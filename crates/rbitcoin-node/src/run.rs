@@ -2107,11 +2107,10 @@ pub fn apply_startup_index_mode(
         query.set_prune_seqsigwit(true)?;
         query.apply_prune_seqsigwit_tip()?;
     }
-    if let Err(e) =
-        query.set_sptweaks_enabled(config.sptweaks, rbitcoin_primitives::Height(taproot_height))
-    {
-        warn!("sp_tweaks: enable failed: {e}");
-    } else if config.sptweaks {
+    query
+        .set_sptweaks_enabled(config.sptweaks, rbitcoin_primitives::Height(taproot_height))
+        .map_err(|e| NodeError::Config(e.to_string()))?;
+    if config.sptweaks {
         info!("sp_tweaks: enabled origin={taproot_height}");
     }
     // Before write-behind starts. An unproven head must not catch up by

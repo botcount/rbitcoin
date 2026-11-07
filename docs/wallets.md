@@ -109,9 +109,11 @@ balances and history.
 | BlueWallet, Stack Wallet, Keeper, Nunchuk, BitBox App, Envoy / Passport, Caravan, MyCitadel, Blockstream Green personal server | The app's custom Electrum or Esplora field. Same listeners as the table above. |
 | BDK wallets on Esplora (Alby Hub's chain source, and the same client shape Mutiny used) | `http://127.0.0.1:3000`, or TLS in front of that port. |
 
-`--sp-tweaks` is refused together with `--prune-seqsigwit`. Cake, Dana and
-Sparrow Silent Payments need the tweak index, so that prune stays off
-for those wallets.
+`--sp-tweaks` can run with `--prune-seqsigwit` when the index is enabled
+before the node reaches taproot. From then on, confirm seals tweaks from
+the wire block. A pruned chain that never sealed those heights cannot
+build the index later. Cake, Dana, and Sparrow still need the index, so a
+pruned wallet node has to have had the flag on before activation.
 
 ## Wasabi
 

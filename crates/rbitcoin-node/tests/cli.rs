@@ -489,16 +489,14 @@ fn operator_conf_and_argv() {
     over.mempool.block_reserved_sigops = Some(80_000);
     over.validate().expect("consensus maximum is accepted");
 
-    let tweaks = ready_config(["rbitcoin-node", "--sp-tweaks", "--prune-seqsigwit"]);
-    let err = tweaks.validate().unwrap_err().to_string();
-    assert!(
-        err.contains("--sp-tweaks") && err.contains("--prune-seqsigwit"),
-        "{err}"
-    );
+    ready_config(["rbitcoin-node", "--sp-tweaks", "--prune-seqsigwit"])
+        .validate()
+        .expect("prune and tweaks validate together");
     let mut conf = NodeConfig::default();
     conf.apply_kv("prune_seqsigwit", "1").unwrap();
     conf.apply_kv("sp_tweaks", "1").unwrap();
-    assert!(conf.validate().is_err());
+    conf.validate()
+        .expect("conf prune_seqsigwit with sp_tweaks validates");
 
     // Electrum and Esplora do not require the scripthash index. The index
     // may also stand alone, or run with either listener.
@@ -716,6 +714,64 @@ fn testnet3_default_milestone_is_anchored() {
         explicit.milestone(),
         rbitcoin_consensus::Milestone::height(10)
     );
+}
+
+/// An empty datadir has not reached taproot, so both flags smoke.
+#[test]
+fn smoke_allows_sp_tweaks_with_prune_before_taproot() {
+    let dir = tmp_datadir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let code = cli_main(
+        [
+            "rbitcoin-node",
+            "--smoke",
+            "--network",
+            "regtest",
+            "--datadir",
+            dir.to_str().unwrap(),
+            "--log-level",
+            "error",
+            "--no-seeds",
+            "--sp-tweaks",
+            "--prune-seqsigwit",
+        ],
+        NodeEnv::default(),
+    );
+    assert_exit(code, ExitCode::SUCCESS);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regtest taproot is genesis. A pruned chain already there, with no tweak
+/// watermark above the prune height, refuses the index at startup.
+#[test]
+fn pruned_datadir_past_taproot_refuses_sp_tweaks() {
+    let _gate = rbitcoin_consensus::script_pool::steal_test_gate();
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("node-late-tweaks");
+    q.set_prune_seqsigwit(true).unwrap();
+    let params = rbitcoin_consensus::ChainParams::regtest();
+    let genesis = rbitcoin_consensus::genesis_block(&params);
+    rbitcoin_query::accept_and_connect_block(
+        &q,
+        &params,
+        rbitcoin_primitives::Height(0),
+        &genesis,
+        rbitcoin_consensus::Milestone::height(u32::MAX),
+    )
+    .unwrap();
+    let cfg = ready_config([
+        "rbitcoin-node",
+        "--network",
+        "regtest",
+        "--sp-tweaks",
+        "--prune-seqsigwit",
+    ]);
+    let err = rbitcoin_node::run::apply_startup_index_mode(&q, &cfg, params.taproot_height())
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("prune-seqsigwit"), "{msg}");
+    assert!(msg.contains("taproot"), "{msg}");
+    drop(q);
+    let _ = std::fs::remove_dir_all(dir.path());
 }
 
 /// RPC binds only after catch-up, so a bad `--rpc-cookie-file` must fail

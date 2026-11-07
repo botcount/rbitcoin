@@ -409,7 +409,9 @@ Block filters: --block-filter-index (default off) builds BIP158 basic filters. I
   --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
   --esplora-onion (default on) ADD_ONION for --esplora-listen when --tor-control is set.\n\
 Silent payments: --sp-tweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
-  Not with --prune-seqsigwit (tweaks read scriptSig and witness).\n\
+  With --prune-seqsigwit, enable it before the node reaches taproot. A later\n\
+  enable is refused once that height has been dropped. Turning prune on while\n\
+  tweaks are already enabled stays refused.\n\
   --sp-tweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
 Health: --health-listen [ADDR] serves GET /healthz, GET /readyz, and GET /progress (JSON:\n\
   the running index build, rebuild, or backfill stage, at any log level) from the first\n\

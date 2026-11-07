@@ -205,13 +205,15 @@ scan). Default **off**. The method still exists when off (naive per-height
 walk). Flag on = persist + serve-from-index. Stream shape and Sparrow/Frigate:
 [`COMPAT.md`](../../COMPAT.md) (Electrum surface).
 
-**Not built during Direct IBD** (the write thread stays Class A + annotate).
-After catch-up, **SH materialize first** (if `--sh-index`), then a background
-walker fills `origin..=live tip` from Class A. Tip write-through only when
-`height == next_height`; if confirm is ahead, backfill owns the hole. Kill
-is safe: `next_height` is the last complete put; restart in Tip (or after
-the next Direct catch-up reaches tip) resumes the walker. Electrum during
-the hole uses the naive path.
+IBD seals the index from the taproot origin when the flag is on before that
+height, on the confirm write thread. With `--prune-seqsigwit`, that is the
+only time a new index can start: after the activation block leaves the keep
+window, the witnesses are gone and startup refuses. A restart whose
+watermark is still above the prune height reseals from `seqsigwit.window`
+(RAM, then the spill file), not from `seqsigwit.body`. Sealed rows serve
+from `sp_tweaks` plus `txout`. Unpruned, a later enable still backfills from
+`seqsigwit.body` on `rbtc-idx-wb`. Electrum during a hole uses the naive
+walk, which a pruned node refuses.
 
 On disk (schema 17 dirs; leftover single files are unlinked on startup):
 
@@ -231,12 +233,9 @@ with `value <= SATS` and drops txs that then have none. Default **1000**.
 not Core dust: P2TR at 1 sat/vB is about **330** sats; 546 is the P2PKH
 figure Cake’s server used. The index is unchanged — only the Electrum JSON.
 
-IBD seals the index from the taproot origin (709632 on mainnet) when
-`--sp-tweaks` is on from the start, on the confirm write thread, shared with
-`--block-filter-index`. A restart gap of at most one write drain is sealed
-at startup; a later enable still materializes after catch-up
-(`rbtc-idx-wb`). Once the watermark covers the tip, new blocks are sealed on
-the confirm write thread. That materialize is one IO thread reading windows of heights on one completion session
+The builder is shared with `--block-filter-index`. Once the watermark covers
+the tip, new blocks are sealed on the confirm write thread. Catch-up is one
+IO thread reading windows of heights on one completion session
 (`seqsigwit` and parent txids only for P2TR-output txs); one CPU thread
 (`rbtc-idx-cpu`) publishes one job per height to `rbtc-scripts-*` (tweak EC,
 and filter GCS when that index is on) and commits one batched height-blob +

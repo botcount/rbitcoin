@@ -846,14 +846,6 @@ impl NodeConfig {
                 "signet-block-time must be greater than zero".into(),
             ));
         }
-        if self.sptweaks && self.prune_seqsigwit {
-            // Tweaks read input keys from scriptSig and witness (seqsigwit).
-            return Err(NodeError::Config(
-                "--sp-tweaks cannot be combined with --prune-seqsigwit: tweaks need the \
-                 scriptSig and witness data pruning drops"
-                    .into(),
-            ));
-        }
         if self.metrics && self.listen.health.is_none() {
             return Err(NodeError::Config("--metrics needs --health-listen".into()));
         }

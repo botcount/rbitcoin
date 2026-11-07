@@ -248,11 +248,21 @@ fn pin_validate_refusals(td: &TestDatadir) {
     for (name, args) in [
         ("chainwork-not-hex", &["--min-chain-work=test"][..]),
         ("challenge-off-signet", &["--signet-challenge", "51"]),
-        ("tweaks-and-pruning", &["--sp-tweaks", "--prune-seqsigwit"]),
         ("metrics-without-health", &["--metrics"]),
     ] {
         assert!(exit_is(smoke(td, name, args), 1), "{name} must refuse");
     }
+    assert!(
+        exit_is(
+            smoke(
+                td,
+                "tweaks-and-pruning",
+                &["--sp-tweaks", "--prune-seqsigwit"]
+            ),
+            0
+        ),
+        "fresh datadir smokes with both flags"
+    );
     let d = td.path().join("signet-time-no-challenge");
     assert!(exit_is(
         node(&[
