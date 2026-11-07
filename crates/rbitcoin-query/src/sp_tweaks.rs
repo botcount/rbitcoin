@@ -176,9 +176,11 @@ impl Query {
     /// Enable persist + serve-from-index + backfill. Creates empty files if needed.
     ///
     /// Does **not** gate Electrum: naive walk remains when off / hole.
+    /// Under `--prune-seqsigwit` the index has to be on before `origin`
+    /// (taproot), or already sealed through every dropped height.
     pub fn set_sptweaks_enabled(&self, on: bool, origin: Height) -> Result<(), QueryError> {
         if on {
-            self.require_sp_tweaks_unpruned()?;
+            self.require_sp_tweaks_start(origin)?;
         }
         self.sptweaks_origin
             .store(origin.0, AtomicOrdering::Release);
@@ -187,6 +189,44 @@ impl Query {
         }
         self.sptweaks_enabled.store(on, AtomicOrdering::Release);
         Ok(())
+    }
+
+    /// Next height the table will accept, or `origin` when no table exists.
+    fn tweak_watermark(&self, origin: Height) -> Result<u32, QueryError> {
+        if let Some(h) = self.sptweaks_next_height() {
+            return Ok(h.0.max(origin.0));
+        }
+        let dir = self.store.cold_files_dir();
+        if SpTweaksTable::files_present(dir) {
+            return Ok(SpTweaksTable::open(dir)?.next_height().0.max(origin.0));
+        }
+        Ok(origin.0)
+    }
+
+    /// Prune drops scriptSig and witness at or below [`Self::pruneheight`].
+    /// A new index can start only while the tip is still below `origin`.
+    /// A restart is allowed when the watermark is already past that line
+    /// (or past the tip, before any height has been dropped).
+    pub(crate) fn require_sp_tweaks_start(&self, origin: Height) -> Result<(), QueryError> {
+        if !self.prune_seqsigwit() {
+            return Ok(());
+        }
+        let tip = self.tip_height().map(|h| h.0);
+        if tip.is_none_or(|t| t < origin.0) {
+            return Ok(());
+        }
+        let next = self.tweak_watermark(origin)?;
+        let covered = match self.pruneheight() {
+            Some(ph) => next > ph.0,
+            None => next > tip.unwrap_or(0),
+        };
+        if covered {
+            return Ok(());
+        }
+        Err(StoreError::Layout(
+            "silent payment tweaks on --prune-seqsigwit must be enabled before taproot activation"
+                .into(),
+        ))
     }
 
     #[doc(hidden)]
@@ -248,8 +288,7 @@ impl Query {
         Ok(())
     }
 
-    /// Tweaks read input keys from scriptSig and witness, which
-    /// `--prune-seqsigwit` drops: a pruned node neither builds nor serves them.
+    /// The naive walk reads scriptSig and witness. A pruned hole cannot.
     pub fn require_sp_tweaks_unpruned(&self) -> Result<(), QueryError> {
         if self.prune_seqsigwit() {
             return Err(StoreError::Layout(
@@ -429,7 +468,6 @@ impl Query {
         start: Height,
         limits: ThinTweakRangeLimits,
     ) -> Result<Vec<(Height, Fk, Vec<ThinTweakRow>)>, QueryError> {
-        self.require_sp_tweaks_unpruned()?;
         if limits.max_heights == 0 {
             return Ok(Vec::new());
         }

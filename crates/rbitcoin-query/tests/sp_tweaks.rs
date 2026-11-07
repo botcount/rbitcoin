@@ -119,21 +119,85 @@ fn thin_tweak_body_corrupt_strings_are_distinct() {
     assert_ne!(m, e);
 }
 
-/// If you prune seqsigwit you cannot serve tweaks: enabling the index,
-/// pruning under it, and reading tweaks are all refused.
+fn connect_one(
+    q: &Query,
+    h: u32,
+    prev: Fk,
+    prev_hash: Option<[u8; 32]>,
+    p2tr: bool,
+) -> (Fk, [u8; 32]) {
+    let header = header(h, prev, prev_hash);
+    let script = if p2tr {
+        let mut s = rbitcoin_primitives::P2TR_PREFIX.to_vec();
+        s.extend_from_slice(&[0x11; 32]);
+        s
+    } else {
+        vec![0x51]
+    };
+    let fk = q
+        .connect_block(
+            Height(h),
+            &header,
+            &[TxApply {
+                tx: TxRecord {
+                    txid: [h as u8; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
+                outputs: vec![OutputRecord::unspent(50_0000_0000, script)],
+            }],
+        )
+        .unwrap();
+    (fk, header.hash)
+}
+
+/// Prune and tweaks together only when the index starts before its origin,
+/// or already covers every dropped height. A sealed row still serves.
 #[test]
-fn prune_seqsigwit_and_sp_tweaks_exclude_each_other() {
+fn prune_seqsigwit_and_sp_tweaks_follow_taproot() {
     let (dir, q) = tmp_q();
-    q.set_sptweaks_enabled(true, Height(0)).unwrap();
-    assert!(q.set_prune_seqsigwit(true).is_err(), "prune under tweaks");
-    q.set_sptweaks_enabled(false, Height(0)).unwrap();
-    q.set_prune_seqsigwit(true).unwrap();
-    let err = q.set_sptweaks_enabled(true, Height(0)).unwrap_err();
-    assert!(err.to_string().contains("prune-seqsigwit"), "{err}");
+    q.set_sptweaks_enabled(true, Height(4)).unwrap();
     assert!(
-        q.load_thin_tweaks(Height(0)).is_err(),
-        "no serving when pruned"
+        q.set_prune_seqsigwit(true).is_err(),
+        "prune under tweaks stays refused"
     );
+    q.set_sptweaks_enabled(false, Height(4)).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    q.set_sptweaks_enabled(true, Height(4)).unwrap();
+
+    let mut prev = Fk::NULL;
+    let mut prev_hash = None;
+    let mut at_origin = Fk::NULL;
+    for h in 0..=4 {
+        let (fk, hash) = connect_one(&q, h, prev, prev_hash, h == 4);
+        prev = fk;
+        prev_hash = Some(hash);
+        if h == 4 {
+            at_origin = fk;
+        }
+    }
+    let tweak = [0x02; 33];
+    q.put_sp_tweaks_blocks(&[(Height(4), at_origin, vec![Some(tweak)])])
+        .unwrap();
+    assert_eq!(q.sptweaks_next_height(), Some(Height(5)));
+    q.set_pruneheight(Some(Height(4))).unwrap();
+    let rows = q.load_thin_tweaks(Height(4)).unwrap().expect("sealed row");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].tweak, tweak);
+    q.set_sptweaks_enabled(true, Height(4)).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let (dir, q) = tmp_q();
+    let _ = connect_one(&q, 0, Fk::NULL, None, false);
+    q.set_prune_seqsigwit(true).unwrap();
+    q.set_pruneheight(Some(Height(0))).unwrap();
+    let err = q.set_sptweaks_enabled(true, Height(0)).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("prune-seqsigwit"), "{msg}");
+    assert!(msg.contains("taproot"), "{msg}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
