@@ -230,12 +230,19 @@ fn startup_repairs_each_fitting_index() {
     assert_sealed_matches_window(&both, 1);
 }
 
-/// Prune is on before activation. Filters stay behind. The spend at `origin`
-/// still seals from the wire block, and the row survives the keep window.
-#[test]
-fn pruned_ibd_seals_tweaks_from_the_wire() {
-    let _gate = rbitcoin_consensus::script_pool::steal_test_gate();
-    let (_dir, q) = tiny_query_labeled("idx-prune-wire");
+/// Prune on, filters behind, one eligible block sealed at `origin`.
+fn seal_pruned_spend(
+    label: &str,
+) -> (
+    rbitcoin_query::testutil::TempDir,
+    Query,
+    u32,
+    Vec<[u8; 33]>,
+    bitcoin::BlockHash,
+    u32,
+    u64,
+) {
+    let (dir, q) = tiny_query_labeled(label);
     q.set_prune_seqsigwit(true).unwrap();
     let body_len = std::fs::metadata(q.store().path().join("seqsigwit.body"))
         .unwrap()
@@ -337,7 +344,18 @@ fn pruned_ibd_seals_tweaks_from_the_wire() {
         rows.into_iter().map(|r| r.tweak).collect::<Vec<_>>(),
         expect
     );
+    (dir, q, origin, expect, prev, time, body_len)
+}
 
+/// Prune is on before activation. Filters stay behind. The spend at `origin`
+/// still seals from the wire block, and the row survives the keep window.
+#[test]
+fn pruned_ibd_seals_tweaks_from_the_wire() {
+    let _gate = rbitcoin_consensus::script_pool::steal_test_gate();
+    let (_dir, q, origin, expect, mut prev, mut time, body_len) =
+        seal_pruned_spend("idx-prune-wire");
+    let params = ChainParams::regtest();
+    let ms = Milestone::height(u32::MAX);
     let pad = Query::SEQSIGWIT_KEEP_HEIGHTS + 1;
     let mut blocks = Vec::with_capacity(pad as usize);
     for h in 1..=pad {
@@ -372,6 +390,51 @@ fn pruned_ibd_seals_tweaks_from_the_wire() {
         heights.iter().all(|h| !h.tweaks),
         "a caught-up tweak watermark does not read witnesses"
     );
+}
+
+/// A crash that leaves the tweak watermark behind, still inside the keep
+/// window, is resealed from the spill. Once that height is pruned, startup
+/// fails with the enable layout error.
+#[test]
+fn pruned_tweak_repair_uses_the_keep_window() {
+    let _gate = rbitcoin_consensus::script_pool::steal_test_gate();
+    let (_dir, q, origin, expect, _prev, _time, _body) = seal_pruned_spend("idx-prune-repair");
+    let spill = q
+        .store()
+        .path()
+        .join(format!("seqsigwit.window/{origin}.bin"));
+    assert!(spill.is_file(), "eligible height spilled");
+    q.clear_seqsigwit_ram_window();
+    q.sp_tweaks
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .truncate_keep_slots(0)
+        .unwrap();
+    assert_eq!(q.tweak_index_next(), Some(origin));
+    rbitcoin_query::prepare_live_indexes(&q).unwrap();
+    let rows = q
+        .load_thin_tweaks(Height(origin))
+        .unwrap()
+        .expect("repaired from the keep window");
+    assert_eq!(
+        rows.into_iter().map(|r| r.tweak).collect::<Vec<_>>(),
+        expect
+    );
+
+    q.sp_tweaks
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .truncate_keep_slots(0)
+        .unwrap();
+    q.set_pruneheight(Some(Height(origin))).unwrap();
+    let err = rbitcoin_query::prepare_live_indexes(&q).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("prune-seqsigwit"), "{msg}");
+    assert!(msg.contains("taproot"), "{msg}");
 }
 
 /// Filters come first, one per block. Tweaks are ranges of at most 32

@@ -154,8 +154,38 @@ impl Query {
     }
 
     /// Read a window of blocks and the parents they spend (completion session).
+    ///
+    /// Prune mode does not pread `seqsigwit.body`. P2TR inputs come from the
+    /// keep window: RAM, then `seqsigwit.window`.
     pub fn read_index_window(&self, heights: &[IndexHeight]) -> Result<IndexWindow, QueryError> {
-        read_index_window(&self.store.txs, heights)
+        let mut window = read_index_window(&self.store.txs, heights)?;
+        if self.prune_seqsigwit() {
+            self.fill_pruned_tweak_inputs(&mut window)?;
+        }
+        Ok(window)
+    }
+
+    fn fill_pruned_tweak_inputs(&self, window: &mut IndexWindow) -> Result<(), QueryError> {
+        for block in &mut window.blocks {
+            for tx in &mut block.txs {
+                if !tx.need_seqsigwit {
+                    continue;
+                }
+                let Some(inputs) = self.seqsigwit_cached_inputs(tx.fk, tx.rec.input_count)? else {
+                    return Err(self.pruned_tweak_witness_miss(block.height));
+                };
+                tx.inputs = Some(inputs);
+            }
+        }
+        Ok(())
+    }
+
+    fn pruned_tweak_witness_miss(&self, height: Height) -> QueryError {
+        let dropped = self.pruneheight().is_some_and(|ph| height.0 <= ph.0);
+        if dropped {
+            return StoreError::Layout(crate::sp_tweaks::SP_TWEAKS_PRUNE_BEFORE_TAPROOT.into());
+        }
+        StoreError::Corrupt("seqsigwit window miss")
     }
 
     /// Basic filter of `window.blocks[i]`. Reads the block hash from the header.

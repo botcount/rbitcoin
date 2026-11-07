@@ -389,9 +389,13 @@ pub fn read_locators(
     let mut loc_plan = table
         .create_loc
         .plan_range_batch(&creates_of(heights.iter()))?;
-    let mut sws_plan = table
-        .seqsigwit_loc
-        .plan_range_batch(&creates_of(heights.iter().filter(|h| h.tweaks)))?;
+    // Prune keeps witnesses in the query window, not on this stem.
+    let sws_creates = if table.prune_seqsigwit_mode() {
+        Vec::new()
+    } else {
+        creates_of(heights.iter().filter(|h| h.tweaks))
+    };
+    let mut sws_plan = table.seqsigwit_loc.plan_range_batch(&sws_creates)?;
     let mut edge_plans = heights
         .iter()
         .map(|h| {
@@ -576,22 +580,24 @@ pub fn read_witnesses_and_parent_locs(
     let mut ploc_plan = table.create_loc.plan_range_batch(&parent_list)?;
     let mut jobs = Vec::new();
     let ploc_r = take_reads(&mut jobs, table.create_loc.loc_file(), ploc_plan.reads());
-    let tweak_txs = blocks
-        .iter()
-        .zip(heights)
-        .enumerate()
-        .filter(|(_, (_, h))| h.tweaks)
-        .flat_map(|(bi, (b, _))| (0..b.txs.len()).map(move |ti| (bi, ti)));
     let mut sws_jobs = Vec::new();
-    let sws_hwm = table.seqsigwit.body_logical_len();
-    for ((bi, ti), range) in tweak_txs.zip(sws_ranges) {
-        if blocks[bi].txs[ti].need_seqsigwit {
-            let (off, len) =
-                range.ok_or_else(|| missing("invariant: index build seqsigwit loc missing"))?;
-            // One compare against the seqsigwit HWM. Not a fresh `published_meta` pair.
-            require_body_hwm(sws_hwm, off.saturating_add(len))?;
-            sws_jobs.push((bi, ti, jobs.len()));
-            jobs.push(ReadJob::new(files.seqsigwit, off, len)?);
+    if !table.prune_seqsigwit_mode() {
+        let tweak_txs = blocks
+            .iter()
+            .zip(heights)
+            .enumerate()
+            .filter(|(_, (_, h))| h.tweaks)
+            .flat_map(|(bi, (b, _))| (0..b.txs.len()).map(move |ti| (bi, ti)));
+        let sws_hwm = table.seqsigwit.body_logical_len();
+        for ((bi, ti), range) in tweak_txs.zip(sws_ranges) {
+            if blocks[bi].txs[ti].need_seqsigwit {
+                let (off, len) =
+                    range.ok_or_else(|| missing("invariant: index build seqsigwit loc missing"))?;
+                // One compare against the seqsigwit HWM. Not a fresh `published_meta` pair.
+                require_body_hwm(sws_hwm, off.saturating_add(len))?;
+                sws_jobs.push((bi, ti, jobs.len()));
+                jobs.push(ReadJob::new(files.seqsigwit, off, len)?);
+            }
         }
     }
     let txid_j = jobs.len();

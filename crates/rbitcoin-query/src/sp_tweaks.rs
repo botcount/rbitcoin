@@ -223,12 +223,15 @@ impl Query {
         if covered {
             return Ok(());
         }
-        Err(StoreError::Layout(
-            "silent payment tweaks on --prune-seqsigwit must be enabled before taproot activation"
-                .into(),
-        ))
+        Err(StoreError::Layout(SP_TWEAKS_PRUNE_BEFORE_TAPROOT.into()))
     }
+}
 
+/// Startup and enable share this text. Callers match `prune-seqsigwit` and `taproot`.
+pub(crate) const SP_TWEAKS_PRUNE_BEFORE_TAPROOT: &str =
+    "silent payment tweaks on --prune-seqsigwit must be enabled before taproot activation";
+
+impl Query {
     #[doc(hidden)]
     pub fn ensure_sp_tweaks(&self, origin: Height) -> Result<(), QueryError> {
         let mut g = self.sp_tweaks.lock().unwrap_or_else(|e| e.into_inner());
