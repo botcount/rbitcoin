@@ -215,21 +215,60 @@ impl Query {
         if tip.is_none_or(|t| t < origin.0) {
             return Ok(());
         }
-        let next = self.tweak_watermark(origin)?;
-        let covered = match self.pruneheight() {
-            Some(ph) => next > ph.0,
-            None => next > tip.unwrap_or(0),
-        };
-        if covered {
+        let tip = tip.expect("tip checked above");
+        if self.tweak_watermark_covers(origin, self.pruneheight().map(|h| h.0), tip)? {
             return Ok(());
         }
         Err(StoreError::Layout(SP_TWEAKS_PRUNE_BEFORE_TAPROOT.into()))
+    }
+
+    /// Startup calls this before the first prune cut when this start also
+    /// wants tweaks. The enabled bit is still false on a fresh process, and
+    /// the stem cut cannot be undone.
+    pub fn refuse_adding_prune_with_tweaks(&self, origin: Height) -> Result<(), QueryError> {
+        if self.sptweaks_enabled() || SpTweaksTable::files_present(self.store.cold_files_dir()) {
+            return Err(StoreError::Layout(SP_TWEAKS_PRUNE_WHILE_ENABLED.into()));
+        }
+        let Some(tip) = self.tip_height().map(|h| h.0) else {
+            return Ok(());
+        };
+        if tip < origin.0 {
+            return Ok(());
+        }
+        // Same line `prune_seqsigwit_below` will persist: nothing is dropped
+        // until the tip is past the keep window.
+        let ph = if tip > Self::SEQSIGWIT_KEEP_HEIGHTS {
+            Some(tip - Self::SEQSIGWIT_KEEP_HEIGHTS)
+        } else {
+            None
+        };
+        if self.tweak_watermark_covers(origin, ph, tip)? {
+            return Ok(());
+        }
+        Err(StoreError::Layout(SP_TWEAKS_PRUNE_BEFORE_TAPROOT.into()))
+    }
+
+    fn tweak_watermark_covers(
+        &self,
+        origin: Height,
+        pruneheight: Option<u32>,
+        tip: u32,
+    ) -> Result<bool, QueryError> {
+        let next = self.tweak_watermark(origin)?;
+        Ok(match pruneheight {
+            Some(ph) => next > ph,
+            None => next > tip,
+        })
     }
 }
 
 /// Startup and enable share this text. Callers match `prune-seqsigwit` and `taproot`.
 pub(crate) const SP_TWEAKS_PRUNE_BEFORE_TAPROOT: &str =
     "silent payment tweaks on --prune-seqsigwit must be enabled before taproot activation";
+
+/// `set_prune_seqsigwit` and startup share this text.
+pub(crate) const SP_TWEAKS_PRUNE_WHILE_ENABLED: &str =
+    "refusing --prune-seqsigwit while silent payment tweaks are enabled";
 
 impl Query {
     #[doc(hidden)]

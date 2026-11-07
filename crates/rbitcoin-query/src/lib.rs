@@ -995,7 +995,7 @@ impl Query {
         let was_on = self.prune_seqsigwit();
         if on && self.sptweaks_enabled() {
             return Err(StoreError::Layout(
-                "refusing --prune-seqsigwit while silent payment tweaks are enabled".into(),
+                crate::sp_tweaks::SP_TWEAKS_PRUNE_WHILE_ENABLED.into(),
             ));
         }
         if !on && self.prune_seqsigwit() {

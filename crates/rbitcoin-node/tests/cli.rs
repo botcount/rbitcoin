@@ -774,6 +774,89 @@ fn pruned_datadir_past_taproot_refuses_sp_tweaks() {
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
+/// An unpruned chain already at taproot must refuse both flags before the
+/// stem cut. Prune cannot be turned back off.
+#[test]
+fn both_flags_on_unpruned_past_taproot_keep_the_stem() {
+    let _gate = rbitcoin_consensus::script_pool::steal_test_gate();
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("node-late-both");
+    let params = rbitcoin_consensus::ChainParams::regtest();
+    let genesis = rbitcoin_consensus::genesis_block(&params);
+    rbitcoin_query::accept_and_connect_block(
+        &q,
+        &params,
+        rbitcoin_primitives::Height(0),
+        &genesis,
+        rbitcoin_consensus::Milestone::height(u32::MAX),
+    )
+    .unwrap();
+    let before = q.store().txs.seqsigwit.body_logical_len();
+    let cfg = ready_config([
+        "rbitcoin-node",
+        "--network",
+        "regtest",
+        "--sp-tweaks",
+        "--prune-seqsigwit",
+    ]);
+    let err = rbitcoin_node::run::apply_startup_index_mode(&q, &cfg, params.taproot_height())
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("prune-seqsigwit"), "{msg}");
+    assert!(msg.contains("taproot"), "{msg}");
+    assert!(
+        !q.prune_seqsigwit(),
+        "prune stuck after a refused tweak start"
+    );
+    assert_eq!(q.store().txs.seqsigwit.body_logical_len(), before);
+    drop(q);
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+/// A fresh process loads the tweak flag as off. Files on disk still count as
+/// the index being enabled, so adding prune must not cut the stem.
+#[test]
+fn adding_prune_beside_existing_tweaks_keeps_the_stem() {
+    let _gate = rbitcoin_consensus::script_pool::steal_test_gate();
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("node-tweaks-then-prune");
+    let params = rbitcoin_consensus::ChainParams::regtest();
+    let genesis = rbitcoin_consensus::genesis_block(&params);
+    rbitcoin_query::accept_and_connect_block(
+        &q,
+        &params,
+        rbitcoin_primitives::Height(0),
+        &genesis,
+        rbitcoin_consensus::Milestone::height(u32::MAX),
+    )
+    .unwrap();
+    q.set_sptweaks_enabled(true, rbitcoin_primitives::Height(0))
+        .unwrap();
+    let before = q.store().txs.seqsigwit.body_logical_len();
+    let path = dir.path().to_path_buf();
+    drop(q);
+    let q = rbitcoin_query::Query::open_or_create_tiny(&path).unwrap();
+    assert!(!q.sptweaks_enabled());
+    let cfg = ready_config([
+        "rbitcoin-node",
+        "--network",
+        "regtest",
+        "--sp-tweaks",
+        "--prune-seqsigwit",
+    ]);
+    let err = rbitcoin_node::run::apply_startup_index_mode(&q, &cfg, params.taproot_height())
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("refusing"), "{msg}");
+    assert!(msg.contains("prune-seqsigwit"), "{msg}");
+    assert!(msg.contains("silent payment tweaks are enabled"), "{msg}");
+    assert!(
+        !q.prune_seqsigwit(),
+        "prune stuck beside an existing tweak index"
+    );
+    assert_eq!(q.store().txs.seqsigwit.body_logical_len(), before);
+    drop(q);
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
 /// RPC binds only after catch-up, so a bad `--rpc-cookie-file` must fail
 /// the launch rather than surface as a warning after IBD.
 #[test]

@@ -2103,6 +2103,13 @@ pub fn apply_startup_index_mode(
             "datadir is pruned-seqsigwit; restart with --prune-seqsigwit enabled".into(),
         ));
     }
+    if config.prune_seqsigwit && config.sptweaks && !query.prune_seqsigwit() {
+        // The enabled bit is false until the call below, and the stem cut
+        // cannot be undone. Refuse before either write.
+        query
+            .refuse_adding_prune_with_tweaks(rbitcoin_primitives::Height(taproot_height))
+            .map_err(|e| NodeError::Config(e.to_string()))?;
+    }
     if config.prune_seqsigwit {
         query.set_prune_seqsigwit(true)?;
         query.apply_prune_seqsigwit_tip()?;
