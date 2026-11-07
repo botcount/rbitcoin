@@ -454,6 +454,10 @@ pub struct Query {
     /// when every enabled index is contiguous with the tip. Load reads it;
     /// the write thread is the only writer.
     pub index_live: std::sync::atomic::AtomicBool,
+    /// Pruned confirm appends tweak rows when that watermark already follows
+    /// the tip, even if a lagging filter index keeps [`Self::index_live`] off.
+    /// Unpruned tweaks stay on `index_live`.
+    pub tweak_follow: std::sync::atomic::AtomicBool,
     /// BIP158 basic filter table, opened when the index is first turned on.
     pub block_filters: std::sync::OnceLock<rbitcoin_store::BlockFilterTable>,
     pub bf_wb: block_filter::BlockFilterWriteBehind,
@@ -667,6 +671,7 @@ impl Query {
             sh_force_rebuild: std::sync::atomic::AtomicBool::new(false),
             block_filter_enabled: std::sync::atomic::AtomicBool::new(false),
             index_live: std::sync::atomic::AtomicBool::new(false),
+            tweak_follow: std::sync::atomic::AtomicBool::new(false),
             block_filters: std::sync::OnceLock::new(),
             bf_wb: block_filter::BlockFilterWriteBehind::new(),
             sp_tweaks: Mutex::new(sp_tweaks),

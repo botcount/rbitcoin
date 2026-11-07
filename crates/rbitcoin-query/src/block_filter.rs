@@ -499,6 +499,16 @@ impl Query {
         self.index_live.store(on, Ordering::Release);
     }
 
+    /// Pruned tweak append is on. Independent of [`Self::index_live`].
+    pub fn tweak_follow(&self) -> bool {
+        self.tweak_follow.load(Ordering::Acquire)
+    }
+
+    /// The write side of [`Self::tweak_follow`].
+    pub fn set_tweak_follow(&self, on: bool) {
+        self.tweak_follow.store(on, Ordering::Release);
+    }
+
     /// Next filter height to seal (`None` when the filter index is off).
     pub fn filter_index_next(&self) -> Option<u32> {
         self.block_filter_table().map(|t| t.next_height().0)

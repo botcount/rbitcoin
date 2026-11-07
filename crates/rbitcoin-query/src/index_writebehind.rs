@@ -169,7 +169,20 @@ pub fn prepare_live_indexes_limited(query: &Query, max_heights: u32) -> Result<(
             && index_caught_up(query.filter_index_next(), tip_h)
             && index_caught_up(query.tweak_index_next(), tip_h),
     );
+    query.set_tweak_follow(tweak_follow_for(query));
     Ok(())
+}
+
+/// Pruned tweaks append on the confirm thread when their watermark already
+/// follows the tip. Filters keep using [`Query::index_live`].
+#[doc(hidden)]
+pub fn tweak_follow_for(query: &Query) -> bool {
+    if !query.prune_seqsigwit() {
+        return false;
+    }
+    let next = query.tweak_index_next();
+    let tip = query.tip_height().map(|h| h.0);
+    next.is_some() && index_caught_up(next, tip)
 }
 
 #[doc(hidden)]
