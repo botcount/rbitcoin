@@ -7,7 +7,9 @@ Fixed
   had already released its old pages. The grow now returns the error at the
   allocation, before any caller frees or overwrites anything. A failed grow
   leaves the file length and the recorded capacity unchanged, including when
-  `fallocate` had already extended the file. When the doubled or headroom size
+  `fallocate` had already extended the file; the undo truncate is retried when
+  a signal interrupts it, and if it still fails that error is returned and the
+  file may stay longer than the recorded capacity. When the doubled or headroom size
   does not fit but the size the caller needs does, the grow succeeds at that
   smaller size. A signal-interrupted `fallocate` is retried.
 

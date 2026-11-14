@@ -217,3 +217,32 @@ fn grow_on_a_full_disk_errors_without_a_sparse_fallback() {
     // Space that does fit still grows.
     f.ensure_capacity(before + 4096).unwrap();
 }
+
+/// The rollback truncate retries EINTR and hands any other failure back.
+#[test]
+fn rollback_len_retries_interrupted_and_surfaces_failure() {
+    let mut calls = 0;
+    rollback_len(|| {
+        calls += 1;
+        if calls < 3 {
+            Err(std::io::Error::from_raw_os_error(libc::EINTR))
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap();
+    assert_eq!(calls, 3);
+
+    let mut calls = 0;
+    let e = rollback_len(|| {
+        calls += 1;
+        if calls == 1 {
+            Err(std::io::Error::from_raw_os_error(libc::EINTR))
+        } else {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        }
+    })
+    .unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(libc::EIO));
+    assert_eq!(calls, 2);
+}
