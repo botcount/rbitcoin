@@ -511,6 +511,16 @@ fn crash_after_collect_mid_rebuild_recovers_on_restart() {
 /// Gap 2: requests that passed the 503 gate keep reading while the wipe and
 /// rebuild run underneath them. No panic, and an Ok answer is never a torn
 /// read: every Ok history has one of the lengths the chain really had.
+///
+/// A fault is a window, not an instant: the index is already torn when the
+/// test tears the head, and the node only learns of it when the disconnect
+/// trips over it and marks the index degraded. A reader admitted before that
+/// moment may be mid-read while the disconnect half-unlinks the torn head, and
+/// can honestly return a short or empty history. No gate can prevent that (the
+/// flag is still clear when it enters), so reads that overlap the window
+/// (`fault` is odd, or changed during the read) are counted but not judged.
+/// Every other read, before the tear and after the rebuild, is held to the
+/// strict invariant.
 #[test]
 fn readers_through_degrade_wipe_and_rebuild_see_no_garbage() {
     use std::collections::HashSet;
@@ -523,6 +533,9 @@ fn readers_through_degrade_wipe_and_rebuild_see_no_garbage() {
     let healthy_len = history_txids(&q, &key).len();
     allowed.lock().unwrap().insert(healthy_len);
     let stop = Arc::new(AtomicBool::new(false));
+    // Odd while a fault is open: from the tear until the disconnect has marked the index.
+    let fault = Arc::new(AtomicU64::new(0));
+    let (checked, in_window) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
     let (oks, errs, bad) = (
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
@@ -538,15 +551,24 @@ fn readers_through_degrade_wipe_and_rebuild_see_no_garbage() {
                 errs.clone(),
                 bad.clone(),
             );
+            let (fault, checked, in_window) = (fault.clone(), checked.clone(), in_window.clone());
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    // The server gate: checked once, then the read runs free.
-                    if !q.sh_history_available() {
+                    // The server gate: a request holds the read guard for its whole read.
+                    let Some(_guard) = q.sh_read_enter() else {
                         std::thread::yield_now();
                         continue;
-                    }
-                    match q.scripthash_history(&key) {
+                    };
+                    let before = fault.load(Ordering::SeqCst);
+                    let res = q.scripthash_history(&key);
+                    let clean = before % 2 == 0 && fault.load(Ordering::SeqCst) == before;
+                    match res {
+                        Ok(_) if !clean => {
+                            in_window.fetch_add(1, Ordering::Relaxed);
+                            oks.fetch_add(1, Ordering::Relaxed);
+                        }
                         Ok(rows) => {
+                            checked.fetch_add(1, Ordering::Relaxed);
                             let ids: Vec<[u8; 32]> = rows.iter().map(|r| r.txid).collect();
                             let n = ids.len();
                             let mut s = ids.clone();
@@ -579,9 +601,11 @@ fn readers_through_degrade_wipe_and_rebuild_see_no_garbage() {
             a.insert(len_now - 3 + 2);
             a.insert(len_now + 2);
         }
+        fault.fetch_add(1, Ordering::SeqCst);
         tear_extent_head(&q, &key);
         q.disconnect_tip().unwrap();
         assert!(q.sh_degraded());
+        fault.fetch_add(1, Ordering::SeqCst);
         assert!(q.rebuild_sh_if_degraded(None).unwrap());
         c.resync_to_tip(&q);
         c.block(&q, 2, 40 + round);
@@ -599,13 +623,18 @@ fn readers_through_degrade_wipe_and_rebuild_see_no_garbage() {
         r.join().expect("reader thread panicked");
     }
     eprintln!(
-        "STRESS ok_reads={} err_reads={} bad={:?}",
+        "STRESS ok_reads={} checked={} in_fault_window={} err_reads={} bad={:?}",
         oks.load(Ordering::Relaxed),
+        checked.load(Ordering::Relaxed),
+        in_window.load(Ordering::Relaxed),
         errs.load(Ordering::Relaxed),
         bad.lock().unwrap()
     );
     assert!(bad.lock().unwrap().is_empty(), "{:?}", bad.lock().unwrap());
-    assert!(oks.load(Ordering::Relaxed) > 0);
+    assert!(
+        checked.load(Ordering::Relaxed) > 0,
+        "no read was judged against the invariant"
+    );
 }
 
 /// Gap 2, deterministic: a request that passed the gate before the index
