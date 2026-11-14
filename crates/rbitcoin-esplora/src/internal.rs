@@ -5,7 +5,7 @@ use crate::handlers::{confirmed_output_count, spawn_join, write_outspends};
 use crate::handlers::{outspend_json, resolve_address_sh, sh_info_reply};
 use crate::server::{
     block_hash_hex, json_bytes_reply, json_reply_here, parse_hash32, pin_or_reject, store_err,
-    AppState,
+    stored_tx_listed, AppState,
 };
 #[cfg(unix)]
 use crate::server::{not_found, AsOf};
@@ -134,7 +134,9 @@ pub fn entry_json(st: &AppState, mp: &MempoolHub, e: &MempoolTxSnapEntry) -> Opt
 #[doc(hidden)]
 pub fn confirmed_or_mempool_tx(st: &AppState, id: &[u8; 32]) -> Option<Value> {
     if let Ok(Some(fk)) = st.query.tx_fk_by_txid(id) {
-        return build_tx_json(&st.query, fk, st.network, None).ok();
+        if stored_tx_listed(st, fk, id).ok()? {
+            return build_tx_json(&st.query, fk, st.network, None).ok();
+        }
     }
     mempool_tx_json(st, id)
 }
@@ -371,16 +373,24 @@ pub fn outspends_for_txid_opts(st: &AppState, ids: Vec<Option<[u8; 32]>>) -> Res
     let mut nouts = Vec::with_capacity(ids.len());
     let mut total = 0u64;
     for id in &ids {
+        let from_mempool = |id: &[u8; 32]| {
+            mp.and_then(|mp| mp.get_tx(&Txid::from_byte_array(*id)))
+                .map_or(0, |tx| tx.output.len() as u32)
+        };
         let nout = match id {
             None => 0,
+            // A stored row that is neither confirmed nor in the mempool is
+            // gone, like an unknown txid.
             Some(id) => match st.query.tx_fk_by_txid(id) {
-                Ok(Some(fk)) => match confirmed_output_count(&st.query, fk) {
-                    Ok(n) => n,
+                Ok(Some(fk)) => match stored_tx_listed(st, fk, id) {
+                    Ok(true) => match confirmed_output_count(&st.query, fk) {
+                        Ok(n) => n,
+                        Err(e) => return store_err(e),
+                    },
+                    Ok(false) => 0,
                     Err(e) => return store_err(e),
                 },
-                _ => mp
-                    .and_then(|mp| mp.get_tx(&Txid::from_byte_array(*id)))
-                    .map_or(0, |tx| tx.output.len() as u32),
+                _ => from_mempool(id),
             },
         };
         total += u64::from(nout);

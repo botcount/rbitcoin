@@ -2,7 +2,8 @@
 
 use crate::server::{
     block_hash_hex, json_reply_here, json_reply_shared, maybe_attach_view, mempool_wire, not_found,
-    parse_hash32, pin_or_reject, plain_ok, store_err, AppState, AsOf, GbtCache, JoinClient,
+    parse_hash32, pin_or_reject, plain_ok, store_err, stored_tx_listed, AppState, AsOf, GbtCache,
+    JoinClient,
 };
 use crate::tx_json::{
     build_tx_json, build_tx_json_from_tx, history_items_to_tx_json, tx_status_json_in,
@@ -478,13 +479,17 @@ pub async fn tx_raw(State(st): State<AppState>, Path(txid_hex): Path<String>) ->
             return not_found();
         };
         match st.query.tx_fk_by_txid(&txid) {
-            Ok(Some(fk)) => match st.query.tx_wire_bytes(fk) {
-                Ok(raw) => (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/octet-stream")],
-                    raw,
-                )
-                    .into_response(),
+            Ok(Some(fk)) => match stored_tx_listed(&st, fk, &txid) {
+                Ok(true) => match st.query.tx_wire_bytes(fk) {
+                    Ok(raw) => (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/octet-stream")],
+                        raw,
+                    )
+                        .into_response(),
+                    Err(e) => store_err(e),
+                },
+                Ok(false) => not_found(),
                 Err(e) => store_err(e),
             },
             Ok(None) => match mempool_wire(&st, &txid) {
@@ -761,6 +766,10 @@ pub async fn tx_outspend(
             return not_found();
         };
         let in_class_a = match st.query.tx_fk_by_txid(&txid) {
+            Ok(Some(fk)) if asof.is_none() => match stored_tx_listed(&st, fk, &txid) {
+                Ok(listed) => listed,
+                Err(e) => return store_err(e),
+            },
             Ok(v) => v.is_some(),
             Err(e) => return store_err(e),
         };
@@ -796,6 +805,11 @@ pub async fn tx_outspends(
             return not_found();
         };
         let fk = match st.query.tx_fk_by_txid(&txid) {
+            Ok(Some(fk)) if asof.is_none() => match stored_tx_listed(&st, fk, &txid) {
+                Ok(true) => Some(fk),
+                Ok(false) => return not_found(),
+                Err(e) => return store_err(e),
+            },
             Ok(v) => v,
             Err(e) => return store_err(e),
         };

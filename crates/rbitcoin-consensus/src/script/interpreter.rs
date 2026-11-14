@@ -70,10 +70,42 @@ pub const MAX_SCRIPT_SIZE_LEGACY: usize = 10_000;
 #[doc(hidden)]
 pub const MAX_OPS_LEGACY: usize = 201;
 
-/// Legacy sighash bytes one unconfirmed transaction may hash. Each base
-/// CHECKSIG counts the non-witness size plus that input's scriptCode.
-/// Every input shares the budget. Block connect does not use this cap.
+/// Legacy sighash bytes one unconfirmed transaction may hash beyond the
+/// hash every input needs anyway. See [`unconfirmed_legacy_sighash_budget`].
+/// Each distinct base hash counts the non-witness size plus that input's
+/// scriptCode, and every input shares the budget. Block connect does not use
+/// this cap.
 pub const MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES: u64 = 400_000;
+
+/// Legacy sighash bytes one unconfirmed transaction may hash in all.
+///
+/// One non-witness-size hash per input is free: a legacy spend must hash the
+/// transaction once per input, and a P2PKH input already does so without
+/// charge. A standard P2SH multisig spend of any input count fits. The
+/// [`MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES`] on top pays for hashes beyond
+/// that, which only a script that checks other hash types, or other
+/// scriptCode, can ask for. A repeated (hash type, scriptCode) is hashed
+/// once, so repeated CHECKSIGs and the extra pubkeys a CHECKMULTISIG tries
+/// cost nothing. Bytes hashed never pass `base_size * inputs + 400_000`.
+pub fn unconfirmed_legacy_sighash_budget(tx: &Transaction) -> u64 {
+    let per_input = u64::try_from(tx.base_size()).unwrap_or(u64::MAX);
+    let inputs = u64::try_from(tx.input.len()).unwrap_or(u64::MAX);
+    per_input
+        .saturating_mul(inputs)
+        .saturating_add(MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES)
+}
+
+/// Legacy sighashes one eval context keeps for [`sighash_for_script`]. A miss
+/// only costs a charge again, so the bound limits memory and not accuracy.
+const LEGACY_HASH_MEMO_SLOTS: usize = 8;
+
+/// One legacy sighash an unconfirmed eval context already paid for.
+#[doc(hidden)]
+pub struct LegacyHashMemo {
+    ty_raw: u32,
+    script_code: Vec<u8>,
+    hash: [u8; 32],
+}
 #[doc(hidden)]
 pub const MAX_PUBKEYS_PER_MULTISIG: i64 = 20;
 
@@ -250,6 +282,9 @@ pub struct EvalContext<'a> {
     /// The transaction's remaining legacy-sighash budget. Set by
     /// [`Self::apply_job_flags`] so every input of one job shares it.
     shared_legacy_sighash: Option<&'a AtomicU64>,
+    /// Legacy hashes already paid for under the unconfirmed cap, newest last.
+    /// Always empty on the consensus path.
+    pub legacy_hash_memo: RefCell<Vec<LegacyHashMemo>>,
     /// Structure/lookup midstates (WitnessV0 BIP143).
     pub pre: Cow<'a, crate::TxScriptPrecompute>,
     /// BIP342 remaining validation weight (`50 + witness serialized size`).
@@ -368,6 +403,7 @@ impl<'a> EvalContext<'a> {
             cache: RefCell::new(None),
             legacy_sighash_left: AtomicU64::new(u64::MAX),
             shared_legacy_sighash: None,
+            legacy_hash_memo: RefCell::new(Vec::new()),
             pre,
             validation_weight_left: Cell::new(tapscript_init_weight(
                 tx,
@@ -398,7 +434,7 @@ impl<'a> EvalContext<'a> {
             let slot = &job.legacy_sighash_left;
             let _ = slot.compare_exchange(
                 u64::MAX,
-                MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES,
+                unconfirmed_legacy_sighash_budget(&job.tx),
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             );
@@ -1589,6 +1625,30 @@ pub fn checksig_schnorr(
     Ok(crypto::SECP.with(|secp| secp.verify_schnorr(&schnorr, &msg, &xonly).is_ok()))
 }
 
+/// Take one legacy sighash of `script_len` scriptCode bytes out of the
+/// transaction's shared budget. The non-witness size is hashed with it and a
+/// witness is not, and scriptPubKey bytes are not in the spending transaction.
+fn charge_legacy_sighash(ctx: &EvalContext<'_>, script_len: usize) -> Result<(), ConsensusError> {
+    let slot = ctx
+        .shared_legacy_sighash
+        .unwrap_or(&ctx.legacy_sighash_left);
+    let cost = u64::try_from(ctx.tx.base_size())
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::try_from(script_len).unwrap_or(u64::MAX));
+    loop {
+        let left = slot.load(Ordering::Relaxed);
+        if cost > left {
+            return Err(ConsensusError::Script("legacy sighash work".into()));
+        }
+        if slot
+            .compare_exchange_weak(left, left - cost, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+}
+
 #[doc(hidden)]
 pub fn sighash_for_script(
     ctx: &EvalContext<'_>,
@@ -1602,39 +1662,37 @@ pub fn sighash_for_script(
             // Raw hashtype 0 is not SIGHASH_ALL=1. The caller already dropped
             // a bare OP_CODESEPARATOR.
             if ctx.const_scriptcode {
-                let slot = ctx
-                    .shared_legacy_sighash
-                    .unwrap_or(&ctx.legacy_sighash_left);
-                // Non-witness size plus this scriptCode. Witness bytes are
-                // not in a legacy sighash. scriptPubKey is, and it is not in
-                // the spending transaction.
-                let cost = u64::try_from(ctx.tx.base_size())
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(u64::try_from(script_bytes.len()).unwrap_or(u64::MAX));
-                loop {
-                    let left = slot.load(Ordering::Relaxed);
-                    if cost > left {
-                        return Err(ConsensusError::Script("legacy sighash work".into()));
-                    }
-                    if slot
-                        .compare_exchange_weak(
-                            left,
-                            left - cost,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        )
-                        .is_ok()
-                    {
-                        break;
-                    }
+                // The same (hash type, scriptCode) of this input hashes to the
+                // same digest: nothing more to hash and nothing more to pay.
+                let seen = ctx
+                    .legacy_hash_memo
+                    .borrow()
+                    .iter()
+                    .find(|m| m.ty_raw == ty_raw && m.script_code == script_bytes)
+                    .map(|m| m.hash);
+                if let Some(hash) = seen {
+                    return Ok(hash);
                 }
+                charge_legacy_sighash(ctx, script_bytes.len())?;
             }
             let mut slot = ctx.cache.borrow_mut();
             let cache = slot.get_or_insert_with(|| SighashCache::new(ctx.tx));
             let h = cache
                 .legacy_signature_hash(ctx.input_index.get(), script_code, ty_raw)
                 .map_err(|_| ConsensusError::Script("legacy sighash".into()))?;
-            Ok(h.to_byte_array())
+            let hash = h.to_byte_array();
+            if ctx.const_scriptcode {
+                let mut memo = ctx.legacy_hash_memo.borrow_mut();
+                if memo.len() >= LEGACY_HASH_MEMO_SLOTS {
+                    memo.remove(0);
+                }
+                memo.push(LegacyHashMemo {
+                    ty_raw,
+                    script_code: script_bytes.to_vec(),
+                    hash,
+                });
+            }
+            Ok(hash)
         }
         PreTapscript::WitnessV0 => crypto::bip143_p2wsh_signature_hash(
             ctx.tx,
