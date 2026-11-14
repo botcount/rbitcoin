@@ -20,7 +20,6 @@ pub fn verify(
     cache: &mut SighashCache<&Transaction>,
     spk: &[u8; 25],
 ) -> Result<(), ConsensusError> {
-    let _ = tx;
     let keyhash = &spk[3..23];
 
     let input = &tx.input[input_index.get()];
@@ -36,6 +35,16 @@ pub fn verify(
 
     let script_code_bytes = sighash_script_code(spk, &sig_raw);
     let script_code = Script::from_bytes(&script_code_bytes);
+    // An unconfirmed check charges this hash to the transaction's budget.
+    if job.const_scriptcode {
+        job.legacy_budget.arm();
+        job.legacy_budget.charge(
+            tx,
+            input_index.get(),
+            sighash_ty,
+            script_code.as_bytes().len(),
+        )?;
+    }
     // Raw hashtype byte (may be 0 — must not normalize to SIGHASH_ALL).
     let sighash = cache
         .legacy_signature_hash(input_index.get(), script_code, sighash_ty)

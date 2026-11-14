@@ -2,7 +2,7 @@
 
 use crate::script_fields::esplora_script_fields;
 use bitcoin::hashes::Hash;
-use bitcoin::{Network, Transaction};
+use bitcoin::{Network, Transaction, Txid};
 use rbitcoin_net::MempoolHub;
 
 use rbitcoin_primitives::{Fk, Height};
@@ -19,6 +19,68 @@ pub fn tx_status_json(query: &Query, tx_fk: Fk) -> Result<Value, QueryError> {
         Some(view) => tx_status_json_in(query, tx_fk, &view),
         None => Ok(json!({ "confirmed": false })),
     }
+}
+
+/// Where a stored tx row is served from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Listing {
+    /// Confirmed on the active chain: the stored row is the transaction.
+    Confirmed,
+    /// Not confirmed, and the mempool holds the txid: the mempool's copy is
+    /// the transaction, and its witness can differ from the stored row's.
+    Mempool,
+    /// Neither: the row was reorged out and is not back in the mempool, or it
+    /// lost its inputs to a conflicting tx.
+    Gone,
+}
+
+/// The mempool's settle generation. Read it before the reads that decide a
+/// listing and hand it to [`require_settled`]. 0 without a mempool.
+pub fn pool_settle(mempool: Option<&MempoolHub>) -> u64 {
+    mempool.map_or(0, MempoolHub::pool_settle_gen)
+}
+
+/// Refuse to call a tx gone while the chain tip may be moving.
+///
+/// A connect, disconnect or reorg holds the settle generation odd from before
+/// the tip moves until the mempool has re-accepted what the disconnected
+/// blocks held (`accept_branch_prefix`). In that window a transaction of a
+/// disconnected block is neither confirmed nor in the mempool yet, and a 404
+/// would tell a client it was dropped. A generation that is odd, or has moved
+/// since `settle0`, means the reads may straddle a tip change: 503, as for a
+/// pinned view that moved. Without a mempool there is nothing to wait for.
+pub fn require_settled(mempool: Option<&MempoolHub>, settle0: u64) -> Result<(), QueryError> {
+    match mempool {
+        Some(m) if settle0 % 2 == 1 || m.pool_settle_gen() != settle0 => {
+            Err(rbitcoin_store::StoreError::Stale("chain view moved"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Whether the node serves a stored tx row, and from where.
+///
+/// Esplora answers 404 for [`Listing::Gone`], and `confirmed: false` means
+/// "in the mempool". Gone is only answered once the pool has settled since
+/// `settle0` ([`require_settled`]). A pinned `?asof=` view has no mempool and
+/// does not use this.
+pub fn tx_listing(
+    query: &Query,
+    mempool: Option<&MempoolHub>,
+    tx_fk: Fk,
+    txid: &[u8; 32],
+    settle0: u64,
+) -> Result<Listing, QueryError> {
+    if query.store().is_confirmed_strong(tx_fk)? {
+        return Ok(Listing::Confirmed);
+    }
+    if mempool.is_some_and(|m| m.contains(&Txid::from_byte_array(*txid))) {
+        return Ok(Listing::Mempool);
+    }
+    // Confirmed since the first read leaves the mempool and moves the
+    // generation, so it lands here as a refusal and not as Gone.
+    require_settled(mempool, settle0)?;
+    Ok(Listing::Gone)
 }
 
 /// Header at `height` on `view`'s chain.

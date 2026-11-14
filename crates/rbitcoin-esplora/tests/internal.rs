@@ -722,3 +722,97 @@ async fn internal_totals_take_heavy_turns(
 
 #[cfg(not(debug_assertions))]
 async fn internal_totals_take_heavy_turns(_: &Query, _: &std::path::Path, _: &str, _: &str) {}
+
+/// A stored tx that was reorged out and is not in the mempool is unknown to
+/// the bulk routes: no row on `/internal/txs`, an empty slot list on both
+/// outspends routes. Back in the mempool it answers again.
+#[tokio::test]
+async fn bulk_routes_skip_a_reorged_out_tx_until_the_mempool_holds_it() {
+    let pad = pad_hub("bulk-reorged-out", 1);
+    let fan_txid = mine_fan_tx(&pad, 3);
+    let fan = fan_txid.to_string();
+    let sock_dir = rbitcoin_query::testutil::TempDir::for_socket().expect("temp dir");
+    let (handle, sock) = run_unix(
+        sock_dir.path(),
+        Arc::clone(&pad.q),
+        Some(Arc::clone(&pad.hub)),
+    )
+    .await;
+    let ids = serde_json::to_vec(&json!([fan])).unwrap();
+    let rows = |sock: &std::path::Path| {
+        let (sock, ids, fan) = (sock.to_path_buf(), ids.clone(), fan.clone());
+        async move {
+            let (st, txs) = http_post_unix(&sock, "/internal/txs", &ids).await;
+            assert_eq!(st, 200, "{txs}");
+            let (st, bulk) = http_post_unix(&sock, "/internal/txs/outspends/by-txid", &ids).await;
+            assert_eq!(st, 200, "{bulk}");
+            let (st, public) = http_get_unix(&sock, &format!("/txs/outspends?txids={fan}")).await;
+            assert_eq!(st, 200, "{public}");
+            let txs: Vec<Value> = serde_json::from_str(&txs).unwrap();
+            let bulk: Vec<Vec<Value>> = serde_json::from_str(&bulk).unwrap();
+            let public: Vec<Vec<Value>> = serde_json::from_str(&public).unwrap();
+            (txs.len(), bulk[0].len(), public[0].len())
+        }
+    };
+    assert_eq!(rows(&sock).await, (1, 3, 3), "confirmed");
+
+    pad.q.disconnect_tip().unwrap();
+    assert_eq!(
+        rows(&sock).await,
+        (0, 0, 0),
+        "reorged out, not in the mempool"
+    );
+
+    let fan_tx = {
+        use bitcoin::consensus::encode::deserialize;
+        use bitcoin::hashes::Hash;
+        let fk = pad
+            .q
+            .tx_fk_by_txid(&fan_txid.to_byte_array())
+            .unwrap()
+            .unwrap();
+        deserialize::<Transaction>(&pad.q.tx_wire_bytes(fk).unwrap()).unwrap()
+    };
+    pad.hub.accept_tx(&fan_tx).expect("back in the mempool");
+    assert_eq!(rows(&sock).await, (1, 3, 3), "in the mempool");
+
+    handle.shutdown().await;
+    let _ = pad.dir;
+}
+
+/// While a connect, disconnect or reorg holds the pool, a stored tx that is
+/// neither confirmed nor in the mempool yet makes every bulk route answer 503
+/// for the batch, not an omitted row or an empty slot list. Once the pool has
+/// settled the row is skipped again.
+#[tokio::test]
+async fn bulk_routes_answer_503_for_an_unlisted_row_while_a_reorg_holds_the_pool() {
+    let pad = pad_hub("bulk-reorg-window", 1);
+    let fan_txid = mine_fan_tx(&pad, 3);
+    let fan = fan_txid.to_string();
+    let sock_dir = rbitcoin_query::testutil::TempDir::for_socket().expect("temp dir");
+    let (handle, sock) = run_unix(
+        sock_dir.path(),
+        Arc::clone(&pad.q),
+        Some(Arc::clone(&pad.hub)),
+    )
+    .await;
+    let ids = serde_json::to_vec(&json!([fan])).unwrap();
+    pad.q.disconnect_tip().unwrap();
+
+    let hold = pad.hub.template_hold();
+    let (st, body) = http_post_unix(&sock, "/internal/txs", &ids).await;
+    assert_eq!((st, body.as_str()), (503, "chain view moved"));
+    let (st, body) = http_post_unix(&sock, "/internal/txs/outspends/by-txid", &ids).await;
+    assert_eq!((st, body.as_str()), (503, "chain view moved"));
+    let (st, body) = http_get_unix(&sock, &format!("/txs/outspends?txids={fan}")).await;
+    assert_eq!((st, body.as_str()), (503, "chain view moved"));
+    drop(hold);
+
+    let (st, body) = http_post_unix(&sock, "/internal/txs", &ids).await;
+    assert_eq!((st, body.as_str()), (200, "[]"));
+    let (st, body) = http_post_unix(&sock, "/internal/txs/outspends/by-txid", &ids).await;
+    assert_eq!((st, body.as_str()), (200, "[[]]"));
+
+    handle.shutdown().await;
+    let _ = pad.dir;
+}

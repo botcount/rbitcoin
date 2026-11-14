@@ -1,12 +1,13 @@
 //! Esplora route handlers beyond tip/header/basic tx.
 
 use crate::server::{
-    block_hash_hex, json_reply_here, json_reply_shared, maybe_attach_view, mempool_wire, not_found,
-    parse_hash32, pin_or_reject, plain_ok, store_err, AppState, AsOf, GbtCache, JoinClient,
+    block_hash_hex, json_reply_here, json_reply_shared, maybe_attach_view, not_found, parse_hash32,
+    pin_or_reject, plain_ok, store_err, stored_tx_listing, tx_body_source, AppState, AsOf,
+    GbtCache, JoinClient, TxBody,
 };
 use crate::tx_json::{
-    build_tx_json, build_tx_json_from_tx, history_items_to_tx_json, tx_status_json_in,
-    utxo_list_json, vout_fields,
+    build_tx_json, build_tx_json_from_tx, history_items_to_tx_json, pool_settle, tx_status_json_in,
+    utxo_list_json, vout_fields, Listing,
 };
 use axum::body::Bytes;
 use axum::extract::{Path, Query as AxumQuery, State};
@@ -477,27 +478,21 @@ pub async fn tx_raw(State(st): State<AppState>, Path(txid_hex): Path<String>) ->
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
         };
-        match st.query.tx_fk_by_txid(&txid) {
-            Ok(Some(fk)) => match st.query.tx_wire_bytes(fk) {
-                Ok(raw) => (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/octet-stream")],
-                    raw,
-                )
-                    .into_response(),
-                Err(e) => store_err(e),
+        let raw = match tx_body_source(&st, &txid) {
+            Ok(Some(TxBody::Stored(fk))) => match st.query.tx_wire_bytes(fk) {
+                Ok(raw) => raw,
+                Err(e) => return store_err(e),
             },
-            Ok(None) => match mempool_wire(&st, &txid) {
-                Some(tx) => (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/octet-stream")],
-                    bitcoin::consensus::serialize(&tx),
-                )
-                    .into_response(),
-                None => not_found(),
-            },
-            Err(e) => store_err(e),
-        }
+            Ok(Some(TxBody::Mempool(tx))) => bitcoin::consensus::serialize(&tx),
+            Ok(None) => return not_found(),
+            Err(e) => return store_err(e),
+        };
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            raw,
+        )
+            .into_response()
     })
     .await
 }
@@ -760,7 +755,12 @@ pub async fn tx_outspend(
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
         };
+        let settle0 = pool_settle(st.mempool.as_deref());
         let in_class_a = match st.query.tx_fk_by_txid(&txid) {
+            Ok(Some(fk)) if asof.is_none() => match stored_tx_listing(&st, fk, &txid, settle0) {
+                Ok(listing) => listing != Listing::Gone,
+                Err(e) => return store_err(e),
+            },
             Ok(v) => v.is_some(),
             Err(e) => return store_err(e),
         };
@@ -795,7 +795,13 @@ pub async fn tx_outspends(
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
         };
+        let settle0 = pool_settle(st.mempool.as_deref());
         let fk = match st.query.tx_fk_by_txid(&txid) {
+            Ok(Some(fk)) if asof.is_none() => match stored_tx_listing(&st, fk, &txid, settle0) {
+                Ok(Listing::Gone) => return not_found(),
+                Ok(_) => Some(fk),
+                Err(e) => return store_err(e),
+            },
             Ok(v) => v,
             Err(e) => return store_err(e),
         };

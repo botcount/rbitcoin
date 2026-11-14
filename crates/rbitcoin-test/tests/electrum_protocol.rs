@@ -2569,9 +2569,9 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
     );
 
     let (st, _, body) = http_get_raw(esplora.local_addr, &format!("/tx/{spend_hex}/status")).await;
-    assert_eq!(st, 200, "spend status after disconnect={body}");
-    let spend_st: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(spend_st["confirmed"], false, "{spend_st}");
+    // The spend left the best chain and this server has no mempool to hold
+    // it, so it is gone (`confirmed: false` would mean "in the mempool").
+    assert_eq!(st, 404, "spend status after disconnect={body}");
     assert_esplora_asof_dead(
         esplora.local_addr,
         &format!("/scripthash/{sh}/utxo?asof={asof_spend}"),

@@ -10,7 +10,6 @@ use rbitcoin_primitives::Height;
 use std::borrow::Borrow;
 use std::hash::BuildHasherDefault;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -995,8 +994,8 @@ pub struct ScriptCheckJob {
     pub tx: JobTx,
     pub flags: ScriptVerifyFlags,
     /// Legacy sighash bytes still allowed for this transaction. One budget
-    /// shared by every input. `u64::MAX` until an unconfirmed check starts.
-    pub(crate) legacy_sighash_left: AtomicU64,
+    /// shared by every input. Unlimited until an unconfirmed check starts.
+    pub(crate) legacy_budget: crate::script::interpreter::LegacyBudget,
     /// Lookup/structure `TxPrecompute`. Set on the confirm path; tests lazy-`from_tx`.
     pub pre: std::sync::OnceLock<JobPre>,
     skip_segwit_midstates: bool,
@@ -1115,7 +1114,7 @@ impl ScriptCheckJob {
             prevouts,
             tx,
             flags,
-            legacy_sighash_left: AtomicU64::new(u64::MAX),
+            legacy_budget: crate::script::interpreter::LegacyBudget::unarmed(),
             pre: std::sync::OnceLock::new(),
             skip_segwit_midstates,
         }

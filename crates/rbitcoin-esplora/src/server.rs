@@ -1,7 +1,10 @@
 //! Esplora HTTP listener (axum + tower limits).
 
 use crate::handlers;
-use crate::tx_json::{build_tx_json, build_tx_json_from_tx, tx_status_json_in};
+use crate::tx_json::{
+    build_tx_json, build_tx_json_from_tx, pool_settle, require_settled, tx_listing,
+    tx_status_json_in, Listing,
+};
 use axum::extract::{FromRequestParts, Path, Query as AxumQuery, Request, State};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderValue, StatusCode};
@@ -1439,24 +1442,19 @@ pub async fn tx_full(State(st): State<AppState>, Path(txid_hex): Path<String>) -
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
         };
-        match st.query.tx_fk_by_txid(&txid) {
-            Ok(Some(fk)) => match build_tx_json(&st.query, fk, st.network, None) {
+        match tx_body_source(&st, &txid) {
+            Ok(Some(TxBody::Stored(fk))) => match build_tx_json(&st.query, fk, st.network, None) {
                 Ok(v) => json_reply_here(v),
                 Err(e) => store_err(e),
             },
-            Ok(None) => match mempool_wire(&st, &txid) {
-                Some(tx) => match build_tx_json_from_tx(
-                    &st.query,
-                    &tx,
-                    st.network,
-                    None,
-                    st.mempool.as_deref(),
-                ) {
+            Ok(Some(TxBody::Mempool(tx))) => {
+                match build_tx_json_from_tx(&st.query, &tx, st.network, None, st.mempool.as_deref())
+                {
                     Ok(v) => json_reply_here(v),
                     Err(e) => store_err(e),
-                },
-                None => not_found(),
-            },
+                }
+            }
+            Ok(None) => not_found(),
             Err(e) => store_err(e),
         }
     })
@@ -1469,18 +1467,15 @@ pub async fn tx_hex(State(st): State<AppState>, Path(txid_hex): Path<String>) ->
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
         };
-        match st.query.tx_fk_by_txid(&txid) {
-            Ok(Some(fk)) => match st.query.tx_wire_bytes(fk) {
+        match tx_body_source(&st, &txid) {
+            Ok(Some(TxBody::Stored(fk))) => match st.query.tx_wire_bytes(fk) {
                 Ok(raw) => plain_ok(rbitcoin_primitives::hex_encode(&(raw))),
                 Err(e) => store_err(e),
             },
-            Ok(None) => match mempool_wire(&st, &txid) {
-                Some(tx) => {
-                    let raw = bitcoin::consensus::serialize(&tx);
-                    plain_ok(rbitcoin_primitives::hex_encode(&(raw)))
-                }
-                None => not_found(),
-            },
+            Ok(Some(TxBody::Mempool(tx))) => plain_ok(rbitcoin_primitives::hex_encode(
+                bitcoin::consensus::serialize(&tx),
+            )),
+            Ok(None) => not_found(),
             Err(e) => store_err(e),
         }
     })
@@ -1497,37 +1492,62 @@ pub async fn tx_status(
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
         };
-        match st.query.tx_fk_by_txid(&txid) {
-            Ok(Some(fk)) => {
-                let view = match pin_or_reject(&st.query, ChainViewKind::Tip, asof) {
-                    Ok(v) => v,
-                    Err(r) => return r,
-                };
-                let status = match &view {
-                    Some(v) => tx_status_json_in(&st.query, fk, v),
-                    None => Ok(json!({ "confirmed": false })),
-                };
-                match status {
-                    Ok(v) => maybe_attach_view(json_reply_here(v), view),
-                    Err(e) => store_err(e),
-                }
-            }
-            Ok(None) => {
-                if asof.is_some() {
-                    return not_found();
-                }
-                use bitcoin::hashes::Hash;
-                let tid = bitcoin::Txid::from_byte_array(txid);
-                if st.mempool.as_ref().is_some_and(|m| m.contains(&tid)) {
-                    json_reply_here(json!({ "confirmed": false }))
-                } else {
-                    not_found()
-                }
-            }
-            Err(e) => store_err(e),
-        }
+        tx_status_reply(&st, &txid, asof, || {})
     })
     .await
+}
+
+/// [`tx_status`] after the txid is parsed. `after_lookup` runs once the row
+/// is found and before the view is pinned, where a tip change would land.
+///
+/// The status is read on the pinned view. Only an unconfirmed answer asks the
+/// mempool, so a tip change between the reads cannot turn a confirmed tx into
+/// a 200 `confirmed: false` for a tx the mempool does not hold: the pool's
+/// settle generation was taken first and a moved one is a 503.
+#[doc(hidden)]
+pub fn tx_status_reply(
+    st: &AppState,
+    txid: &[u8; 32],
+    asof: Option<[u8; 32]>,
+    after_lookup: impl FnOnce(),
+) -> Response {
+    let settle0 = pool_settle(st.mempool.as_deref());
+    match st.query.tx_fk_by_txid(txid) {
+        Ok(Some(fk)) => {
+            after_lookup();
+            let view = match pin_or_reject(&st.query, ChainViewKind::Tip, asof) {
+                Ok(v) => v,
+                Err(r) => return r,
+            };
+            let status = match &view {
+                Some(v) => tx_status_json_in(&st.query, fk, v),
+                None => Ok(json!({ "confirmed": false })),
+            };
+            let status = match status {
+                Ok(v) => v,
+                Err(e) => return store_err(e),
+            };
+            if asof.is_none() && status["confirmed"] != true {
+                match mempool_holds(st, txid, settle0) {
+                    Ok(true) => {}
+                    Ok(false) => return not_found(),
+                    Err(e) => return store_err(e),
+                }
+            }
+            maybe_attach_view(json_reply_here(status), view)
+        }
+        Ok(None) => {
+            if asof.is_some() {
+                return not_found();
+            }
+            if mempool_wire_contains(st, txid) {
+                json_reply_here(json!({ "confirmed": false }))
+            } else {
+                not_found()
+            }
+        }
+        Err(e) => store_err(e),
+    }
 }
 
 pub async fn fallback_404() -> Response {
@@ -1569,6 +1589,69 @@ pub fn block_hash_hex(hash: &[u8; 32]) -> String {
 #[allow(clippy::result_unit_err)] // bad hex is (); callers map it to not found
 pub fn parse_hash32(s: &str) -> Result<[u8; 32], ()> {
     rbitcoin_primitives::parse_display_hash32(s).map_err(|_| ())
+}
+
+/// Whether a stored tx row is served, and from where. See [`tx_listing`].
+pub fn stored_tx_listing(
+    st: &AppState,
+    fk: rbitcoin_primitives::Fk,
+    txid: &[u8; 32],
+    settle0: u64,
+) -> Result<Listing, rbitcoin_query::QueryError> {
+    tx_listing(&st.query, st.mempool.as_deref(), fk, txid, settle0)
+}
+
+/// The mempool holds `txid`. A txid it does not hold is only called missing
+/// once the pool has settled since `settle0` ([`require_settled`]).
+pub fn mempool_holds(
+    st: &AppState,
+    txid: &[u8; 32],
+    settle0: u64,
+) -> Result<bool, rbitcoin_query::QueryError> {
+    if mempool_wire_contains(st, txid) {
+        return Ok(true);
+    }
+    require_settled(st.mempool.as_deref(), settle0)?;
+    Ok(false)
+}
+
+fn mempool_wire_contains(st: &AppState, txid: &[u8; 32]) -> bool {
+    use bitcoin::hashes::Hash;
+    let tid = bitcoin::Txid::from_byte_array(*txid);
+    st.mempool.as_ref().is_some_and(|m| m.contains(&tid))
+}
+
+/// The transaction a tx route serves.
+pub enum TxBody {
+    /// Confirmed: the stored row.
+    Stored(rbitcoin_primitives::Fk),
+    /// Not confirmed: the mempool's copy. A stored row of the same txid can
+    /// carry another witness, so its body is not served.
+    Mempool(bitcoin::Transaction),
+}
+
+/// Pick the body of `txid`: the stored row while it is confirmed, else the
+/// mempool's copy, else `None` (404). A gone row is `None` only once the pool
+/// has settled. See [`tx_listing`].
+pub fn tx_body_source(
+    st: &AppState,
+    txid: &[u8; 32],
+) -> Result<Option<TxBody>, rbitcoin_query::QueryError> {
+    let settle0 = pool_settle(st.mempool.as_deref());
+    let Some(fk) = st.query.tx_fk_by_txid(txid)? else {
+        return Ok(mempool_wire(st, txid).map(TxBody::Mempool));
+    };
+    match stored_tx_listing(st, fk, txid, settle0)? {
+        Listing::Confirmed => Ok(Some(TxBody::Stored(fk))),
+        Listing::Mempool => match mempool_wire(st, txid) {
+            Some(tx) => Ok(Some(TxBody::Mempool(tx))),
+            None => {
+                require_settled(st.mempool.as_deref(), settle0)?;
+                Ok(None)
+            }
+        },
+        Listing::Gone => Ok(None),
+    }
 }
 
 pub fn mempool_wire(st: &AppState, txid: &[u8; 32]) -> Option<bitcoin::Transaction> {

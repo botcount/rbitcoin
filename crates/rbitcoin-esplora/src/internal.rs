@@ -5,7 +5,7 @@ use crate::handlers::{confirmed_output_count, spawn_join, write_outspends};
 use crate::handlers::{outspend_json, resolve_address_sh, sh_info_reply};
 use crate::server::{
     block_hash_hex, json_bytes_reply, json_reply_here, parse_hash32, pin_or_reject, store_err,
-    AppState,
+    stored_tx_listing, AppState,
 };
 #[cfg(unix)]
 use crate::server::{not_found, AsOf};
@@ -13,6 +13,7 @@ use crate::server::{not_found, AsOf};
 use crate::tx_json::{
     build_tx_json, build_tx_json_from_tx, build_tx_json_from_tx_with_status, tx_status_json,
 };
+use crate::tx_json::{pool_settle, Listing};
 #[cfg(unix)]
 use axum::body::Bytes;
 use axum::extract::{Path, Query as AxumQuery, State};
@@ -130,13 +131,24 @@ pub fn entry_json(st: &AppState, mp: &MempoolHub, e: &MempoolTxSnapEntry) -> Opt
     serde_json::from_str(raw).ok()
 }
 
+/// The row for `id`: the stored tx while it is confirmed, else the mempool's
+/// copy, else none. A gone row is only none once the pool has settled, else
+/// the batch is a 503 (see [`crate::tx_json::require_settled`]).
 #[cfg(unix)]
 #[doc(hidden)]
-pub fn confirmed_or_mempool_tx(st: &AppState, id: &[u8; 32]) -> Option<Value> {
-    if let Ok(Some(fk)) = st.query.tx_fk_by_txid(id) {
-        return build_tx_json(&st.query, fk, st.network, None).ok();
+pub fn confirmed_or_mempool_tx(
+    st: &AppState,
+    id: &[u8; 32],
+) -> Result<Option<Value>, rbitcoin_query::QueryError> {
+    let settle0 = pool_settle(st.mempool.as_deref());
+    if let Some(fk) = st.query.tx_fk_by_txid(id)? {
+        match stored_tx_listing(st, fk, id, settle0)? {
+            Listing::Confirmed => return Ok(build_tx_json(&st.query, fk, st.network, None).ok()),
+            Listing::Mempool => {}
+            Listing::Gone => return Ok(None),
+        }
     }
-    mempool_tx_json(st, id)
+    Ok(mempool_tx_json(st, id))
 }
 
 #[cfg(unix)]
@@ -156,7 +168,7 @@ pub fn mempool_tx_json(st: &AppState, id: &[u8; 32]) -> Option<Value> {
 async fn post_tx_batch(
     st: AppState,
     body: Bytes,
-    lookup: fn(&AppState, &[u8; 32]) -> Option<Value>,
+    lookup: fn(&AppState, &[u8; 32]) -> Result<Option<Value>, rbitcoin_query::QueryError>,
 ) -> Response {
     if body.len() > st.max_body {
         return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response();
@@ -168,8 +180,10 @@ async fn post_tx_batch(
         };
         let mut out = Vec::new();
         for id in ids {
-            if let Some(v) = lookup(&st, &id) {
-                out.push(v);
+            match lookup(&st, &id) {
+                Ok(Some(v)) => out.push(v),
+                Ok(None) => {}
+                Err(e) => return store_err(e),
             }
         }
         json_reply_here(out)
@@ -184,7 +198,7 @@ pub async fn post_internal_txs(State(st): State<AppState>, body: Bytes) -> Respo
 
 #[cfg(unix)]
 pub async fn post_internal_mempool_txs(State(st): State<AppState>, body: Bytes) -> Response {
-    post_tx_batch(st, body, mempool_tx_json).await
+    post_tx_batch(st, body, |st, id| Ok(mempool_tx_json(st, id))).await
 }
 
 #[cfg(unix)]
@@ -368,19 +382,28 @@ pub const MAX_OUTSPENDS_ENTRIES: u64 = 250_000;
 /// [`MAX_OUTSPENDS_ENTRIES`], before any slot is built.
 pub fn outspends_for_txid_opts(st: &AppState, ids: Vec<Option<[u8; 32]>>) -> Response {
     let mp = st.mempool.as_deref();
+    let settle0 = pool_settle(mp);
     let mut nouts = Vec::with_capacity(ids.len());
     let mut total = 0u64;
     for id in &ids {
+        let from_mempool = |id: &[u8; 32]| {
+            mp.and_then(|mp| mp.get_tx(&Txid::from_byte_array(*id)))
+                .map_or(0, |tx| tx.output.len() as u32)
+        };
         let nout = match id {
             None => 0,
+            // A stored row that is neither confirmed nor in the mempool is
+            // gone, like an unknown txid, once the pool has settled.
             Some(id) => match st.query.tx_fk_by_txid(id) {
-                Ok(Some(fk)) => match confirmed_output_count(&st.query, fk) {
-                    Ok(n) => n,
+                Ok(Some(fk)) => match stored_tx_listing(st, fk, id, settle0) {
+                    Ok(Listing::Gone) => 0,
+                    Ok(_) => match confirmed_output_count(&st.query, fk) {
+                        Ok(n) => n,
+                        Err(e) => return store_err(e),
+                    },
                     Err(e) => return store_err(e),
                 },
-                _ => mp
-                    .and_then(|mp| mp.get_tx(&Txid::from_byte_array(*id)))
-                    .map_or(0, |tx| tx.output.len() as u32),
+                _ => from_mempool(id),
             },
         };
         total += u64::from(nout);
