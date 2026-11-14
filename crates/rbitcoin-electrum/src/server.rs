@@ -2391,6 +2391,10 @@ pub fn settled_restatus_notes(
     subs: &[[u8; 32]],
     heights: Option<&[u32]>,
 ) -> Option<Vec<([u8; 32], String)>> {
+    // A degraded or rebuilding index reads as an empty history. Pushing that
+    // would tell a wallet its address emptied, so hold instead: the caller
+    // reads every sub again once the index serves.
+    let _sh_guard = query.sh_read_enter()?;
     let gen = mempool.map(MempoolHub::pool_settle_gen);
     if gen.is_some_and(|g| g % 2 == 1) {
         return None;
@@ -2661,10 +2665,7 @@ where
     // mark is `asof not on chain`; at or behind it the pin succeeds and the
     // later gate says the index is off. Refuse before any pin.
     if method_needs_sh_index(method) && !query.sh_history_available() {
-        return (
-            Err(rbitcoin_query::SCRIPTHASH_INDEX_DISABLED.to_string()),
-            None,
-        );
+        return (Err(query.sh_unavailable_message().to_string()), None);
     }
     let kind = electrum_pin_kind(method);
     match take_trailing_asof(method, params) {
@@ -2924,9 +2925,15 @@ pub fn dispatch_pinned(
     pinned: Option<&ChainView>,
     is_asof: bool,
 ) -> Result<Value, String> {
-    if method_needs_sh_index(method) && !query.sh_history_available() {
-        return Err(rbitcoin_query::SCRIPTHASH_INDEX_DISABLED.to_string());
-    }
+    // Held for the whole dispatch: the rebuild's wipe waits for it.
+    let _sh_guard = if method_needs_sh_index(method) {
+        match query.sh_read_enter() {
+            Some(g) => Some(g),
+            None => return Err(query.sh_unavailable_message().to_string()),
+        }
+    } else {
+        None
+    };
     let protocol = conn.protocol.clone();
     let header_sub = &mut conn.header_sub;
     let sh_subs = &mut conn.sh_subs;

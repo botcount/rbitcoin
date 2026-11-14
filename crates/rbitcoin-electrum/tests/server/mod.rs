@@ -378,6 +378,22 @@ fn restatus_notes_scans_intermediate_tick_heights() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A degraded or rebuilding scripthash index reads as empty history. The
+/// subscription push must hold (None: the caller reads every sub again once the
+/// index serves) instead of telling a wallet its address emptied.
+#[test]
+fn settled_restatus_holds_while_sh_index_degraded() {
+    let (dir, q) = tmp_store();
+    let sh = rbitcoin_store::script_hash(&[0x51]);
+    assert!(settled_restatus_notes(&q, None, &[sh], None).is_some());
+    q.mark_sh_degraded("test fault");
+    assert!(
+        settled_restatus_notes(&q, None, &[sh], None).is_none(),
+        "degraded index must not produce statuses"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn negotiate_protocol_intersection_and_asof_dialect() {
     assert_eq!(negotiate_protocol(&json!([])).unwrap(), PROTOCOL_MAX);

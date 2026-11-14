@@ -1097,12 +1097,22 @@ impl Query {
         self.sh.pending_cv.notify_all();
     }
 
+    /// A fault in the SH append does not stop the chain or the appender:
+    /// the index is marked degraded, the job is dropped, and the
+    /// rebuild supervisor restores the index.
     pub fn apply_sh_job(&self, job: ShPendingJob) -> Result<(), QueryError> {
-        let applied = self.apply_sh_job_inner(&job)?;
-        if applied {
-            unindex_sh_ram_head(&mut self.sh.ram_head.lock().unwrap(), &job);
+        match self.apply_sh_job_inner(&job) {
+            Ok(applied) => {
+                if applied {
+                    unindex_sh_ram_head(&mut self.sh.ram_head.lock().unwrap(), &job);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.mark_sh_degraded(&format!("write-behind h={}: {e}", job.height.0));
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     #[doc(hidden)]
@@ -1220,6 +1230,9 @@ impl Query {
     /// Restore SH watermark from durable `include_hwm` and re-queue heights the
     /// RAM write-behind lost on restart.
     pub fn recover_sh_writebehind(&self) -> Result<(), QueryError> {
+        if self.sh_degraded() {
+            return Ok(());
+        }
         let recovered = self.recover_sh_indexed_through()?;
         self.set_sh_indexed_through_height(recovered);
         if !self.store.scripthash.has_durable_index() {
@@ -1450,20 +1463,28 @@ impl Query {
             .unwrap_or([0u8; 32]);
         let tx_fks = self.block_tx_fks(height)?;
 
-        let mut by_sh: HashMap<[u8; 32], Vec<Fk>> = HashMap::new();
-        for &tx_fk in &tx_fks {
-            let outputs = self.tx_output_run_class_a(tx_fk)?;
-            for o in &outputs {
-                by_sh.entry(script_hash(&o.script)).or_default().push(tx_fk);
+        // SH is optional: a fault here degrades the index, it never fails the
+        // disconnect. While degraded the unlink is skipped; the rebuild reads
+        // Class A and readers filter creates that are no longer confirmed.
+        let sh_live = self.sh_index_enabled() && !self.sh_degraded();
+        if sh_live {
+            let mut by_sh: HashMap<[u8; 32], Vec<Fk>> = HashMap::new();
+            for &tx_fk in &tx_fks {
+                let outputs = self.tx_output_run_class_a(tx_fk)?;
+                for o in &outputs {
+                    by_sh.entry(script_hash(&o.script)).or_default().push(tx_fk);
+                }
+            }
+            let mut groups: Vec<([u8; 32], Vec<Fk>)> = Vec::with_capacity(by_sh.len());
+            for (sh, mut fks) in by_sh {
+                fks.sort_by_key(|fk| fk.0);
+                fks.dedup();
+                groups.push((sh, fks));
+            }
+            if let Err(e) = self.store.scripthash.unlink_creates_batch(&groups) {
+                self.mark_sh_degraded(&format!("disconnect h={} unlink: {e}", height.0));
             }
         }
-        let mut groups: Vec<([u8; 32], Vec<Fk>)> = Vec::with_capacity(by_sh.len());
-        for (sh, mut fks) in by_sh {
-            fks.sort_by_key(|fk| fk.0);
-            fks.dedup();
-            groups.push((sh, fks));
-        }
-        self.store.scripthash.unlink_creates_batch(&groups)?;
 
         let write = rbitcoin_store::ClassCWrite::new();
         self.store.confirmed.disconnect_tip(&write, height)?;
@@ -1482,7 +1503,11 @@ impl Query {
         }
         self.store.flush_confirmed_only()?;
         self.sealed_tip.shrunk_to(self.tip_height());
-        self.store.scripthash.commit_deferred_empty_heads()?;
+        if !self.sh_degraded() {
+            if let Err(e) = self.store.scripthash.commit_deferred_empty_heads() {
+                self.mark_sh_degraded(&format!("disconnect h={} empty heads: {e}", height.0));
+            }
+        }
         self.store.clamp_spend_durable()?;
         log_disconnect_tip(height.0, &hash, tx_fks.len());
 

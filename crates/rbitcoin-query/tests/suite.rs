@@ -22,6 +22,7 @@ mod root;
 mod run_builder_core;
 mod scripthash;
 mod sh_builder;
+mod sh_degraded;
 mod soft_densify;
 mod sp_read;
 mod sp_store_tests;

@@ -71,8 +71,15 @@ impl Query {
     }
 
     /// Confirm SH write-behind enqueue: Tip + shindex on.
+    /// False while the index is degraded: SH work is deferred.
     #[inline]
     pub fn enqueues_sh_writebehind(&self) -> bool {
+        !self.sh_degraded() && self.sh_writebehind_wanted()
+    }
+
+    /// Tip + shindex on, ignoring a degraded index. The appender thread is
+    /// started on this so a rebuild has an appender to hand back to.
+    pub fn sh_writebehind_wanted(&self) -> bool {
         self.index_mode()
             .expect("index mode cell")
             .enqueues_sh_writebehind(self.sh_index_enabled())
@@ -154,6 +161,13 @@ impl Query {
     /// Requires a non-empty durable head, no residual on-disk runs, and
     /// `include_hwm`/SEAL **≥** tip create HWM (strict; not memtable lag).
     pub fn sh_is_tip_ready(&self) -> bool {
+        !self.sh_degraded() && self.sh_covers_tip()
+    }
+
+    /// [`Self::sh_is_tip_ready`] without the degraded gate. The rebuild's own
+    /// materialize / backfill loops ask this one.
+    #[doc(hidden)]
+    pub fn sh_covers_tip(&self) -> bool {
         use crate::sh_builder::durable_sh_inclusion_floor;
 
         let tip_max = self.store.txs.count();
@@ -284,7 +298,7 @@ impl Query {
                     self.store.scripthash.note_include_hwm(seal)?;
                 }
                 self.sync_sh_seal_from_include_hwm()?;
-                if self.sh_is_tip_ready() {
+                if self.sh_covers_tip() {
                     rbitcoin_log::info!(
                         "node: scripthash already tip-ready (durable head covers tip) — \
                      skip Class A recollect and bulk materialize"
@@ -347,7 +361,7 @@ impl Query {
             const GAP: &str =
                 "scripthash unsorted-shards create gap remain after materialize drain \
                      (refuse tip-follow / Electrum)";
-            while !self.sh_is_tip_ready() {
+            while !self.sh_covers_tip() {
                 if !self.store.scripthash.has_durable_index()
                     || self.store.scripthash.include_hwm() >= self.store.txs.count()
                 {
@@ -373,7 +387,7 @@ impl Query {
         let mut n = 0u64;
         loop {
             n = n.saturating_add(self.backfill_sh_creates_from_class_a()?);
-            if self.sh_is_tip_ready() {
+            if self.sh_covers_tip() {
                 #[cfg(debug_assertions)]
                 if let Some(hook) = sh_backfill_on_ready_hook() {
                     hook(self);

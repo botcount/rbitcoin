@@ -325,13 +325,21 @@ pub async fn stamp_chain_view_mw(State(st): State<AppState>, req: Request, next:
         Err(()) => return not_found(),
     };
     let path = req.uri().path().to_string();
-    if path_uses_sh_view(&path) && !st.query.sh_history_available() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            rbitcoin_query::SCRIPTHASH_INDEX_DISABLED,
-        )
-            .into_response();
-    }
+    // Held until the response is built: the rebuild's wipe waits for it.
+    let _sh_guard = if path_uses_sh_view(&path) {
+        match st.query.sh_read_enter() {
+            Some(g) => Some(g),
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    st.query.sh_unavailable_message(),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
     if asof.is_some() && !path_accepts_asof(&path) {
         return not_found();
     }

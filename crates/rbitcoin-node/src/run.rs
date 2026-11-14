@@ -895,6 +895,20 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             }
         },
     );
+    // Rebuilds a degraded SH index in the background.
+    // `RBITCOIN_SH_AUTO_REBUILD=0` leaves it degraded until a restart with
+    // `RBITCOIN_SH_FORCE_REBUILD=1` (or the degraded marker) wipes it at open.
+    let sh_rebuild = config.shindex.then(|| {
+        node.hub.query.set_sh_auto_rebuild(
+            std::env::var("RBITCOIN_SH_AUTO_REBUILD")
+                .map(|v| !matches!(v.trim(), "0" | "off" | "false" | "no"))
+                .unwrap_or(true),
+        );
+        rbitcoin_query::spawn_sh_rebuild_supervisor(
+            Arc::clone(&node.hub.query),
+            Arc::clone(&shutdown.flag),
+        )
+    });
     let peers_path = config.datadir.path().join("peers");
     let mut addrman = match AddrMan::load(&peers_path) {
         Ok(am) => {
@@ -1832,6 +1846,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if let Some(h) = sh_writebehind {
         let _ = h.join();
     }
+    if let Some(h) = sh_rebuild {
+        let _ = h.join();
+    }
     if let Some(h) = index_writebehind {
         let _ = h.join();
     }
@@ -2414,6 +2431,9 @@ pub fn apply_startup_index_mode(
     }
     // Before write-behind starts. An unproven head must not catch up by
     // appending from height 0; delete it and stay Direct until materialize.
+    query
+        .startup_sh_rebuild(config.shindex)
+        .map_err(|e| NodeError::Config(format!("scripthash rebuild at open: {e}")))?;
     query
         .discard_unproven_scripthash_head()
         .map_err(|e| NodeError::Config(format!("scripthash index: {e}")))?;
@@ -3147,7 +3167,7 @@ pub fn sh_writebehind_at_tip_entry(
     stop: Arc<AtomicBool>,
     on_fatal: impl FnOnce() + Send + 'static,
 ) -> Option<ShWritebehind> {
-    if !query.enqueues_sh_writebehind() {
+    if !query.sh_writebehind_wanted() {
         return None;
     }
     Some(spawn_sh_writebehind(query, stop, on_fatal))
