@@ -662,6 +662,13 @@ impl TableFile {
         self.io_handle()
     }
 
+    /// Handle of the locked write fd, the one `fallocate` runs on.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn write_handle(&self) -> crate::io_handle::IoHandle {
+        crate::io_handle::IoHandle::from_file(&self.file.lock().unwrap())
+    }
+
     /// Portable handle for the completion session (lock-free; do not close).
     #[inline]
     pub fn io_handle(&self) -> crate::io_handle::IoHandle {
@@ -1073,12 +1080,12 @@ impl TableFile {
         let policy = self.grow_policy.load(Ordering::Acquire);
         if policy == GrowPolicy::Tight1MiB as u8 {
             let target = need.saturating_add(1 << 20).max(need);
-            return self.grow_to(target);
+            return self.grow_to_at_least(target, need);
         }
         if policy == GrowPolicy::Align64k as u8 {
             const STEP: u64 = 64 * 1024;
             let target = need.div_ceil(STEP).saturating_mul(STEP).max(need);
-            return self.grow_to(target);
+            return self.grow_to_at_least(target, need);
         }
         let (headroom, step) = if cur >= 8 * 1024 * 1024 * 1024 {
             (1024 * 1024 * 1024u64, 512 * 1024 * 1024u64)
@@ -1099,12 +1106,25 @@ impl TableFile {
                 .saturating_mul(step)
                 .max(need)
         };
-        self.grow_to(new_cap)
+        self.grow_to_at_least(new_cap, need)
     }
 
     /// Fallocate/`set_len` to `new_cap` and publish `file_cap`.
     #[doc(hidden)]
     pub fn grow_to(&self, new_cap: u64) -> Result<(), StoreError> {
+        self.grow_to_at_least(new_cap, new_cap)
+    }
+
+    /// Grow to `new_cap`, or when the disk cannot hold that, to `need`.
+    ///
+    /// Fails, with the length and `file_cap` unchanged, when even `need`
+    /// cannot be reserved. The failure holds only where `fallocate` reports
+    /// it. Where `fallocate` is missing (Darwin, Windows, or a Linux
+    /// filesystem answering EOPNOTSUPP, ENOSYS or EINVAL) the file is
+    /// extended sparsely and a full disk shows up on a later page write.
+    #[doc(hidden)]
+    pub fn grow_to_at_least(&self, new_cap: u64, need: u64) -> Result<(), StoreError> {
+        let need = need.min(new_cap);
         if new_cap <= self.file_cap.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -1119,20 +1139,42 @@ impl TableFile {
         if new_cap <= self.file_cap.load(Ordering::Acquire) {
             return Ok(());
         }
-        match try_fallocate(&file, new_cap) {
-            Ok(()) => {}
-            // A full disk must fail here, before the caller frees or
-            // overwrites anything. A sparse `set_len` fallback would defer
-            // the same error to a later page write, in the middle of an
-            // operation that has already released its old pages.
-            Err(e) if is_out_of_space(&e) => return Err(StoreError::io(&self.path, e)),
-            Err(_) => {}
-        }
-        if file.metadata().map(|m| m.len()).unwrap_or(0) < new_cap {
-            set_file_len(&file, &self.path, new_cap)?;
-        }
+        let before = file
+            .metadata()
+            .map_err(|e| StoreError::io(&self.path, e))?
+            .len();
+        // Try the slab first, then the smaller `need` that the caller must
+        // have. A failed `fallocate` is not atomic: it can leave a longer
+        // file with the blocks kept, so each failure is rolled back before
+        // the next try, and `file_cap` never moves on a failure.
+        let mut target = new_cap;
+        let reached = loop {
+            match try_fallocate(&file, target) {
+                Ok(()) => break target,
+                // No `fallocate` here: reserve nothing, extend the length.
+                // This can leave a sparse file, and a later page write can
+                // still hit a full disk.
+                Err(e) if fallocate_unsupported(&e) => {
+                    if file.metadata().map(|m| m.len()).unwrap_or(0) < target {
+                        set_file_len(&file, &self.path, target)?;
+                    }
+                    break target;
+                }
+                // ENOSPC, EDQUOT or any other failure must stop here, before
+                // the caller frees or overwrites anything. A sparse
+                // `set_len` would defer the error to a later page write.
+                Err(e) => {
+                    let _ = file.set_len(before);
+                    if target > need {
+                        target = need;
+                        continue;
+                    }
+                    return Err(StoreError::io(&self.path, e));
+                }
+            }
+        };
         drop(file);
-        self.file_cap.store(new_cap, Ordering::Release);
+        self.file_cap.store(reached, Ordering::Release);
         Ok(())
     }
 
@@ -1379,31 +1421,59 @@ pub fn ensure_nofile_budget_at_least(want_soft: u64) -> (u64, u64) {
     }
 }
 
-/// `ENOSPC` or `EDQUOT`: the filesystem refused to reserve space.
+/// The platform or filesystem has no `fallocate`: the non-Linux stub, or
+/// `EOPNOTSUPP`, `ENOSYS`, `EINVAL`. Only these may fall back to `set_len`.
+/// Any other error, ENOSPC and EDQUOT included, is a real failure.
 #[doc(hidden)]
-pub fn is_out_of_space(e: &std::io::Error) -> bool {
+pub fn fallocate_unsupported(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::Unsupported {
+        return true;
+    }
     #[cfg(unix)]
     {
-        matches!(e.raw_os_error(), Some(libc::ENOSPC) | Some(libc::EDQUOT))
+        matches!(
+            e.raw_os_error(),
+            Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EINVAL)
+        )
     }
     #[cfg(not(unix))]
     {
-        let _ = e;
         false
     }
 }
 
+/// One `fallocate(2)` call, mode 0, no retry.
+#[cfg(target_os = "linux")]
+fn fallocate_once(file: &File, len: u64) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let raw = |len: u64| {
+        // SAFETY: `file` is open. Mode 0 allocates `[0, len)`.
+        let rc = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, len as i64) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    #[cfg(debug_assertions)]
+    if let Some(e) = crate::io_handle::injected_fallocate_fault(IoHandle::from_file(file), len, raw)
+    {
+        return Err(e);
+    }
+    raw(len)
+}
+
+/// Reserve `[0, len)` with `fallocate`, retrying when a signal interrupts it.
 #[doc(hidden)]
 pub fn try_fallocate(file: &File, len: u64) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::io::AsRawFd;
-        // SAFETY: `file` is open. Mode 0 allocates `[0, len)`.
-        let rc = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, len as i64) };
-        if rc == 0 {
-            return Ok(());
+        loop {
+            match fallocate_once(file, len) {
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                r => return r,
+            }
         }
-        Err(std::io::Error::last_os_error())
     }
     #[cfg(not(target_os = "linux"))]
     {

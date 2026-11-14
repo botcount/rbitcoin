@@ -144,6 +144,17 @@ static FAIL_HWM: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(
 #[cfg(debug_assertions)]
 static FAIL_SYNC: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(Vec::new());
 
+/// `(fd, limit, keep_partial)`: a `fallocate` past `limit` bytes fails with
+/// ENOSPC. With `keep_partial` it first really allocates up to `limit`, the
+/// way a filesystem can keep blocks from a call that then runs out of room.
+#[cfg(debug_assertions)]
+static FAIL_FALLOCATE: std::sync::Mutex<Vec<(IoHandle, u64, bool)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Next N `fallocate` calls on these fds fail with EINTR before the syscall.
+#[cfg(debug_assertions)]
+static EINTR_FALLOCATE: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(Vec::new());
+
 /// Next N preads on these fds fail before any byte is returned.
 #[cfg(debug_assertions)]
 static FAIL_PREAD: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(Vec::new());
@@ -158,6 +169,58 @@ fn disk_full_errno() -> i32 {
     {
         112
     }
+}
+
+/// Arm `handle` so a `fallocate` to more than `limit` bytes returns ENOSPC.
+/// With `keep_partial` the file is first really allocated to `limit`, so the
+/// failed call leaves a longer file behind. Stays armed until the handle or
+/// everything is disarmed.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_fallocate_limit(handle: IoHandle, limit: u64, keep_partial: bool) {
+    let mut slots = FAIL_FALLOCATE.lock().unwrap_or_else(|e| e.into_inner());
+    slots.retain(|(h, _, _)| *h != handle);
+    slots.push((handle, limit, keep_partial));
+}
+
+/// Make the next `n` `fallocate` calls on `handle` return EINTR.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_fallocate_eintr(handle: IoHandle, n: u32) {
+    EINTR_FALLOCATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((handle, n));
+}
+
+/// An armed fault for one `fallocate(handle, len)` call, if any. `real`
+/// performs the genuine syscall for the partial case.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+pub(crate) fn injected_fallocate_fault(
+    handle: IoHandle,
+    len: u64,
+    real: impl FnOnce(u64) -> std::io::Result<()>,
+) -> Option<std::io::Error> {
+    {
+        let mut slots = EINTR_FALLOCATE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = slots.iter_mut().find(|(h, n)| *h == handle && *n > 0) {
+            slot.1 -= 1;
+            return Some(std::io::Error::from_raw_os_error(libc::EINTR));
+        }
+    }
+    let armed = FAIL_FALLOCATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(h, limit, _)| *h == handle && len > *limit)
+        .copied();
+    let (_, limit, keep_partial) = armed?;
+    if keep_partial {
+        if let Err(e) = real(limit) {
+            return Some(e);
+        }
+    }
+    Some(std::io::Error::from_raw_os_error(libc::ENOSPC))
 }
 
 /// Arm `handle` so later pwrites longer than the HWM unit write 8 bytes and
@@ -181,6 +244,14 @@ pub fn disarm_short_pwrite() {
     FAIL_HWM.lock().unwrap_or_else(|e| e.into_inner()).clear();
     FAIL_SYNC.lock().unwrap_or_else(|e| e.into_inner()).clear();
     FAIL_PREAD.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    FAIL_FALLOCATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    EINTR_FALLOCATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     disarm_fail_pread_len();
 }
 
@@ -188,6 +259,14 @@ pub fn disarm_short_pwrite() {
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn disarm_pwrite(handle: IoHandle) {
+    FAIL_FALLOCATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(h, _, _)| *h != handle);
+    EINTR_FALLOCATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(h, _)| *h != handle);
     SHORT_PWRITE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
