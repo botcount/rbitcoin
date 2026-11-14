@@ -2354,6 +2354,17 @@ pub async fn startup_follows_without_catch_up(hub: &Arc<ChainHub>) -> bool {
     }
 }
 
+/// Open-time SH head handling: wipe a head a previous run marked degraded (or
+/// that `RBITCOIN_SH_FORCE_REBUILD` names), then drop a head nothing proves.
+fn prepare_sh_head_at_open(query: &Query, shindex: bool) -> Result<(), NodeError> {
+    query
+        .startup_sh_rebuild(shindex)
+        .map_err(|e| NodeError::Config(format!("scripthash rebuild at open: {e}")))?;
+    query
+        .discard_unproven_scripthash_head()
+        .map_err(|e| NodeError::Config(format!("scripthash index: {e}")))
+}
+
 #[doc(hidden)]
 pub fn apply_startup_index_mode(
     query: &Query,
@@ -2431,12 +2442,7 @@ pub fn apply_startup_index_mode(
     }
     // Before write-behind starts. An unproven head must not catch up by
     // appending from height 0; delete it and stay Direct until materialize.
-    query
-        .startup_sh_rebuild(config.shindex)
-        .map_err(|e| NodeError::Config(format!("scripthash rebuild at open: {e}")))?;
-    query
-        .discard_unproven_scripthash_head()
-        .map_err(|e| NodeError::Config(format!("scripthash index: {e}")))?;
+    prepare_sh_head_at_open(query, config.shindex)?;
     if config.shindex && query.sh_use_writebehind() {
         let _ = query.sync_sh_seal_from_include_hwm();
         query.enter_tip_index_mode();

@@ -1642,6 +1642,26 @@ fn startup_sets_sh_force_rebuild_on_the_query() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A degraded marker left by a previous run makes startup wipe the SH head
+/// and clear the marker, before write-behind starts.
+#[test]
+fn startup_wipes_a_degraded_sh_head_and_clears_the_marker() {
+    let dir = scratch_dir("sh-degraded-marker");
+    {
+        let q = Query::open_or_create_tiny(&dir).unwrap();
+        q.mark_sh_degraded("test fault");
+        assert!(q.sh_degraded_marker_present());
+    }
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    assert!(q.sh_degraded_marker_present(), "marker survives the reopen");
+    let mut cfg = NodeConfig::default();
+    cfg.shindex = true;
+    apply_startup_index_mode(&q, &cfg, 0).unwrap();
+    assert!(!q.sh_degraded_marker_present());
+    assert!(!q.sh_degraded());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A pruned datadir does not start when this process omitted the flag.
 /// The witness files are already the only copy.
 #[test]
