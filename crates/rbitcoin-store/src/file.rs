@@ -1118,10 +1118,13 @@ impl TableFile {
     /// Grow to `new_cap`, or when the disk cannot hold that, to `need`.
     ///
     /// Fails, with the length and `file_cap` unchanged, when even `need`
-    /// cannot be reserved. The failure holds only where `fallocate` reports
-    /// it. Where `fallocate` is missing (Darwin, Windows, or a Linux
-    /// filesystem answering EOPNOTSUPP, ENOSYS or EINVAL) the file is
-    /// extended sparsely and a full disk shows up on a later page write.
+    /// cannot be reserved. If the rollback truncate itself fails (after
+    /// retrying EINTR) the file may stay longer than `file_cap` and that
+    /// truncate error is returned instead of the allocation error. The
+    /// failure holds only where `fallocate` reports it. Where `fallocate` is
+    /// missing (Darwin, Windows, or a Linux filesystem answering EOPNOTSUPP,
+    /// ENOSYS or EINVAL) the file is extended sparsely and a full disk shows
+    /// up on a later page write.
     #[doc(hidden)]
     pub fn grow_to_at_least(&self, new_cap: u64, need: u64) -> Result<(), StoreError> {
         let need = need.min(new_cap);
@@ -1164,7 +1167,10 @@ impl TableFile {
                 // the caller frees or overwrites anything. A sparse
                 // `set_len` would defer the error to a later page write.
                 Err(e) => {
-                    let _ = file.set_len(before);
+                    // If the undo fails the length is unknown, so report that
+                    // error rather than the allocation one.
+                    rollback_len(|| file.set_len(before))
+                        .map_err(|re| StoreError::io(&self.path, re))?;
                     if target > need {
                         target = need;
                         continue;
@@ -1461,6 +1467,17 @@ fn fallocate_once(file: &File, len: u64) -> std::io::Result<()> {
         return Err(e);
     }
     raw(len)
+}
+
+/// Run the rollback truncate, retrying when a signal interrupts it.
+#[doc(hidden)]
+pub fn rollback_len(mut truncate: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    loop {
+        match truncate() {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            r => return r,
+        }
+    }
 }
 
 /// Reserve `[0, len)` with `fallocate`, retrying when a signal interrupts it.

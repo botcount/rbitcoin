@@ -234,6 +234,9 @@ pub fn arm_short_pwrite(handle: IoHandle) {
     }
 }
 
+/// Clears the pwrite, HWM, sync and pread arms. It leaves the `fallocate`
+/// arms alone: they belong to tests that disarm their own fd with
+/// [`disarm_pwrite`].
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn disarm_short_pwrite() {
@@ -244,14 +247,6 @@ pub fn disarm_short_pwrite() {
     FAIL_HWM.lock().unwrap_or_else(|e| e.into_inner()).clear();
     FAIL_SYNC.lock().unwrap_or_else(|e| e.into_inner()).clear();
     FAIL_PREAD.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    FAIL_FALLOCATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
-    EINTR_FALLOCATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
     disarm_fail_pread_len();
 }
 
