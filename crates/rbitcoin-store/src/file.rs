@@ -1119,9 +1119,16 @@ impl TableFile {
         if new_cap <= self.file_cap.load(Ordering::Acquire) {
             return Ok(());
         }
-        if try_fallocate(&file, new_cap).is_err()
-            || file.metadata().map(|m| m.len()).unwrap_or(0) < new_cap
-        {
+        match try_fallocate(&file, new_cap) {
+            Ok(()) => {}
+            // A full disk must fail here, before the caller frees or
+            // overwrites anything. A sparse `set_len` fallback would defer
+            // the same error to a later page write, in the middle of an
+            // operation that has already released its old pages.
+            Err(e) if is_out_of_space(&e) => return Err(StoreError::io(&self.path, e)),
+            Err(_) => {}
+        }
+        if file.metadata().map(|m| m.len()).unwrap_or(0) < new_cap {
             set_file_len(&file, &self.path, new_cap)?;
         }
         drop(file);
@@ -1369,6 +1376,20 @@ pub fn ensure_nofile_budget_at_least(want_soft: u64) -> (u64, u64) {
     {
         let _ = want_soft;
         (0, 0)
+    }
+}
+
+/// `ENOSPC` or `EDQUOT`: the filesystem refused to reserve space.
+#[doc(hidden)]
+pub fn is_out_of_space(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(e.raw_os_error(), Some(libc::ENOSPC) | Some(libc::EDQUOT))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = e;
+        false
     }
 }
 
