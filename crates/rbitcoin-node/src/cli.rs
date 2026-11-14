@@ -216,6 +216,9 @@ pub fn finish_operator_config(
         config.bq_assign_stop_bytes = stop;
     }
     config.sh_force_rebuild |= env.sh_force_rebuild;
+    if let Some(on) = env.sh_auto_rebuild {
+        config.sh_auto_rebuild = on;
+    }
     config.rpc.package_dialect |= env.rpc_package_dialect;
     config.rpc.wait_tip_idle |= env.rpc_wait_tip_idle;
     config.resolve_listen_defaults();

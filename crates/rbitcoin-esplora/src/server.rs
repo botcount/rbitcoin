@@ -338,13 +338,21 @@ pub async fn stamp_chain_view_mw(State(st): State<AppState>, req: Request, next:
             .get::<axum::extract::MatchedPath>()
             .is_none();
     let sh_view = !unmounted && path_uses_sh_view(&path);
-    if sh_view && !st.query.sh_history_available() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            rbitcoin_query::SCRIPTHASH_INDEX_DISABLED,
-        )
-            .into_response();
-    }
+    // Held until the response is built: the rebuild's wipe waits for it.
+    let sh_guard = if sh_view {
+        match st.query.sh_read_enter() {
+            Some(g) => Some(g),
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    st.query.sh_unavailable_message(),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
     if asof.is_some() && (unmounted || !path_accepts_asof(&path)) {
         return not_found();
     }
@@ -370,6 +378,15 @@ pub async fn stamp_chain_view_mw(State(st): State<AppState>, req: Request, next:
         }
     };
     let mut resp = next.run(req).await;
+    // A fault, a rebuild step or an unlink batch began or ended during the
+    // read: whatever it saw is not an answer.
+    if sh_guard.as_ref().is_some_and(|g| !g.still_valid()) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            st.query.sh_unavailable_message(),
+        )
+            .into_response();
+    }
     let view = resp.extensions().get::<ChainView>().copied().or(pre_view);
     let Some(view) = view else {
         return resp;

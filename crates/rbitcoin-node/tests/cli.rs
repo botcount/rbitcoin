@@ -1334,6 +1334,42 @@ fn env_flags_take_one_true_zero_or_false() {
     }
 }
 
+/// `RBITCOIN_SH_AUTO_REBUILD` defaults on. Unset or empty keeps that, `0` or
+/// `false` turns it off, `1` or `true` is explicit on, and any other text
+/// (`off`, `no`) stops the start like every other flag.
+#[test]
+fn sh_auto_rebuild_env_is_unset_on_or_off() {
+    let key = "RBITCOIN_SH_AUTO_REBUILD";
+    for unset in ["", " "] {
+        let got = env_of(&[(key, unset)]);
+        match unset {
+            "" => assert_eq!(got.unwrap().sh_auto_rebuild, None),
+            _ => assert!(got.is_err(), "blank is not empty"),
+        }
+    }
+    assert_eq!(env_of(&[]).unwrap().sh_auto_rebuild, None);
+    for on in ["1", "true", "TRUE"] {
+        assert_eq!(env_of(&[(key, on)]).unwrap().sh_auto_rebuild, Some(true));
+    }
+    for off in ["0", "false", "False"] {
+        assert_eq!(env_of(&[(key, off)]).unwrap().sh_auto_rebuild, Some(false));
+    }
+    for bad in ["off", "no", "yes", "2"] {
+        let err = env_of(&[(key, bad)]).unwrap_err().to_string();
+        assert!(err.contains(key), "{err}");
+    }
+    let assembled = |pairs: &[(&str, &str)]| match operator_config_from_args(
+        ["rbitcoin-node"],
+        &env_of(pairs).unwrap(),
+    ) {
+        Ok(OperatorArgs::Ready { config, .. }) => config.sh_auto_rebuild,
+        other => panic!("expected assembled config, got {other:?}"),
+    };
+    assert!(assembled(&[]), "default on");
+    assert!(assembled(&[(key, "1")]));
+    assert!(!assembled(&[(key, "0")]));
+}
+
 /// `NodeEnv` asks its lookup for each knob by name and leaves the name match to
 /// it. `std::env::var_os` ignores case on Windows, so there a lower-case name
 /// still sets the knob, as it did before `NodeEnv`.

@@ -154,3 +154,117 @@ pub fn sh_join_slot_over_16mib() -> Arc<ShJoinSlot> {
     let n = (CAP - 144) / 8 + 1;
     ShJoinSlot::with_spender_fk_count(n)
 }
+
+/// Regtest proof-of-work limit in compact form (hex 207fffff).
+const REGTEST_POW_LIMIT_BITS: u32 = 545_259_519;
+
+/// Header over `txs` at height `h`, chained on `prev_hash`. The merkle root is
+/// real, so a reopen (tip revalidate) keeps the chain. An empty block gets a
+/// height-keyed root.
+pub fn fixture_header(
+    h: u32,
+    nonce: u32,
+    prev_fk: Fk,
+    prev_hash: Option<[u8; 32]>,
+    txs: &[TxApply],
+) -> HeaderRecord {
+    let leaves: Vec<[u8; 32]> = txs.iter().map(|t| t.tx.txid).collect();
+    let merkle = if leaves.is_empty() {
+        let mut m = [0u8; 32];
+        m[0..4].copy_from_slice(&h.to_le_bytes());
+        m
+    } else {
+        rbitcoin_primitives::merkle_root_from_txids(&leaves)
+    };
+    let hash = rbitcoin_store::block_header_hash(
+        1,
+        &prev_hash.unwrap_or([0u8; 32]),
+        &merkle,
+        h + 1,
+        REGTEST_POW_LIMIT_BITS,
+        nonce,
+    );
+    HeaderRecord {
+        prev_fk,
+        version: 1,
+        timestamp: h + 1,
+        bits: REGTEST_POW_LIMIT_BITS,
+        nonce,
+        merkle_root: merkle,
+        hash,
+        size: 0,
+        weight: 0,
+    }
+}
+
+/// Coinbase-shaped tx with one unspent output to `script`.
+pub fn fixture_pay(txid_seed: u32, script: &[u8]) -> TxApply {
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    let mut txid = [0u8; 32];
+    txid[..4].copy_from_slice(&txid_seed.to_le_bytes());
+    txid[31] = 217;
+    TxApply {
+        tx: TxRecord {
+            txid,
+            version: 2,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord::coinbase(u32::MAX, vec![1], vec![])],
+        outputs: vec![OutputRecord::unspent(1, script.to_vec())],
+    }
+}
+
+/// Script `heavy_sh_extent_query` pays on every create.
+pub const SH_HEAVY_SCRIPT: &[u8] = &[81, 81];
+
+/// Creates in one tip block that move a scripthash key from a slab to an
+/// extent chain (`SH_MEGAKEY_MIN_FKS`). A cold pack stores a key by the bytes
+/// of its fk stream and stays a slab until about 2 KiB, so the extent comes
+/// from tip-mode appends, not from the cold build.
+pub const SH_HEAVY_CREATES: u32 = rbitcoin_store::scripthash_slabs::SH_MEGAKEY_MIN_FKS;
+
+/// A tip-mode query whose SH index holds one extent key, built the node way:
+/// block 0 (one tx) connects Direct, the cold build seals the head, then a
+/// block of [`SH_HEAVY_CREATES`] txs and a block of `tail_txs` txs (none when
+/// 0) paying [`SH_HEAVY_SCRIPT`] append in tip mode. Returns the key.
+pub fn heavy_sh_extent_query(label: &str, tail_txs: u32) -> (TempDir, Query, [u8; 32]) {
+    let (dir, q) = tiny_query_labeled(label);
+    q.enter_direct_index_mode().expect("direct mode");
+    let (mut prev_fk, mut prev_hash, mut seed) = (Fk::NULL, None, 1u32);
+    let mut connect = |q: &Query, h: u32, n: u32| {
+        let txs: Vec<TxApply> = (0..n)
+            .map(|_| {
+                seed += 1;
+                fixture_pay(seed, SH_HEAVY_SCRIPT)
+            })
+            .collect();
+        let hdr = fixture_header(h, 0, prev_fk, prev_hash, &txs);
+        prev_fk = q.connect_block(Height(h), &hdr, &txs).expect("connect");
+        prev_hash = Some(hdr.hash);
+    };
+    connect(&q, 0, 1);
+    q.finalize_sh_runs().expect("cold SH build");
+    q.enter_tip_index_mode();
+    connect(&q, 1, SH_HEAVY_CREATES);
+    if tail_txs > 0 {
+        connect(&q, 2, tail_txs);
+    }
+    (dir, q, rbitcoin_store::script_hash(SH_HEAVY_SCRIPT))
+}
+
+/// Zero the `ver` byte of the key's last extent page: the torn head left by an
+/// ENOSPC mid-rewrite. Every full read of the key then fails with
+/// `scripthash extent last page not ver=2`.
+pub fn tear_sh_extent_head(q: &Query, key: &[u8; 32]) {
+    let t = &q.store().scripthash;
+    let last_page = match t.head_value(key).expect("head").expect("key present") {
+        rbitcoin_store::ShHeadValue::Extent { last_page } => last_page,
+        other => panic!("heavy key is not an extent: {other:?}"),
+    };
+    let mut page = [0u8; 4096];
+    t.body().read_at(last_page, &mut page).expect("read page");
+    page[0] = 0;
+    t.body().write_at(last_page, &page).expect("tear page");
+}

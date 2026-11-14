@@ -1105,6 +1105,11 @@ impl Query {
         Ok(())
     }
 
+    /// A scripthash `Corrupt` or I/O error from the append does not stop the
+    /// chain or the appender: the index is marked degraded and the job is
+    /// dropped (`Ok(false)`); the rebuild supervisor restores the index. Any
+    /// other error, including the Class C read of the job's height, is
+    /// returned for the write-behind loop to requeue and halt on.
     #[doc(hidden)]
     pub fn apply_sh_job_inner(&self, job: &ShPendingJob) -> Result<bool, QueryError> {
         let _appender = self.sh.appender.lock().unwrap();
@@ -1121,6 +1126,14 @@ impl Query {
             return Ok(false);
         }
 
+        let r = self.append_sh_job(job);
+        self.settle_sh_apply(job.height, r)
+    }
+
+    /// The scripthash half of a write-behind job: append the creates, move the
+    /// watermark, advance `include_hwm`. Every error here is the SH tables'
+    /// (the Class C read that picks the job is outside it).
+    fn append_sh_job(&self, job: &ShPendingJob) -> Result<(), QueryError> {
         let sh_creates = &job.records;
 
         if !sh_creates.is_empty() {
@@ -1150,8 +1163,7 @@ impl Query {
         self.sh
             .applied_max_fk
             .fetch_max(tip_sh_max_fk, Ordering::AcqRel);
-        self.advance_sh_include_hwm()?;
-        Ok(true)
+        self.advance_sh_include_hwm()
     }
 
     /// Sync the SH tables, then advance `include_hwm` (and SEAL) to the
@@ -1220,6 +1232,9 @@ impl Query {
     /// Restore SH watermark from durable `include_hwm` and re-queue heights the
     /// RAM write-behind lost on restart.
     pub fn recover_sh_writebehind(&self) -> Result<(), QueryError> {
+        if self.sh_degraded() {
+            return Ok(());
+        }
         let recovered = self.recover_sh_indexed_through()?;
         self.set_sh_indexed_through_height(recovered);
         if !self.store.scripthash.has_durable_index() {
@@ -1427,6 +1442,34 @@ impl Query {
         self.disconnect_tip_body(false)
     }
 
+    /// Unlink the block's creates from the SH index, with readers held off:
+    /// the batch rewrites each key before it returns, while the tip has not
+    /// shrunk and those creates still read as strong, so a read in that window
+    /// would show outputs the best chain no longer has. A failed batch marks
+    /// the index degraded before the freeze ends, so readers stay out.
+    fn unlink_sh_creates_of(&self, height: Height, tx_fks: &[Fk]) -> Result<(), QueryError> {
+        let mut by_sh: HashMap<[u8; 32], Vec<Fk>> = HashMap::new();
+        for &tx_fk in tx_fks {
+            let outputs = self.tx_output_run_class_a(tx_fk)?;
+            for o in &outputs {
+                by_sh.entry(script_hash(&o.script)).or_default().push(tx_fk);
+            }
+        }
+        let mut groups: Vec<([u8; 32], Vec<Fk>)> = Vec::with_capacity(by_sh.len());
+        for (sh, mut fks) in by_sh {
+            fks.sort_by_key(|fk| fk.0);
+            fks.dedup();
+            groups.push((sh, fks));
+        }
+        let _freeze = self.freeze_sh_readers();
+        #[cfg(debug_assertions)]
+        crate::sh_degraded::sh_stage_hook("unlink_frozen", self);
+        if let Err(e) = self.store.scripthash.unlink_creates_batch(&groups) {
+            self.mark_sh_degraded(&format!("disconnect h={} unlink: {e}", height.0));
+        }
+        Ok(())
+    }
+
     #[doc(hidden)]
     pub fn disconnect_tip_body(&self, drop_pending: bool) -> Result<(), QueryError> {
         let _utxo_view = self.store.hold_utxo_view();
@@ -1450,20 +1493,12 @@ impl Query {
             .unwrap_or([0u8; 32]);
         let tx_fks = self.block_tx_fks(height)?;
 
-        let mut by_sh: HashMap<[u8; 32], Vec<Fk>> = HashMap::new();
-        for &tx_fk in &tx_fks {
-            let outputs = self.tx_output_run_class_a(tx_fk)?;
-            for o in &outputs {
-                by_sh.entry(script_hash(&o.script)).or_default().push(tx_fk);
-            }
+        // SH is optional: a fault here degrades the index, it never fails the
+        // disconnect. While degraded the unlink is skipped; the rebuild reads
+        // Class A and readers filter creates that are no longer confirmed.
+        if self.sh_index_enabled() && !self.sh_degraded() {
+            self.unlink_sh_creates_of(height, &tx_fks)?;
         }
-        let mut groups: Vec<([u8; 32], Vec<Fk>)> = Vec::with_capacity(by_sh.len());
-        for (sh, mut fks) in by_sh {
-            fks.sort_by_key(|fk| fk.0);
-            fks.dedup();
-            groups.push((sh, fks));
-        }
-        self.store.scripthash.unlink_creates_batch(&groups)?;
 
         let write = rbitcoin_store::ClassCWrite::new();
         self.store.confirmed.disconnect_tip(&write, height)?;
@@ -1482,7 +1517,11 @@ impl Query {
         }
         self.store.flush_confirmed_only()?;
         self.sealed_tip.shrunk_to(self.tip_height());
-        self.store.scripthash.commit_deferred_empty_heads()?;
+        if !self.sh_degraded() {
+            if let Err(e) = self.store.scripthash.commit_deferred_empty_heads() {
+                self.mark_sh_degraded(&format!("disconnect h={} empty heads: {e}", height.0));
+            }
+        }
         self.store.clamp_spend_durable()?;
         log_disconnect_tip(height.0, &hash, tx_fks.len());
 

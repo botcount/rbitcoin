@@ -89,7 +89,19 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
   A non-suffix unlink writes the replacement, syncs those bytes and the new
   heads once for the whole disconnect, then frees the old pages.
   A full-list unlink does not sync the empty head until the tip shrink is durable.
-- No tip-mode full rebuild; corrupt index ⇒ reindex (wipe store / redo IBD).
+- A scripthash fault does not stop the chain and does not need a reindex. A `Corrupt` or I/O error from a
+  disconnect's unlink batch, from a write-behind append, or from a history, listunspent or count read of a
+  torn key marks the index **degraded** (a write-behind error that is not the SH tables', such as the Class C
+  read of the job's height, still halts as before). `store/scripthash.degraded` is published like the other
+  small durable markers (synced temp file, rename, directory fsync). Connect and disconnect go on with SH
+  deferred. Every Electrum and Esplora address route answers 503 `scripthash index rebuilding`, and a read
+  that overlapped the fault, or a disconnect's unlink batch (readers are held off for the batch), is refused
+  too, because the reader's guard carries a generation that those events bump. A supervisor then waits for
+  every in-flight reader (no timeout), wipes the SH tables under the appender lock, rebuilds from Class A, syncs
+  the new head's `SEAL` and `scripthash.include_hwm` (files and their directories), re-arms write-behind, and
+  only then removes the marker. A restart that finds the marker (or `RBITCOIN_SH_FORCE_REBUILD`) wipes at open,
+  before tip entry, and keeps the marker until the cold rebuild at tip entry has sealed a head, so a kill in
+  between wipes again. `RBITCOIN_SH_AUTO_REBUILD=0` leaves the index degraded until that restart.
 
 ## Flush
 

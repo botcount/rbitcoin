@@ -378,6 +378,58 @@ fn restatus_notes_scans_intermediate_tick_heights() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A degraded or rebuilding scripthash index reads as empty history. The
+/// subscription push must hold (None: the caller reads every sub again once the
+/// index serves) instead of telling a wallet its address emptied.
+#[test]
+fn settled_restatus_holds_while_sh_index_degraded() {
+    let (dir, q) = tmp_store();
+    let sh = rbitcoin_store::script_hash(&[0x51]);
+    assert!(settled_restatus_notes(&q, None, &[sh], None).is_some());
+    q.mark_sh_degraded("test fault");
+    assert!(
+        settled_restatus_notes(&q, None, &[sh], None).is_none(),
+        "degraded index must not produce statuses"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A history read that finds a torn extent key answers `scripthash index
+/// rebuilding` itself (not a corrupt-record error), latches the degraded state
+/// so every other script is refused too, and holds the subscription push. The
+/// same read after the rebuild answers.
+#[test]
+fn torn_key_read_answers_rebuilding_and_latches_for_every_script() {
+    let (_dir, q, _key) = rbitcoin_query::testutil::heavy_sh_extent_query("electrum-torn", 0);
+    let params = ChainParams::regtest();
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let (mut header_sub, mut sh_subs) = (false, HashSet::new());
+    let mut call = |sh_script: &[u8]| {
+        dispatch(
+            "blockchain.scripthash.get_history",
+            &json!([electrum_scripthash_hex(sh_script)]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+    };
+    let heavy = rbitcoin_query::testutil::SH_HEAVY_SCRIPT;
+    let healthy = call(heavy).unwrap();
+    assert!(healthy.as_array().is_some_and(|h| h.len() > 200));
+    rbitcoin_query::testutil::tear_sh_extent_head(&q, &rbitcoin_store::script_hash(heavy));
+    assert_eq!(call(heavy).unwrap_err(), "scripthash index rebuilding");
+    assert!(q.sh_degraded(), "the read latched");
+    assert_eq!(call(&[0x51]).unwrap_err(), "scripthash index rebuilding");
+    let sh = rbitcoin_store::script_hash(heavy);
+    assert!(settled_restatus_notes(&q, None, &[sh], None).is_none());
+    assert!(q.rebuild_sh_if_degraded(None).unwrap());
+    assert_eq!(call(heavy).unwrap(), healthy);
+    assert!(settled_restatus_notes(&q, None, &[sh], None).is_some());
+}
+
 #[test]
 fn negotiate_protocol_intersection_and_asof_dialect() {
     assert_eq!(negotiate_protocol(&json!([])).unwrap(), PROTOCOL_MAX);

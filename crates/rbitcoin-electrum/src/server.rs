@@ -2391,12 +2391,17 @@ pub fn settled_restatus_notes(
     subs: &[[u8; 32]],
     heights: Option<&[u32]>,
 ) -> Option<Vec<([u8; 32], String)>> {
+    // A degraded or rebuilding index reads as an empty history. Pushing that
+    // would tell a wallet its address emptied, so hold instead: the caller
+    // reads every sub again once the index serves.
+    // A read that a fault or an unlink batch overlapped is held the same way.
+    let sh_guard = query.sh_read_enter()?;
     let gen = mempool.map(MempoolHub::pool_settle_gen);
     if gen.is_some_and(|g| g % 2 == 1) {
         return None;
     }
     let notes = restatus_notes(query, mempool, subs, heights);
-    (mempool.map(MempoolHub::pool_settle_gen) == gen).then_some(notes)
+    (mempool.map(MempoolHub::pool_settle_gen) == gen && sh_guard.still_valid()).then_some(notes)
 }
 
 #[doc(hidden)]
@@ -2661,10 +2666,7 @@ where
     // mark is `asof not on chain`; at or behind it the pin succeeds and the
     // later gate says the index is off. Refuse before any pin.
     if method_needs_sh_index(method) && !query.sh_history_available() {
-        return (
-            Err(rbitcoin_query::SCRIPTHASH_INDEX_DISABLED.to_string()),
-            None,
-        );
+        return (Err(query.sh_unavailable_message().to_string()), None);
     }
     let kind = electrum_pin_kind(method);
     match take_trailing_asof(method, params) {
@@ -2924,9 +2926,37 @@ pub fn dispatch_pinned(
     pinned: Option<&ChainView>,
     is_asof: bool,
 ) -> Result<Value, String> {
-    if method_needs_sh_index(method) && !query.sh_history_available() {
-        return Err(rbitcoin_query::SCRIPTHASH_INDEX_DISABLED.to_string());
+    // Held for the whole dispatch: the rebuild's wipe waits for it. A read a
+    // fault, a rebuild step or an unlink batch overlapped is not an answer.
+    let sh_guard = if method_needs_sh_index(method) {
+        match query.sh_read_enter() {
+            Some(g) => Some(g),
+            None => return Err(query.sh_unavailable_message().to_string()),
+        }
+    } else {
+        None
+    };
+    let out = dispatch_method(
+        method, params, query, config, chain, mempool, conn, pinned, is_asof,
+    );
+    match sh_guard {
+        Some(g) if !g.still_valid() => Err(query.sh_unavailable_message().to_string()),
+        _ => out,
     }
+}
+
+#[allow(clippy::too_many_arguments)] // call-site args stay unbundled
+fn dispatch_method(
+    method: &str,
+    params: &Value,
+    query: &Query,
+    config: &ElectrumConfig,
+    chain: &ChainParams,
+    mempool: Option<&MempoolHub>,
+    conn: &mut ElectrumConn,
+    pinned: Option<&ChainView>,
+    is_asof: bool,
+) -> Result<Value, String> {
     let protocol = conn.protocol.clone();
     let header_sub = &mut conn.header_sub;
     let sh_subs = &mut conn.sh_subs;
