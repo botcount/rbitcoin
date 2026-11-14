@@ -18,7 +18,7 @@ allow = [
   "cli_main",
   "decode_cmd_payload",
   "dispatch_inner",
-  "dispatch_pinned",
+  "dispatch_method",
   "eval_script",
   "ibd_cancellable",
   "pread_batch_on_session_inner",

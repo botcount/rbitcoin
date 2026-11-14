@@ -349,6 +349,10 @@ pub struct NodeEnv {
     /// `RBITCOIN_SH_FORCE_REBUILD` is on: tip SH finalize wipes the head and
     /// recollects all of Class A, on every start while it stays set.
     pub sh_force_rebuild: bool,
+    /// `RBITCOIN_SH_AUTO_REBUILD`: `Some(false)` leaves a degraded scripthash
+    /// index degraded until a restart wipes it, `Some(true)` or unset lets the
+    /// node rebuild it in the background.
+    pub sh_auto_rebuild: Option<bool>,
     /// `RBITCOIN_RPC_PACKAGE_DIALECT` is on: `submitpackage` uses Core
     /// `IsChildWithParents`.
     pub rpc_package_dialect: bool,
@@ -377,6 +381,7 @@ impl NodeEnv {
                 .map(|n| if n == 0 { u64::MAX } else { n }),
             test_drop_store: env_flag(var("RBITCOIN_TEST_DROP_STORE"))?,
             sh_force_rebuild: env_flag(var("RBITCOIN_SH_FORCE_REBUILD"))?,
+            sh_auto_rebuild: env_flag_set(var("RBITCOIN_SH_AUTO_REBUILD"))?,
             rpc_package_dialect: env_flag(var("RBITCOIN_RPC_PACKAGE_DIALECT"))?,
             rpc_wait_tip_idle: env_flag(var("RBITCOIN_RPC_WAIT_TIP_IDLE"))?,
         })
@@ -402,11 +407,17 @@ where
         .transpose()
 }
 
-fn env_flag((key, val): (&str, Option<OsString>)) -> Result<bool, NodeError> {
+fn env_flag(var: (&str, Option<OsString>)) -> Result<bool, NodeError> {
+    Ok(env_flag_set(var)?.unwrap_or(false))
+}
+
+/// A flag knob that distinguishes unset (`None`) from an explicit off, for a
+/// knob whose default is on.
+fn env_flag_set((key, val): (&str, Option<OsString>)) -> Result<Option<bool>, NodeError> {
     match env_value(key, val.as_deref())? {
-        None => Ok(false),
-        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => Ok(true),
-        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => Ok(false),
+        None => Ok(None),
+        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => Ok(Some(true)),
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => Ok(Some(false)),
         Some(v) => Err(NodeError::Config(format!(
             "{key}={v:?}: expected 1, true, 0, or false"
         ))),
@@ -446,6 +457,9 @@ pub struct NodeConfig {
     /// Rebuild the scripthash index from Class A at tip entry. Set only from
     /// [`NodeEnv::sh_force_rebuild`].
     pub sh_force_rebuild: bool,
+    /// Rebuild a degraded scripthash index in the background. Default **on**;
+    /// off only from [`NodeEnv::sh_auto_rebuild`].
+    pub sh_auto_rebuild: bool,
     /// Build BIP158 basic block filters. Default **off**. Independent of `shindex`.
     pub block_filter_index: bool,
     /// Drop Class A seqsigwit below a 288-height watermark (`NETWORK_LIMITED`).
@@ -623,6 +637,7 @@ impl Default for NodeConfig {
             max_run_secs: None,
             shindex: false,
             sh_force_rebuild: false,
+            sh_auto_rebuild: true,
             block_filter_index: false,
             prune_seqsigwit: false,
             datadir_hdd: false,

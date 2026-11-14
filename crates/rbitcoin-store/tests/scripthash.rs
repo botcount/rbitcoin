@@ -2744,6 +2744,28 @@ fn reinit_clears_head_when_live_count_already_zero() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A key first seen after the pack lives in the ingest head, which is looked
+/// up before main. A cold re-init that kept it would serve the old chain and
+/// add the repacked one on top.
+#[test]
+fn reinit_drops_a_key_first_seen_after_the_pack() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let packed = script_hash(&[0x71]);
+    let late = script_hash(&[0x72]);
+    let mut session = t.pack_shard_session(0).unwrap();
+    push_chain(&mut session, packed, &[Fk(42)]);
+    seal_session(&t, 0, session);
+    put_create(&t, rec(late, 7, 1));
+    put_create(&t, rec(late, 8, 2));
+    assert_eq!(t.entries(&late).unwrap().len(), 2, "late key is indexed");
+    t.reinit_empty_for_cold_materialize().unwrap();
+    assert!(t.head_is_empty());
+    assert!(t.entries(&late).unwrap().is_empty(), "late key is gone");
+    assert!(t.entries(&packed).unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn open_discards_legacy_head_and_keeps_runs() {
     {

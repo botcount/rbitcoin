@@ -13,7 +13,7 @@ below. Do not grow env surface without a damn-good reason.
 
 `main` (`process_main`) reads `RBITCOIN_P2P_MAX_INBOUND`,
 `RBITCOIN_BLOCK_QUEUE_BYTES`, `RBITCOIN_BLOCK_QUEUE_GB`,
-`RBITCOIN_SH_FORCE_REBUILD`, `RBITCOIN_RPC_PACKAGE_DIALECT`,
+`RBITCOIN_SH_FORCE_REBUILD`, `RBITCOIN_SH_AUTO_REBUILD`, `RBITCOIN_RPC_PACKAGE_DIALECT`,
 `RBITCOIN_RPC_WAIT_TIP_IDLE`, and `RBITCOIN_TEST_DROP_STORE` once into
 `NodeEnv` and passes that to `cli_main`. Nothing below the process shell
 reads them. An empty value is the same as unset. A set value that does not
@@ -37,6 +37,7 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_TX_HEAD_REBUILD_WORKERS` | min(n-cpu, free-RAM/1 GiB) | Wipe/empty-head MPHF parallelism (`1` = serial). Unset = auto. **Not** the SH extract 1.5 GiB cap |
 | `RBITCOIN_HEAD_SLOTS_HEADER` | scale default | Header hash-head initial slots (power of two) |
 | `RBITCOIN_SH_FORCE_REBUILD` | off | Sticky SH rebuild (also in OPERATOR) |
+| `RBITCOIN_SH_AUTO_REBUILD` | on | `0` or `false` leaves a degraded SH index degraded (address routes stay 503) until a restart with the `store/scripthash.degraded` marker or `RBITCOIN_SH_FORCE_REBUILD=1` wipes it at open. Unset, empty, `1` and `true` rebuild it in the background. The only flag that defaults on. See [`crash-recovery.md`](./crash-recovery.md) |
 | `RBITCOIN_SH_MERGE_WORKERS` | min(n-cpu, max(1, free-RAM/1.5 GiB)) | SH extract (collect, merge, BDZ, fuse, pass 2, pack). `1` = serial. Unset = auto (see [`ibd-memory.md`](./ibd-memory.md)) |
 | `RBITCOIN_P2P_MAX_INBOUND` | 200 | Only if `--max-inbound` / conf omitted |
 | `RBITCOIN_URING_DRAIN_HARD_SECS` | 120 | `drain_all` zero-CQE abort (Linux/pool/IOCP). Raise if completions are slow but still arriving |

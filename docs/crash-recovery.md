@@ -89,7 +89,29 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
   A non-suffix unlink writes the replacement, syncs those bytes and the new
   heads once for the whole disconnect, then frees the old pages.
   A full-list unlink does not sync the empty head until the tip shrink is durable.
-- No tip-mode full rebuild; corrupt index ⇒ reindex (wipe store / redo IBD).
+- A scripthash fault does not stop the chain and does not need a reindex. A `Corrupt` or I/O error from a
+  disconnect's unlink batch, from a write-behind append, or from a history, listunspent or count read of a
+  torn key marks the index **degraded** (a write-behind error that is not the SH tables', such as the Class C
+  read of the job's height, still halts as before). `store/scripthash.degraded` is published like the other
+  small durable markers (synced temp file, rename, directory fsync). Connect and disconnect go on with SH
+  deferred. Every Electrum and Esplora address route answers 503 `scripthash index rebuilding`, and a read
+  that overlapped the fault, or a disconnect's unlink batch (readers are held off for the batch), is refused
+  too, because the reader's guard carries a generation that those events bump. A supervisor then waits for
+  every in-flight reader (no timeout), wipes the SH tables under the appender lock, rebuilds from Class A, syncs
+  the new head's `SEAL` and `scripthash.include_hwm` (files and their directories), re-arms write-behind, and
+  only then removes the marker. A restart that finds the marker (or `RBITCOIN_SH_FORCE_REBUILD`) wipes at open,
+  before tip entry, and keeps the marker until the cold rebuild at tip entry has sealed a head, so a kill in
+  between wipes again. `RBITCOIN_SH_AUTO_REBUILD=0` leaves the index degraded until that restart.
+  The in-place rebuild and tip entry's own SH step share one owner lock: tip entry waits for a rebuild that is
+  running, takes the rebuilt head, and leaves a still-degraded index to the supervisor, so the two never write
+  `scripthash.runs` and `scripthash.unsorted` together. The wipe also clears an unlink undo record left armed by
+  a failed unlink, so the next open does not reject it.
+  The marker rescues faults that surface after open succeeded: a torn page, a failed write or unlink, a read of a
+  torn key. It cannot rescue damage that makes open itself fail (a truncated `scripthash.head/NN.val`, a torn
+  undo record): open validates the SH files before it reads the marker, so such a store does not start, with or
+  without `RBITCOIN_SH_AUTO_REBUILD` and `RBITCOIN_SH_FORCE_REBUILD`, and the fix is to stop the node, remove
+  `scripthash*` (the marker included) from the store directory and start again; tip entry then builds the index
+  cold from Class A.
 
 ## Flush
 

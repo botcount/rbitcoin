@@ -275,9 +275,11 @@ pub(crate) async fn store_blocking<T: Send + 'static>(
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, tokio::task::JoinError> {
     let store_permit = rbitcoin_net::acquire_armed_store_budget().await;
+    let sh_hold = crate::server::sh_read_hold();
     tokio::task::spawn_blocking(move || {
         let _g = rbitcoin_net::BlockingRegion::enter();
         let _store = store_permit;
+        let _sh_hold = sh_hold;
         f()
     })
     .await
@@ -1006,9 +1008,11 @@ pub fn gbt_json(body: &Arc<Value>) -> Response {
 
 pub async fn spawn_join(f: impl FnOnce() -> Response + Send + 'static) -> Response {
     let store_permit = rbitcoin_net::acquire_armed_store_budget().await;
+    let sh_hold = crate::server::sh_read_hold();
     match tokio::task::spawn_blocking(move || {
         let _g = rbitcoin_net::BlockingRegion::enter();
         let _store = store_permit;
+        let _sh_hold = sh_hold;
         f()
     })
     .await

@@ -456,6 +456,94 @@ async fn address_page_under_cap_matches_summary() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A read that finds a torn extent key answers 503 `scripthash index
+/// rebuilding` (not a 500 from the corrupt record), latches the degraded state,
+/// and every other script answers 503 too until the rebuild publishes a head.
+#[tokio::test]
+async fn torn_key_read_is_503_for_every_script_until_rebuilt() {
+    use rbitcoin_primitives::scripthash_display_hex as display;
+    use rbitcoin_query::testutil::{heavy_sh_extent_query, tear_sh_extent_head, SH_HEAVY_SCRIPT};
+    let (dir, q, key) = heavy_sh_extent_query("esplora-torn", 0);
+    let q = Arc::new(q);
+    let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    let handle = run_esplora(cfg, q.clone(), None).await.expect("listen");
+    let heavy = format!("/scripthash/{}/txs", display(SH_HEAVY_SCRIPT));
+    let other = format!("/scripthash/{}/txs", display(&[0x51]));
+    let (st, body) = http_get(handle.local_addr, &heavy).await;
+    assert_eq!(st, 200, "{body}");
+    tear_sh_extent_head(&q, &key);
+    let (st, body) = http_get(handle.local_addr, &heavy).await;
+    assert_eq!((st, body.as_str()), (503, "scripthash index rebuilding"));
+    assert!(q.sh_degraded(), "the read latched");
+    let (st, body) = http_get(handle.local_addr, &other).await;
+    assert_eq!((st, body.as_str()), (503, "scripthash index rebuilding"));
+    let q2 = q.clone();
+    assert!(tokio::task::spawn_blocking(move || q2.rebuild_sh_if_degraded(None))
+        .await
+        .unwrap()
+        .unwrap());
+    let (st, body) = http_get(handle.local_addr, &heavy).await;
+    assert_eq!(st, 200, "{body}");
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A request the timeout layer drops (or whose client left) must keep its SH
+/// read guard until its blocking read returns, or the rebuild's wipe would run
+/// under that read.
+#[tokio::test]
+async fn dropped_request_keeps_its_sh_guard_until_the_blocking_read_ends() {
+    let (dir, q, _key) = rbitcoin_query::testutil::heavy_sh_extent_query("esplora-guard", 0);
+    let q = Arc::new(q);
+    let state = join_only_state(q.clone(), Arc::new(Mutex::new(JoinCache::default())));
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let held = Arc::new(Mutex::new((entered_tx, release_rx)));
+    let app = Router::new()
+        .route(
+            "/scripthash/{hash}/txs",
+            get(move || {
+                let held = Arc::clone(&held);
+                async move {
+                    handlers::spawn_join(move || {
+                        let g = held.lock().unwrap();
+                        g.0.send(()).unwrap();
+                        let _ = g.1.recv();
+                        StatusCode::OK.into_response()
+                    })
+                    .await
+                }
+            }),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            stamp_chain_view_mw,
+        ))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_millis(300),
+        ))
+        .with_state(state);
+    let path = format!("/scripthash/{}/txs", block_hash_hex(&script_hash(&[0x51])));
+    let (st, _) = oneshot_http(&app, get_with_client(&path, "guard")).await;
+    assert_eq!(st, 408, "the timeout layer dropped the request");
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the blocking read started");
+    assert_eq!(
+        q.sh_readers_in_flight(),
+        1,
+        "the read is still running, so its guard must still be held"
+    );
+    release_tx.send(()).unwrap();
+    let end = Instant::now() + Duration::from_secs(10);
+    while q.sh_readers_in_flight() != 0 {
+        assert!(Instant::now() < end, "guard never released");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn esplora_sh_join_and_template() {
     let (a1, spk1) = regtest_p2wpkh();

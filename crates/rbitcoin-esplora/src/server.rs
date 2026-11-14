@@ -324,6 +324,19 @@ pub async fn stamp_powered_by_mw(req: Request, next: Next) -> Response {
     resp
 }
 
+tokio::task_local! {
+    /// The SH read guard of the request being served.
+    static SH_READ: Arc<rbitcoin_query::ShReadGuard>;
+}
+
+/// The current request's SH read guard, for a blocking task to carry. The
+/// middleware's own copy goes when the timeout layer or a client disconnect
+/// drops the request, while the blocking read it started keeps running: the
+/// task holds the guard until its read returns, so the rebuild's wipe waits.
+pub(crate) fn sh_read_hold() -> Option<Arc<rbitcoin_query::ShReadGuard>> {
+    SH_READ.try_with(Arc::clone).ok()
+}
+
 pub async fn stamp_chain_view_mw(State(st): State<AppState>, req: Request, next: Next) -> Response {
     let asof = match asof_hash_from_uri(req.uri()) {
         Ok(v) => v,
@@ -338,13 +351,21 @@ pub async fn stamp_chain_view_mw(State(st): State<AppState>, req: Request, next:
             .get::<axum::extract::MatchedPath>()
             .is_none();
     let sh_view = !unmounted && path_uses_sh_view(&path);
-    if sh_view && !st.query.sh_history_available() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            rbitcoin_query::SCRIPTHASH_INDEX_DISABLED,
-        )
-            .into_response();
-    }
+    // Held until the response is built: the rebuild's wipe waits for it.
+    let sh_guard = if sh_view {
+        match st.query.sh_read_enter() {
+            Some(g) => Some(Arc::new(g)),
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    st.query.sh_unavailable_message(),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
     if asof.is_some() && (unmounted || !path_accepts_asof(&path)) {
         return not_found();
     }
@@ -369,7 +390,19 @@ pub async fn stamp_chain_view_mw(State(st): State<AppState>, req: Request, next:
             }
         }
     };
-    let mut resp = next.run(req).await;
+    let mut resp = match &sh_guard {
+        Some(g) => SH_READ.scope(Arc::clone(g), next.run(req)).await,
+        None => next.run(req).await,
+    };
+    // A fault, a rebuild step or an unlink batch began or ended during the
+    // read: whatever it saw is not an answer.
+    if sh_guard.as_ref().is_some_and(|g| !g.still_valid()) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            st.query.sh_unavailable_message(),
+        )
+            .into_response();
+    }
     let view = resp.extensions().get::<ChainView>().copied().or(pre_view);
     let Some(view) = view else {
         return resp;

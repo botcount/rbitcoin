@@ -1067,7 +1067,9 @@ components:
       headers: { X-Powered-By: { $ref: "#/components/headers/PoweredBy" } }
       content: { text/plain: { schema: { type: string } } }
     Unavailable:
-      description: No tip, mempool unavailable, scripthash index disabled, `--max-sh-creates` exceeded, or `chain view moved`
+      description: |
+        No tip, mempool unavailable, scripthash index disabled, `--max-sh-creates` exceeded, or `chain view moved`.
+        Address and scripthash routes also answer `scripthash index rebuilding` while the index is rebuilt after a fault (every script, until the replacement is published) and `scripthash index updating` while a reorg's disconnect rewrites it (once per disconnected block, briefly, and for a request that was already running when it began). Both mean retry; neither is a reason to rescan.
       headers: { X-Powered-By: { $ref: "#/components/headers/PoweredBy" } }
       content: { text/plain: { schema: { type: string } } }
     TxList:

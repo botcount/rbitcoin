@@ -1642,6 +1642,45 @@ fn startup_sets_sh_force_rebuild_on_the_query() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `NodeConfig::sh_auto_rebuild` (from `RBITCOIN_SH_AUTO_REBUILD`) reaches the
+/// query the supervisor reads. On by default.
+#[test]
+fn startup_sets_sh_auto_rebuild_on_the_query() {
+    let dir = scratch_dir("sh-auto-rebuild");
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    assert!(q.sh_auto_rebuild(), "default on");
+    let mut cfg = NodeConfig::default();
+    assert!(cfg.sh_auto_rebuild);
+    cfg.sh_auto_rebuild = false;
+    apply_startup_index_mode(&q, &cfg, 0).unwrap();
+    assert!(!q.sh_auto_rebuild());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A degraded marker left by a previous run makes startup wipe the SH head
+/// before write-behind starts. The marker stays: the cold rebuild at tip
+/// entry has not sealed a replacement head yet.
+#[test]
+fn startup_wipes_a_degraded_sh_head_and_keeps_the_marker() {
+    let dir = scratch_dir("sh-degraded-marker");
+    {
+        let q = Query::open_or_create_tiny(&dir).unwrap();
+        q.mark_sh_degraded("test fault");
+        assert!(q.sh_degraded_marker_present());
+    }
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    assert!(q.sh_degraded_marker_present(), "marker survives the reopen");
+    let mut cfg = NodeConfig::default();
+    cfg.shindex = true;
+    apply_startup_index_mode(&q, &cfg, 0).unwrap();
+    assert!(
+        q.sh_degraded_marker_present(),
+        "kept until the head is sealed"
+    );
+    assert!(!q.sh_degraded());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A pruned datadir does not start when this process omitted the flag.
 /// The witness files are already the only copy.
 #[test]
@@ -1771,6 +1810,126 @@ fn enter_tip_mode_does_not_ready_electrum_when_inclusion_lags() {
         !gates.sh_tip_ready,
         "lagging inclusion must not start Electrum"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A tip-mode query whose heavy key was torn and then degraded by an append.
+fn degraded_heavy_query(label: &str) -> (std::path::PathBuf, Arc<Query>, [u8; 32]) {
+    let (dir, q, key) = rbitcoin_query::testutil::heavy_sh_extent_query(label, 0);
+    let q = Arc::new(q);
+    rbitcoin_query::testutil::tear_sh_extent_head(&q, &key);
+    connect_heavy_pay(&q, 1);
+    assert!(q.sh_degraded(), "the append hit the torn key");
+    (dir.path().to_path_buf(), q, key)
+}
+
+/// One more block paying the heavy script on top of the tip.
+fn connect_heavy_pay(q: &Query, nonce: u32) {
+    use rbitcoin_query::testutil::{fixture_header, fixture_pay, FixtureChain, SH_HEAVY_SCRIPT};
+    let tip = q.tip_height().unwrap();
+    let (fk, rec) = q.header_at_height(tip).unwrap().unwrap();
+    let txs = vec![fixture_pay(50_000 + nonce, SH_HEAVY_SCRIPT)];
+    let h = fixture_header(tip.0 + 1, nonce, fk, Some(rec.hash), &txs);
+    q.connect_block(rbitcoin_primitives::Height(tip.0 + 1), &h, &txs)
+        .unwrap();
+}
+
+/// Tip entry and the in-place rebuild must not both own the scripthash build.
+/// The rebuild has wiped the index and parks; tip entry then runs. It has to
+/// wait for the rebuild instead of starting its own cold build on the same
+/// files, and once the rebuild is done the node is in Tip with a head that
+/// still takes appends.
+#[test]
+fn enter_tip_mode_waits_for_an_in_flight_sh_rebuild() {
+    use std::sync::mpsc;
+    enum Ev {
+        Wiped,
+        TipEntryWaits,
+        TipEntryDone(bool),
+    }
+    let (dir, q, key) = degraded_heavy_query("tip-owner");
+    let (tx, rx) = mpsc::channel::<Ev>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let rebuild = {
+        let (q, tx) = (Arc::clone(&q), tx.clone());
+        std::thread::spawn(move || {
+            rbitcoin_query::set_sh_rebuild_hook_for_test(Some(Box::new(move |stage, _| {
+                if stage == "after_wipe" {
+                    tx.send(Ev::Wiped).unwrap();
+                    let _ = release_rx.recv();
+                }
+                Ok(())
+            })));
+            q.rebuild_sh_if_degraded(None)
+        })
+    };
+    assert!(matches!(rx.recv().unwrap(), Ev::Wiped));
+    let tip_entry = {
+        let (q, tx) = (Arc::clone(&q), tx.clone());
+        std::thread::spawn(move || {
+            let tx2 = tx.clone();
+            rbitcoin_query::set_sh_rebuild_hook_for_test(Some(Box::new(move |stage, _| {
+                if stage == "build_wait" {
+                    tx2.send(Ev::TipEntryWaits).unwrap();
+                }
+                Ok(())
+            })));
+            let gates = enter_tip_mode(&q, None, true);
+            tx.send(Ev::TipEntryDone(gates.sh_tip_ready)).unwrap();
+        })
+    };
+    match rx.recv_timeout(Duration::from_secs(20)).unwrap() {
+        Ev::TipEntryWaits => {}
+        Ev::TipEntryDone(_) => panic!("tip entry ran its own build while the rebuild owned it"),
+        Ev::Wiped => unreachable!(),
+    }
+    release_tx.send(()).unwrap();
+    assert!(rebuild.join().unwrap().unwrap(), "rebuild finished");
+    tip_entry.join().unwrap();
+    let Ev::TipEntryDone(ready) = rx.recv().unwrap() else {
+        panic!("tip entry did not finish");
+    };
+    assert!(ready, "tip entry saw the rebuilt head");
+    assert!(!q.sh_degraded());
+    assert!(!q.index_mode().unwrap().is_direct(), "node is in Tip");
+    let before = q.scripthash_create_count(&key).unwrap();
+    connect_heavy_pay(&q, 2);
+    assert_eq!(
+        q.scripthash_create_count(&key).unwrap(),
+        before + 1,
+        "the head still takes appends"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A degraded index at tip entry is the supervisor's to rebuild: tip entry
+/// must not wipe it or start a cold build, only follow the tip. After the
+/// rebuild a second entry sees a ready head.
+#[test]
+fn enter_tip_mode_leaves_a_degraded_index_to_the_supervisor() {
+    let (dir, q, _key) = degraded_heavy_query("tip-degraded");
+    let gates = enter_tip_mode(&q, None, true);
+    assert!(gates.tip_follow_ready);
+    assert!(!gates.sh_tip_ready, "address routes stay closed");
+    assert!(
+        q.sh_degraded(),
+        "tip entry did not touch the degraded index"
+    );
+    assert!(!q.index_mode().unwrap().is_direct());
+    assert!(q.rebuild_sh_if_degraded(None).unwrap());
+    assert!(enter_tip_mode(&q, None, true).sh_tip_ready);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The wait for the build owner ends at shutdown.
+#[test]
+fn enter_tip_mode_cancel_ends_the_wait_for_the_build_owner() {
+    let (dir, q, _key) = degraded_heavy_query("tip-cancel-owner");
+    let _owner = q.sh_build_acquire(None).unwrap();
+    let cancel = Arc::new(AtomicBool::new(true));
+    let gates = enter_tip_mode(&q, Some(cancel), true);
+    assert!(gates.tip_follow_ready);
+    assert!(!gates.sh_tip_ready);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

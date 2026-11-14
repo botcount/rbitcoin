@@ -27,6 +27,13 @@ On/off costs and start/IBD/tip behavior: [`docs/operator/storage.md`](./docs/ope
 (Scripthash index). Disable later leaves SH files on disk; follow does not
 wait on SH materialize.
 
+**Scripthash index availability.** Address and scripthash reads can be refused with two more 503 bodies, both of which mean "ask again":
+
+- `scripthash index rebuilding`: the index hit a fault (a torn page after ENOSPC, a failed unlink or append, a history read that tripped over a torn key) and is being rebuilt from the chain in the background. Every address and scripthash route answers it, for every script, until the replacement index is published (minutes on a small store, longer on a large one). Blocks keep connecting meanwhile and the txid, outpoint, block, broadcast and fee routes are unaffected. Electrum returns the same text as a JSON-RPC error, and sends no `blockchain.scripthash.subscribe` notifications while it lasts; `blockchain.scripthash.unsubscribe` still works. When it ends every subscribed script is read again. Retry with backoff. `RBITCOIN_SH_AUTO_REBUILD=0` leaves it in place until a restart ([`docs/crash-recovery.md`](./docs/crash-recovery.md)).
+- `scripthash index updating`: a disconnect (a reorg) is rewriting the index for the block it removes, or a read overlapped one. It is answered while that rewrite runs, once per disconnected block, so a reorg of N blocks can refuse requests N times, each for the length of that block's unlink and flush. A request already running when the rewrite starts is refused after it finishes rather than answered from the half-rewritten index. Retry at once, or after a short pause.
+
+Neither body means the data is wrong, and neither is a reason to rescan the wallet.
+
 ### Query surface intent: wallet clients, plus 0.8 electrs drop-in
 
 **Goal:** serve **wallet software** (Electrum, Sparrow, custom wallets, light

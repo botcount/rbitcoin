@@ -899,6 +899,15 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             }
         },
     );
+    // Rebuilds a degraded SH index in the background. `RBITCOIN_SH_AUTO_REBUILD=0`
+    // (`NodeConfig::sh_auto_rebuild`) leaves it degraded until a restart with
+    // `RBITCOIN_SH_FORCE_REBUILD=1` (or the degraded marker) wipes it at open.
+    let sh_rebuild = config.shindex.then(|| {
+        rbitcoin_query::spawn_sh_rebuild_supervisor(
+            Arc::clone(&node.hub.query),
+            Arc::clone(&shutdown.flag),
+        )
+    });
     let peers_path = config.datadir.path().join("peers");
     let mut addrman = match AddrMan::load(&peers_path) {
         Ok(am) => {
@@ -1836,6 +1845,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if let Some(h) = sh_writebehind {
         let _ = h.join();
     }
+    if let Some(h) = sh_rebuild {
+        let _ = h.join();
+    }
     if let Some(h) = index_writebehind {
         let _ = h.join();
     }
@@ -2341,6 +2353,17 @@ pub async fn startup_follows_without_catch_up(hub: &Arc<ChainHub>) -> bool {
     }
 }
 
+/// Open-time SH head handling: wipe a head a previous run marked degraded (or
+/// that `RBITCOIN_SH_FORCE_REBUILD` names), then drop a head nothing proves.
+fn prepare_sh_head_at_open(query: &Query, shindex: bool) -> Result<(), NodeError> {
+    query
+        .startup_sh_rebuild(shindex)
+        .map_err(|e| NodeError::Config(format!("scripthash rebuild at open: {e}")))?;
+    query
+        .discard_unproven_scripthash_head()
+        .map_err(|e| NodeError::Config(format!("scripthash index: {e}")))
+}
+
 #[doc(hidden)]
 pub fn apply_startup_index_mode(
     query: &Query,
@@ -2358,6 +2381,7 @@ pub fn apply_startup_index_mode(
     ));
     query.set_sh_index_enabled(config.shindex);
     query.set_sh_force_rebuild(config.sh_force_rebuild);
+    query.set_sh_auto_rebuild(config.sh_auto_rebuild);
     query.set_block_filter_index(config.block_filter_index)?;
     query.set_genesis_coinbase_txid(config.chain_params()?.genesis_coinbase_txid);
     query.set_max_sh_creates(config.max_sh_creates);
@@ -2418,9 +2442,7 @@ pub fn apply_startup_index_mode(
     }
     // Before write-behind starts. An unproven head must not catch up by
     // appending from height 0; delete it and stay Direct until materialize.
-    query
-        .discard_unproven_scripthash_head()
-        .map_err(|e| NodeError::Config(format!("scripthash index: {e}")))?;
+    prepare_sh_head_at_open(query, config.shindex)?;
     if config.shindex && query.sh_use_writebehind() {
         let _ = query.sync_sh_seal_from_include_hwm();
         query.enter_tip_index_mode();
@@ -3151,10 +3173,38 @@ pub fn sh_writebehind_at_tip_entry(
     stop: Arc<AtomicBool>,
     on_fatal: impl FnOnce() + Send + 'static,
 ) -> Option<ShWritebehind> {
-    if !query.enqueues_sh_writebehind() {
+    if !query.sh_writebehind_wanted() {
         return None;
     }
     Some(spawn_sh_writebehind(query, stop, on_fatal))
+}
+
+/// Tip entry's claim on the SH build. Waits out a rebuild in flight, and the
+/// head that rebuild leaves is then the one tip entry sees. `Err` carries the
+/// gates to return: the wait was cancelled, or the index is still degraded
+/// (rebuild off or failed), which stays the supervisor's to rebuild. Tip
+/// follow starts either way.
+fn claim_sh_build<'a>(
+    query: &'a Query,
+    cancel: Option<&AtomicBool>,
+) -> Result<rbitcoin_query::ShBuildGuard<'a>, TipModeGates> {
+    let not_ready = TipModeGates {
+        tip_follow_ready: true,
+        sh_tip_ready: false,
+    };
+    let owner = query.sh_build_acquire(cancel).map_err(|e| {
+        warn!("node: scripthash build not claimed: {e}");
+        not_ready
+    })?;
+    if query.sh_degraded() {
+        query.enter_tip_index_mode();
+        warn!(
+            "node: scripthash index is degraded at tip entry; the rebuild supervisor owns \
+             it, address routes stay closed until it finishes"
+        );
+        return Err(not_ready);
+    }
+    Ok(owner)
 }
 
 /// Enter steady-state after true catch-up.
@@ -3197,6 +3247,11 @@ pub fn enter_tip_mode(
         };
     }
 
+    // One owner of the SH build: the rebuild supervisor may be mid-pass.
+    let _owner = match claim_sh_build(query, cancel.as_deref()) {
+        Ok(g) => g,
+        Err(gates) => return gates,
+    };
     if query.sh_use_writebehind() {
         query.enter_tip_index_mode();
         info!(
