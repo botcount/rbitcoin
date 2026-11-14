@@ -317,6 +317,7 @@ paths:
       summary: Confirmation status
       description: |
         Live: confirmed status at the tip, or `{"confirmed": false}` for a mempool tx.
+        A tx that is in neither (reorged out and not back in the mempool) is **404**.
         With `?asof=`: confirmed only if the tx is in a block at or below the
         as-of block; a tx confirmed later reads `{"confirmed": false}`.
       parameters:

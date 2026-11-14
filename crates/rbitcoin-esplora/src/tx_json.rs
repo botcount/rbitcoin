@@ -2,7 +2,7 @@
 
 use crate::script_fields::esplora_script_fields;
 use bitcoin::hashes::Hash;
-use bitcoin::{Network, Transaction};
+use bitcoin::{Network, Transaction, Txid};
 use rbitcoin_net::MempoolHub;
 
 use rbitcoin_primitives::{Fk, Height};
@@ -19,6 +19,26 @@ pub fn tx_status_json(query: &Query, tx_fk: Fk) -> Result<Value, QueryError> {
         Some(view) => tx_status_json_in(query, tx_fk, &view),
         None => Ok(json!({ "confirmed": false })),
     }
+}
+
+/// True when the node still serves a stored tx row: the mempool holds the
+/// txid, or the row is confirmed on the active chain.
+///
+/// A row that is neither was reorged out and is not back in the mempool, or it
+/// lost its inputs to a conflicting tx. Esplora answers 404 for it, and
+/// `confirmed: false` means "in the mempool". A tx that moves between the
+/// mempool and a block during the two reads can read as gone for that one
+/// request. A pinned `?asof=` view has no mempool and does not use this.
+pub fn tx_is_listed(
+    query: &Query,
+    mempool: Option<&MempoolHub>,
+    tx_fk: Fk,
+    txid: &[u8; 32],
+) -> Result<bool, QueryError> {
+    if mempool.is_some_and(|m| m.contains(&Txid::from_byte_array(*txid))) {
+        return Ok(true);
+    }
+    query.store().is_confirmed_strong(tx_fk)
 }
 
 /// Header at `height` on `view`'s chain.

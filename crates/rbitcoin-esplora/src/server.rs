@@ -1,7 +1,7 @@
 //! Esplora HTTP listener (axum + tower limits).
 
 use crate::handlers;
-use crate::tx_json::{build_tx_json, build_tx_json_from_tx, tx_status_json_in};
+use crate::tx_json::{build_tx_json, build_tx_json_from_tx, tx_is_listed, tx_status_json_in};
 use axum::extract::{FromRequestParts, Path, Query as AxumQuery, Request, State};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderValue, StatusCode};
@@ -1440,8 +1440,12 @@ pub async fn tx_full(State(st): State<AppState>, Path(txid_hex): Path<String>) -
             return not_found();
         };
         match st.query.tx_fk_by_txid(&txid) {
-            Ok(Some(fk)) => match build_tx_json(&st.query, fk, st.network, None) {
-                Ok(v) => json_reply_here(v),
+            Ok(Some(fk)) => match stored_tx_listed(&st, fk, &txid) {
+                Ok(true) => match build_tx_json(&st.query, fk, st.network, None) {
+                    Ok(v) => json_reply_here(v),
+                    Err(e) => store_err(e),
+                },
+                Ok(false) => not_found(),
                 Err(e) => store_err(e),
             },
             Ok(None) => match mempool_wire(&st, &txid) {
@@ -1470,8 +1474,12 @@ pub async fn tx_hex(State(st): State<AppState>, Path(txid_hex): Path<String>) ->
             return not_found();
         };
         match st.query.tx_fk_by_txid(&txid) {
-            Ok(Some(fk)) => match st.query.tx_wire_bytes(fk) {
-                Ok(raw) => plain_ok(rbitcoin_primitives::hex_encode(&(raw))),
+            Ok(Some(fk)) => match stored_tx_listed(&st, fk, &txid) {
+                Ok(true) => match st.query.tx_wire_bytes(fk) {
+                    Ok(raw) => plain_ok(rbitcoin_primitives::hex_encode(&(raw))),
+                    Err(e) => store_err(e),
+                },
+                Ok(false) => not_found(),
                 Err(e) => store_err(e),
             },
             Ok(None) => match mempool_wire(&st, &txid) {
@@ -1499,6 +1507,13 @@ pub async fn tx_status(
         };
         match st.query.tx_fk_by_txid(&txid) {
             Ok(Some(fk)) => {
+                if asof.is_none() {
+                    match stored_tx_listed(&st, fk, &txid) {
+                        Ok(true) => {}
+                        Ok(false) => return not_found(),
+                        Err(e) => return store_err(e),
+                    }
+                }
                 let view = match pin_or_reject(&st.query, ChainViewKind::Tip, asof) {
                     Ok(v) => v,
                     Err(r) => return r,
@@ -1569,6 +1584,16 @@ pub fn block_hash_hex(hash: &[u8; 32]) -> String {
 #[allow(clippy::result_unit_err)] // bad hex is (); callers map it to not found
 pub fn parse_hash32(s: &str) -> Result<[u8; 32], ()> {
     rbitcoin_primitives::parse_display_hash32(s).map_err(|_| ())
+}
+
+/// A stored tx row is served only while the mempool holds it or it is
+/// confirmed on the active chain. See [`tx_is_listed`].
+pub fn stored_tx_listed(
+    st: &AppState,
+    fk: rbitcoin_primitives::Fk,
+    txid: &[u8; 32],
+) -> Result<bool, rbitcoin_query::QueryError> {
+    tx_is_listed(&st.query, st.mempool.as_deref(), fk, txid)
 }
 
 pub fn mempool_wire(st: &AppState, txid: &[u8; 32]) -> Option<bitcoin::Transaction> {

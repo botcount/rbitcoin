@@ -1112,3 +1112,182 @@ async fn dropped_admit_waiter_clears_waiting() {
     drop(held);
     handle.shutdown().await;
 }
+
+/// A real one-input transaction as a store apply, so the same txid can be
+/// stored by a block and later offered to the mempool.
+fn stored_spend(tx: &bitcoin::Transaction, prev: [u8; 32]) -> TxApply {
+    use bitcoin::hashes::Hash;
+    TxApply {
+        tx: TxRecord {
+            txid: tx.compute_txid().to_byte_array(),
+            version: 2,
+            locktime: 0,
+            input_count: 1,
+            output_count: u32::try_from(tx.output.len()).unwrap(),
+        },
+        inputs: vec![InputRecord {
+            prev_txid: prev,
+            parent: rbitcoin_store::InputParent::Unlinked { vout: 0 },
+            sequence: tx.input[0].sequence.to_consensus_u32(),
+            script_sig: vec![],
+            witness: vec![],
+        }],
+        outputs: tx
+            .output
+            .iter()
+            .map(|o| OutputRecord::unspent(o.value.to_sat(), o.script_pubkey.to_bytes()))
+            .collect(),
+    }
+}
+
+/// `/tx/:txid` and its status, hex, raw, outspends and outspend routes.
+async fn tx_routes(addr: SocketAddr, txid: &str) -> Vec<(String, u16, String)> {
+    let mut out = Vec::new();
+    for suffix in ["", "/status", "/hex", "/raw", "/outspends", "/outspend/0"] {
+        let path = format!("/tx/{txid}{suffix}");
+        let (st, body) = http_get(addr, &path).await;
+        out.push((path, st, body));
+    }
+    out
+}
+
+/// A transaction that was in a block, is no longer on the active chain, and is
+/// not in the mempool is gone: 404 on every `/tx/:txid` route. It answers
+/// `confirmed: false` only while the mempool holds it.
+#[tokio::test(flavor = "current_thread")]
+async fn reorged_out_tx_is_404_unless_the_mempool_holds_it() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize_hex;
+    use bitcoin::hashes::Hash;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+
+    let (dir, q) = temp_query("reorged-out-tx");
+    let q = Arc::new(q);
+    let mp_dir = dir.join("mp");
+    std::fs::create_dir_all(&mp_dir).unwrap();
+    let hub = rbitcoin_net::MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    let handle = run_esplora(cfg, Arc::clone(&q), Some(Arc::clone(&hub)))
+        .await
+        .expect("listen");
+    let mut pad = HttpPad {
+        q,
+        hub,
+        addr: handle.local_addr,
+        cbs: Vec::new(),
+        hashes: Vec::new(),
+        tip_fk: Fk::NULL,
+    };
+    for _ in 0..102u32 {
+        pad.connect(Vec::new());
+    }
+    let cbs = pad.cbs.clone();
+    let spend = |cb: usize, tweak: u64| Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array(cbs[cb]),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(20_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+            TxOut {
+                value: Amount::from_sat(30_0000_0000 - 2_000 - tweak),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+        ],
+    };
+    // `conflicted` loses its input to `other`. `dropped` is reorged out and
+    // spends a coin nobody else takes, so the mempool can hold it again.
+    let conflicted = spend(0, 0);
+    let other = spend(0, 1);
+    let dropped = spend(1, 0);
+    let ids = [&conflicted, &dropped].map(|t| display_txid(t.compute_txid()));
+    pad.connect(vec![
+        stored_spend(&conflicted, pad.cbs[0]),
+        stored_spend(&dropped, pad.cbs[1]),
+    ]);
+    for id in &ids {
+        for (path, st, body) in tx_routes(pad.addr, id).await {
+            assert_eq!(st, 200, "confirmed {path}: {body}");
+        }
+        let (_, body) = http_get(pad.addr, &format!("/tx/{id}/status")).await;
+        let status: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status["confirmed"], true, "{body}");
+    }
+
+    // Reorg: the block goes, a block with `other` takes its place.
+    pad.q.disconnect_tip().unwrap();
+    let old_tip = pad.hashes.pop().unwrap();
+    pad.cbs.pop();
+    let h = pad.tip() + 1;
+    let parent_hash = *pad.hashes.last().unwrap();
+    let parent_fk = pad.q.header_at_height(Height(pad.tip())).unwrap().unwrap().0;
+    let (mut alt, alt_cb) = coinbase(h, parent_fk, Some(parent_hash));
+    alt.nonce += 1;
+    alt.hash = rbitcoin_store::block_header_hash(
+        alt.version,
+        &parent_hash,
+        &alt.merkle_root,
+        alt.timestamp,
+        alt.bits,
+        alt.nonce,
+    );
+    assert_ne!(alt.hash, old_tip);
+    pad.cbs.push(alt_cb.tx.txid);
+    pad.hashes.push(alt.hash);
+    pad.tip_fk = pad
+        .q
+        .connect_block(Height(h), &alt, &[alt_cb, stored_spend(&other, cbs[0])])
+        .unwrap();
+
+    let (st, _) = http_get(pad.addr, &format!("/tx/{}/status", ids[0])).await;
+    assert_eq!(st, 404, "conflicted, not in the mempool");
+    for id in &ids {
+        for (path, st, body) in tx_routes(pad.addr, id).await {
+            assert_eq!(st, 404, "reorged out, not in the mempool: {path}: {body}");
+        }
+    }
+    let (st, body) = http_get(pad.addr, &format!("/tx/{}/status", "ee".repeat(32))).await;
+    assert_eq!((st, body.as_str()), (404, "Not Found"));
+
+    // The mempool takes the non-conflicting one back: pending, not gone.
+    let (st, body) = http_post(pad.addr, "/tx", serialize_hex(&dropped).as_bytes()).await;
+    assert_eq!(st, 200, "re-broadcast: {body}");
+    for (path, st, body) in tx_routes(pad.addr, &ids[1]).await {
+        assert_eq!(st, 200, "in the mempool: {path}: {body}");
+        if path.ends_with("/status") {
+            assert_eq!(body, r#"{"confirmed":false}"#);
+        }
+        if path.ends_with("/hex") {
+            assert_eq!(body, serialize_hex(&dropped));
+        }
+        if path.ends_with("/outspends") {
+            assert_eq!(body, r#"[{"spent":false},{"spent":false}]"#);
+        }
+    }
+    let (_, body) = http_get(pad.addr, &format!("/tx/{}", ids[1])).await;
+    let full: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(full["status"]["confirmed"], false, "{body}");
+    // The conflicted one stays gone.
+    let (st, _) = http_get(pad.addr, &format!("/tx/{}/status", ids[0])).await;
+    assert_eq!(st, 404);
+
+    // A pinned `asof` view never reads the mempool, so it keeps its answer.
+    let asof = block_hash_hex(&pad.hashes[0]);
+    let (st, body) = http_get(pad.addr, &format!("/tx/{}/status?asof={asof}", ids[1])).await;
+    assert_eq!((st, body.as_str()), (200, r#"{"confirmed":false}"#));
+
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
