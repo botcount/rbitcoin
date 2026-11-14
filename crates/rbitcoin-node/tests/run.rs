@@ -1642,6 +1642,45 @@ fn startup_sets_sh_force_rebuild_on_the_query() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `NodeConfig::sh_auto_rebuild` (from `RBITCOIN_SH_AUTO_REBUILD`) reaches the
+/// query the supervisor reads. On by default.
+#[test]
+fn startup_sets_sh_auto_rebuild_on_the_query() {
+    let dir = scratch_dir("sh-auto-rebuild");
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    assert!(q.sh_auto_rebuild(), "default on");
+    let mut cfg = NodeConfig::default();
+    assert!(cfg.sh_auto_rebuild);
+    cfg.sh_auto_rebuild = false;
+    apply_startup_index_mode(&q, &cfg, 0).unwrap();
+    assert!(!q.sh_auto_rebuild());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A degraded marker left by a previous run makes startup wipe the SH head
+/// before write-behind starts. The marker stays: the cold rebuild at tip
+/// entry has not sealed a replacement head yet.
+#[test]
+fn startup_wipes_a_degraded_sh_head_and_keeps_the_marker() {
+    let dir = scratch_dir("sh-degraded-marker");
+    {
+        let q = Query::open_or_create_tiny(&dir).unwrap();
+        q.mark_sh_degraded("test fault");
+        assert!(q.sh_degraded_marker_present());
+    }
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    assert!(q.sh_degraded_marker_present(), "marker survives the reopen");
+    let mut cfg = NodeConfig::default();
+    cfg.shindex = true;
+    apply_startup_index_mode(&q, &cfg, 0).unwrap();
+    assert!(
+        q.sh_degraded_marker_present(),
+        "kept until the head is sealed"
+    );
+    assert!(!q.sh_degraded());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A pruned datadir does not start when this process omitted the flag.
 /// The witness files are already the only copy.
 #[test]

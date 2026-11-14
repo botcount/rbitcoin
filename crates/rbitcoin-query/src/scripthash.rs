@@ -1316,7 +1316,7 @@ impl Query {
     ) -> Result<Vec<Fk>, QueryError> {
         let genesis = self.genesis_coinbase_fk()?;
         let mut fks = Vec::new();
-        for fk in self.store.scripthash.create_fks(scripthash)? {
+        for fk in self.sh_create_fks(scripthash)? {
             if Some(fk) != genesis && self.confirmed_strong_in(fk, view)? {
                 fks.push(fk);
             }
@@ -1974,7 +1974,7 @@ impl Query {
         scripthash: &[u8; 32],
         height: Height,
     ) -> Result<Vec<Fk>, QueryError> {
-        let entries = self.store.scripthash.create_fks(scripthash)?;
+        let entries = self.sh_create_fks(scripthash)?;
         let mut posting: Vec<u64> = entries.iter().filter_map(|fk| fk.get()).collect();
         for fk in self.pending_sh_create_fks(scripthash) {
             if let Some(id) = fk.get() {
@@ -2050,7 +2050,7 @@ impl Query {
     /// The cheap test that lets callers skip [`Self::block_touch`] when no
     /// subscribed hash could possibly be touched.
     pub fn scripthash_has_postings(&self, scripthash: &[u8; 32]) -> Result<bool, QueryError> {
-        if !self.store.scripthash.create_fks(scripthash)?.is_empty() {
+        if !self.sh_create_fks(scripthash)?.is_empty() {
             return Ok(true);
         }
         Ok(!self.pending_sh_create_fks(scripthash).is_empty())
@@ -2065,7 +2065,7 @@ impl Query {
         if touch.ids.is_empty() {
             return Ok(false);
         }
-        let entries = self.store.scripthash.create_fks(scripthash)?;
+        let entries = self.sh_create_fks(scripthash)?;
         let hit = entries
             .iter()
             .chain(self.pending_sh_create_fks(scripthash).iter())
@@ -2236,7 +2236,7 @@ impl Query {
 
     /// Durable SH create count plus pending write-behind for this key.
     pub fn scripthash_create_count(&self, scripthash: &[u8; 32]) -> Result<u32, QueryError> {
-        let durable = self.store.scripthash.create_count(scripthash)?;
+        let durable = self.sh_create_count(scripthash)?;
         let pending = self.pending_sh_create_fks(scripthash).len() as u32;
         Ok(durable.saturating_add(pending))
     }

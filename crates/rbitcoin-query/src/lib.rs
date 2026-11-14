@@ -34,6 +34,8 @@ pub mod scripthash;
 #[doc(hidden)]
 pub mod sh_builder;
 #[doc(hidden)]
+pub mod sh_degraded;
+#[doc(hidden)]
 pub mod soft_densify;
 #[doc(hidden)]
 pub mod sp_tweaks;
@@ -202,6 +204,13 @@ pub struct PublishedTip {
 
 /// Electrum JSON-RPC error / Esplora 503 body when `--sh-index` is off.
 pub const SCRIPTHASH_INDEX_DISABLED: &str = "scripthash index disabled";
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub use sh_degraded::set_sh_rebuild_hook_for_test;
+pub use sh_degraded::{
+    spawn_sh_rebuild_supervisor, ShReadGuard, SCRIPTHASH_INDEX_REBUILDING,
+    SCRIPTHASH_INDEX_UPDATING,
+};
 
 /// Default unpaged scripthash join cap. `0` stays unlimited.
 pub const DEFAULT_MAX_SH_CREATES: u32 = 10_000;
@@ -469,6 +478,8 @@ pub struct Query {
     pub sh_index_enabled: std::sync::atomic::AtomicBool,
     /// See [`Self::set_sh_force_rebuild`].
     pub sh_force_rebuild: std::sync::atomic::AtomicBool,
+    /// SH index fault state. See [`sh_degraded`].
+    pub sh_degraded: sh_degraded::ShDegraded,
     pub block_filter_enabled: std::sync::atomic::AtomicBool,
     /// Confirm appends filter and tweak rows. Set by `prepare_live_indexes`
     /// when every enabled index is contiguous with the tip. Load reads it;
@@ -889,6 +900,7 @@ impl Query {
             // `--shindex` off before entering Direct.
             sh_index_enabled: std::sync::atomic::AtomicBool::new(true),
             sh_force_rebuild: std::sync::atomic::AtomicBool::new(false),
+            sh_degraded: sh_degraded::ShDegraded::default(),
             block_filter_enabled: std::sync::atomic::AtomicBool::new(false),
             index_live: std::sync::atomic::AtomicBool::new(false),
             tweak_follow: std::sync::atomic::AtomicBool::new(false),
@@ -2030,7 +2042,7 @@ impl Query {
     /// Electrum/Esplora scripthash reads follow `--sh-index`.
     /// A leftover watermark from a previous run does not turn them on.
     pub fn sh_history_available(&self) -> bool {
-        self.sh_index_enabled()
+        self.sh_index_enabled() && !self.sh_degraded() && !self.sh_frozen()
     }
 
     /// Advance SH watermark only after Class C tip commit.

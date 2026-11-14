@@ -1240,6 +1240,8 @@ impl ScriptHashTable {
     /// the alloc header still says `live_count == 0`.
     pub fn reinit_empty_for_cold_materialize(&self) -> Result<(), StoreError> {
         self.reset_all_bodies()?;
+        self.pending_empty.lock().unwrap().clear();
+        self.wipe_overflow_heads()?;
         for slot in self.sorted_main.iter() {
             *slot.write().unwrap() = None;
         }
@@ -1252,6 +1254,35 @@ impl ScriptHashTable {
         for i in 0..n {
             unlink_shard_pack_mark(&sorted_main_shard_path(&self.store_dir, i, n));
         }
+        Ok(())
+    }
+
+    /// Drop the ingest OA, every sealed overflow head and the L1 head. Keys
+    /// first seen after a pack live there, and they are looked up before main,
+    /// so a rebuild that left them would shadow the packed chains. Exclusive:
+    /// no concurrent SH readers/writers.
+    fn wipe_overflow_heads(&self) -> Result<(), StoreError> {
+        self.sealed_ovf.lock().unwrap().clear();
+        *self.ovf_l1.lock().unwrap() = None;
+        // Everything in `scripthash.ovf/` except the overflow body, which
+        // `reset_all_bodies` already emptied: sealed heads, L1, ingest.
+        let ovf_dir = self.store_dir.join("scripthash.ovf");
+        if let Ok(rd) = std::fs::read_dir(&ovf_dir) {
+            for ent in rd.flatten() {
+                if ent.file_name() == "body" {
+                    continue;
+                }
+                let p = ent.path();
+                let r = if p.is_dir() {
+                    std::fs::remove_dir_all(&p)
+                } else {
+                    std::fs::remove_file(&p)
+                };
+                r.map_err(|e| StoreError::io(&p, e))?;
+            }
+        }
+        let mut ing = self.ingest.lock().unwrap();
+        *ing = open_or_create_ingest(&self.store_dir, self.scale)?;
         Ok(())
     }
 
