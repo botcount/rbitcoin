@@ -2758,6 +2758,10 @@ async fn below_floor_headers_do_not_walk_parents() {
     );
     assert_eq!(side_tips(&hub), 0, "below-floor headers are not stored");
     peers.set_noban(true);
+    // The stamp is whole seconds of the hub clock. Pin it so a second
+    // boundary between the push and the assert cannot move the expected value.
+    let stamp_at = 1_700_000_000;
+    peers.set_mock_now(stamp_at);
     let noban = live_peer(&peers, 18602, 42, false);
     let mut follow_nb = PeerFollowState::new();
     push(
@@ -2774,7 +2778,7 @@ async fn below_floor_headers_do_not_walk_parents() {
     );
     assert_eq!(
         noban.last_block_announcement.load(Ordering::Relaxed),
-        noban.clock_now(),
+        stamp_at,
         "a noban peer stamps its accepted heavier below-floor header"
     );
     peers.set_noban(false);

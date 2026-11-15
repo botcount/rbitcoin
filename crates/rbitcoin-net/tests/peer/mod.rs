@@ -5994,7 +5994,7 @@ fn snapshot_omits_peer_after_tcp_fin() {
 
 /// Burst tip advances (> tip broadcast capacity) must still reach a follow peer
 /// without waiting for the 120s headers poll (`sync_blocks` is 60s).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "current_thread")]
 async fn tip_burst_past_broadcast_capacity_still_syncs_peer() {
     use bitcoin::ScriptBuf;
     use rbitcoin_net::P2PNode;
@@ -6034,9 +6034,18 @@ async fn tip_burst_past_broadcast_capacity_still_syncs_peer() {
     .unwrap();
 
     na.follow_from(nb.local_addr).await.unwrap();
+    // Both session loops must be running before the burst: each side has read
+    // the other's initial getheaders. Otherwise B's own initial sync, and not
+    // the lagged announce, would fetch the burst.
+    let read_getheaders = |n: &P2PNode| {
+        n.peers
+            .snapshot()
+            .iter()
+            .any(|p| p.bytesrecv_per_msg.contains_key("getheaders"))
+    };
     let mut linked = false;
-    for _ in 0..100 {
-        if na.follow_live_count() >= 1 && !nb.peers.snapshot().is_empty() {
+    for _ in 0..500 {
+        if na.follow_live_count() >= 1 && read_getheaders(&na) && read_getheaders(&nb) {
             linked = true;
             break;
         }
@@ -6044,8 +6053,11 @@ async fn tip_burst_past_broadcast_capacity_still_syncs_peer() {
     }
     assert!(linked, "follow session must be live before tip burst");
 
-    // Capacity is 64; sync generate without await fills the ring so the
-    // announce task sees Lagged instead of every TipEvent.
+    // Capacity is 64. The runtime has one thread, so the sync generate below
+    // cannot be interleaved with the session tasks: the ring overflows and the
+    // announce task sees Lagged instead of every TipEvent. On a multi-thread
+    // runtime the sessions raced the miner and B was flooded with per-block
+    // traffic it could not decode in time under load ("decode queue full").
     const BURST: u32 = 80;
     na.hub
         .generate_to_script(BURST, ScriptBuf::from_bytes(vec![0x51]), vec![])

@@ -81,10 +81,24 @@ impl Drop for Restore {
 }
 
 /// Filling the P2P listener must stop while descriptors remain.
+///
+/// A plain test that takes the limit before it builds the runtime: building a
+/// runtime opens descriptors, so under `#[tokio::test]` the other test could
+/// already hold a full table by then and the build failed with EMFILE.
 #[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn listener_cap_fd_reserve_leaves_room() {
+#[test]
+fn listener_cap_fd_reserve_leaves_room() {
     let _limit = hold_fd_limit();
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(listener_cap_fd_reserve_room());
+}
+
+#[cfg(unix)]
+async fn listener_cap_fd_reserve_room() {
     let (soft, hard) = nofile();
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
