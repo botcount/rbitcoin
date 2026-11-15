@@ -235,8 +235,9 @@ pub struct Session {
     pub rebuild_at: Option<Instant>,
     /// Budgets that replaced a queued rebuild's since the last build.
     superseded: u32,
-    /// Last `publish` returned without a template because the node was in IBD
-    /// or relay was off. Cleared when a template is sent.
+    /// Last `publish` returned without a template because the node was in IBD,
+    /// relay was off, or the next block's time was past the future limit.
+    /// Cleared when a template is sent.
     holding: bool,
     held_logged: bool,
     /// While `holding`, the next time to try again. Relay turns on after the
@@ -418,8 +419,8 @@ impl Session {
     }
 
     /// Template for the session's constraints. `None` before constraints, while
-    /// in IBD, or before the pool is maintained (`-blocksonly` never starts
-    /// it). A holding session tries again on the template interval, so
+    /// in IBD, before the pool is maintained (`-blocksonly` never starts
+    /// it), or while the next block's time is past the future limit. A holding session tries again on the template interval, so
     /// maintenance starting after the catch-up tip still publishes. Peer
     /// relay can stay off.
     async fn build(&mut self) -> io::Result<Option<template::Template>> {
@@ -468,7 +469,7 @@ impl Session {
         if t.is_none() {
             self.holding = true;
             if !self.held_logged {
-                rbitcoin_log::info!("sv2: holding templates until the mempool is maintained");
+                rbitcoin_log::info!("sv2: holding templates until the node can build one");
                 self.held_logged = true;
             }
         }

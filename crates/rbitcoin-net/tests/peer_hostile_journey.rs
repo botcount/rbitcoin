@@ -260,7 +260,7 @@ async fn hostile_peer_session() {
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("hostile-session");
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(200, ScriptBuf::from_bytes(vec![0x51]), vec![])
+    hub.confirm_empty_regtest(200)
         .unwrap();
     let genesis = hub
         .query
@@ -283,7 +283,7 @@ async fn hostile_peer_session() {
 
     let hdr = Header {
         version: bitcoin::block::Version::TWO,
-        prev_blockhash: BlockHash::all_zeros(),
+        prev_blockhash: BlockHash::from_byte_array([0x99; 32]),
         merkle_root: bitcoin::TxMerkleNode::all_zeros(),
         time: 0,
         bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
@@ -323,6 +323,34 @@ async fn hostile_peer_session() {
         .unwrap();
     assert_eq!(follow.pending_headers.len(), rbitcoin_net::peer::MAX_PENDING_HEADERS);
     assert!(!follow.pending_headers.contains_key(&extra_hash));
+
+    // One continuation needs one slot. The other orphans stay, so a later
+    // parent can still join them.
+    let mut continuation = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(200))
+        .unwrap();
+    continuation.prev_blockhash = hub.tip_hash().unwrap();
+    continuation.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0x55; 32]);
+    continuation.time = continuation.time.saturating_add(600);
+    continuation.nonce = 0;
+    rbitcoin_consensus::grind_regtest_pow(&mut continuation);
+    let continuation_hash = continuation.block_hash();
+    on_headers(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&peer),
+        &[continuation],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        follow.pending_headers.len(),
+        rbitcoin_net::peer::MAX_PENDING_HEADERS
+    );
+    assert!(follow.pending_headers.contains_key(&continuation_hash));
+
     while out_rx.try_recv().is_ok() {}
 
     let gh = GetHeadersMessage::new(vec![genesis], BlockHash::from_byte_array([0u8; 32]));
@@ -413,11 +441,12 @@ async fn hostile_peer_session() {
     }]);
     assert_eq!(rbitcoin_net::peers::outbound_msg_bytes(&v2), 61);
     let hsi = HeaderAndShortIds::from_block(&block, 1, 1, &[0]).unwrap();
+    let compact_n = bitcoin::consensus::encode::serialize(&hsi).len();
     assert_eq!(
         rbitcoin_net::peers::outbound_msg_bytes(&NetworkMessage::CmpctBlock(CmpctBlock {
             compact_block: hsi
         })),
-        1024
+        compact_n
     );
     let txns = bitcoin::bip152::BlockTransactions {
         block_hash: block.block_hash(),
@@ -713,4 +742,724 @@ fn addrv2_flood_is_rate_limited_before_addrman() {
             "getpeerinfo addr counters, addr permission {perm}"
         );
     }
+}
+
+fn regtest_child(parent: &bitcoin::block::Header, tag: u8) -> bitcoin::block::Header {
+    pow_child(parent, u32::from(tag))
+}
+
+fn pow_child(parent: &bitcoin::block::Header, n: u32) -> bitcoin::block::Header {
+    let mut header = *parent;
+    header.prev_blockhash = parent.block_hash();
+    let mut merkle = [0u8; 32];
+    merkle[..4].copy_from_slice(&n.to_le_bytes());
+    header.merkle_root = bitcoin::TxMerkleNode::from_byte_array(merkle);
+    header.time = parent.time.saturating_add(600);
+    header.bits = bitcoin::CompactTarget::from_consensus(0x207f_ffff);
+    header.nonce = 0;
+    rbitcoin_consensus::grind_regtest_pow(&mut header);
+    header
+}
+
+/// Does not connect to a header we have, and the hash misses `bits`.
+/// A non-connecting header stays in the map without a store write.
+fn unconnected_missing_target(n: u32) -> bitcoin::block::Header {
+    let mut header = bitcoin::block::Header {
+        version: bitcoin::block::Version::TWO,
+        prev_blockhash: BlockHash::from_byte_array([0x99; 32]),
+        merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+        time: 0,
+        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+        nonce: n,
+    };
+    let mut merkle = [0u8; 32];
+    merkle[..4].copy_from_slice(&n.to_le_bytes());
+    header.merkle_root = bitcoin::TxMerkleNode::from_byte_array(merkle);
+    let start = header.nonce;
+    loop {
+        if header.validate_pow(header.target()).is_err() {
+            return header;
+        }
+        header.nonce = header.nonce.wrapping_add(1);
+        assert_ne!(header.nonce, start, "regtest target rejected no nonce");
+    }
+}
+
+/// Same shape as [`pow_child`], but the hash misses `bits`. No grind.
+fn child_missing_target(parent: &bitcoin::block::Header, n: u32) -> bitcoin::block::Header {
+    let mut header = *parent;
+    header.prev_blockhash = parent.block_hash();
+    let mut merkle = [0u8; 32];
+    merkle[..4].copy_from_slice(&n.to_le_bytes());
+    header.merkle_root = bitcoin::TxMerkleNode::from_byte_array(merkle);
+    header.time = parent.time.saturating_add(600);
+    header.bits = bitcoin::CompactTarget::from_consensus(0x207f_ffff);
+    header.nonce = n;
+    let start = header.nonce;
+    loop {
+        if header.validate_pow(header.target()).is_err() {
+            return header;
+        }
+        header.nonce = header.nonce.wrapping_add(1);
+        assert_ne!(header.nonce, start, "regtest target rejected no nonce");
+    }
+}
+
+fn pending_keys(follow: &PeerFollowState) -> HashSet<BlockHash> {
+    follow.pending_headers.keys().copied().collect()
+}
+
+/// Put `headers` in the pending map. Used to reach [`MAX_PENDING_HEADERS`]
+/// without a clone of that map on every header.
+fn fill_pending(follow: &mut PeerFollowState, headers: &[bitcoin::block::Header]) {
+    for header in headers {
+        follow.pending_headers.insert(header.block_hash(), *header);
+    }
+}
+
+/// Tip height for the pending-cap journeys. A one-block fork from two below
+/// this tip has less work than the tip. The hostile locator journey stays at
+/// height 200: its getheaders reply is the whole chain.
+const CAP_TIP: u32 = 4;
+
+fn nonconnecting_header(nonce: u32) -> bitcoin::block::Header {
+    bitcoin::block::Header {
+        version: bitcoin::block::Version::TWO,
+        prev_blockhash: BlockHash::from_byte_array([0x99; 32]),
+        merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+        time: 0,
+        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+        nonce,
+    }
+}
+
+/// Fill the pending map to [`MAX_PENDING_HEADERS`] with non-connecting
+/// headers. The first header is admitted by `on_headers`. The rest are the
+/// same headers, inserted without cloning the map on every header.
+async fn fill_nonconnecting_to_cap(
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    peer: &rbitcoin_net::peers::LivePeer,
+) {
+    let headers: Vec<bitcoin::block::Header> = (0..MAX_PENDING_HEADERS as u32)
+        .map(nonconnecting_header)
+        .collect();
+    on_headers(hub, out_tx, follow, Some(peer), &[headers[0]])
+        .await
+        .unwrap();
+    assert!(
+        follow
+            .pending_headers
+            .contains_key(&headers[0].block_hash()),
+        "a non-connecting header was not admitted"
+    );
+    fill_pending(follow, &headers[1..]);
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+}
+
+/// At `MAX_PENDING_HEADERS`, a header the store will not keep must not drop
+/// a non-connecting header or a fork that loses to the tip. A header the
+/// store accepts still drops a losing fork and keeps one with more work.
+#[tokio::test]
+async fn cap_evicts_only_after_the_store_accepts() {
+    use bitcoin::block::Header;
+    use std::cmp::Ordering;
+
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cap-evict-store");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let tip = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(CAP_TIP))
+        .unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = hostile_ver(bind);
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+
+    let mut above_limit = tip;
+    above_limit.prev_blockhash = tip.block_hash();
+    above_limit.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0x11; 32]);
+    above_limit.time = tip.time.saturating_add(600);
+    above_limit.bits = bitcoin::CompactTarget::from_consensus(0x217f_ffff);
+    above_limit.nonce = 0;
+    assert!(
+        above_limit.validate_pow(above_limit.target()).is_ok(),
+        "a target above the pow limit still meets its own bits"
+    );
+    assert!(
+        !hub.header_claimed_pow_ok(&above_limit),
+        "pow limit rejects this target"
+    );
+
+    let mut bad_diff = tip;
+    bad_diff.prev_blockhash = tip.block_hash();
+    bad_diff.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0x22; 32]);
+    bad_diff.time = tip.time.saturating_add(600);
+    bad_diff.bits = bitcoin::CompactTarget::from_consensus(0x207f_fffe);
+    bad_diff.nonce = 0;
+    rbitcoin_consensus::grind_regtest_pow(&mut bad_diff);
+    assert!(hub.header_claimed_pow_ok(&bad_diff));
+    let bad_diff_hash = bad_diff.block_hash();
+
+    let peer = peers.register(
+        bind,
+        bind,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    let mut follow = PeerFollowState::new();
+    fill_nonconnecting_to_cap(&hub, &out_tx, &mut follow, &peer).await;
+    let junk_hash = *follow.pending_headers.keys().next().unwrap();
+    for rejected in [&above_limit, &bad_diff] {
+        let before = pending_keys(&follow);
+        on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[*rejected])
+            .await
+            .unwrap();
+        assert_eq!(
+            pending_keys(&follow),
+            before,
+            "a header the store rejects does not evict non-connecting headers"
+        );
+    }
+    assert!(follow.pending_headers.contains_key(&junk_hash));
+    assert!(hub
+        .query
+        .get_header_by_hash(&bad_diff_hash.to_byte_array())
+        .unwrap()
+        .is_none());
+
+    let parent = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(CAP_TIP - 1))
+        .unwrap();
+    // A child of genesis is not the next block's difficulty. The store
+    // rejects it. A one-block fork from two below the tip has less work
+    // than the tip and is a header the store keeps.
+    let fork_parent = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(CAP_TIP - 2))
+        .unwrap();
+    let heavier_a = regtest_child(&parent, 0xa1);
+    let heavier_b = regtest_child(&heavier_a, 0xa2);
+    let heavier_tip = heavier_b.block_hash();
+    let mut follow = PeerFollowState::new();
+    let peer = peers.register(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445),
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    on_headers(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&peer),
+        &[heavier_a, heavier_b],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        announced_work_cmp(&hub, &follow.pending_headers, heavier_tip),
+        Some(Ordering::Greater)
+    );
+    let losers: Vec<Header> = (0..MAX_PENDING_HEADERS as u32 - 2)
+        .map(|n| pow_child(&fork_parent, n))
+        .collect();
+    let loser_hash = losers[0].block_hash();
+    let loser_hashes: HashSet<BlockHash> = losers.iter().map(|header| header.block_hash()).collect();
+    // One sibling through the admit path. The rest fill the cap. Each
+    // `on_headers` clones the whole map, and the eviction below is the
+    // call under test.
+    on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[losers[0]])
+        .await
+        .unwrap();
+    fill_pending(&mut follow, &losers[1..]);
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    assert_eq!(
+        announced_work_cmp(&hub, &follow.pending_headers, loser_hash),
+        Some(Ordering::Less)
+    );
+    for rejected in [&above_limit, &bad_diff] {
+        let before = pending_keys(&follow);
+        on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[*rejected])
+            .await
+            .unwrap();
+        assert_eq!(
+            pending_keys(&follow),
+            before,
+            "a header the store rejects does not evict a losing fork"
+        );
+    }
+    assert!(follow.pending_headers.contains_key(&heavier_tip));
+    assert!(follow.pending_headers.contains_key(&loser_hash));
+
+    let accepted = regtest_child(&tip, 0xb1);
+    let accepted_hash = accepted.block_hash();
+    on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[accepted])
+        .await
+        .unwrap();
+    assert!(follow.pending_headers.contains_key(&accepted_hash));
+    assert!(follow.pending_headers.contains_key(&heavier_tip));
+    let dropped = loser_hashes
+        .iter()
+        .filter(|hash| !follow.pending_headers.contains_key(*hash))
+        .count();
+    assert_eq!(
+        dropped, 1,
+        "an accepted header drops one fork with less work"
+    );
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    assert!(hub
+        .query
+        .get_header_by_hash(&accepted_hash.to_byte_array())
+        .unwrap()
+        .is_some());
+}
+
+/// Children of the tip have more work than the tip, so a full map of them
+/// must still take one more. A longer fork than that child stays.
+#[tokio::test]
+async fn cap_accepts_the_next_header_when_equal_work_fills_the_map() {
+    use std::cmp::Ordering;
+
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cap-evict-equal");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let tip = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(CAP_TIP))
+        .unwrap();
+    let parent = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(CAP_TIP - 1))
+        .unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = hostile_ver(bind);
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let peer = peers.register(
+        bind,
+        bind,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    let heavy_a = regtest_child(&parent, 0xc1);
+    let heavy_b = regtest_child(&heavy_a, 0xc2);
+    let heavy_c = regtest_child(&heavy_b, 0xc3);
+    let heavy = heavy_c.block_hash();
+    let mut follow = PeerFollowState::new();
+    on_headers(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&peer),
+        &[heavy_a, heavy_b, heavy_c],
+    )
+    .await
+    .unwrap();
+    let siblings: Vec<_> = (0..MAX_PENDING_HEADERS as u32 - 3)
+        .map(|n| pow_child(&tip, n))
+        .collect();
+    let sibling_hashes: HashSet<BlockHash> =
+        siblings.iter().map(|header| header.block_hash()).collect();
+    // Siblings are not one chain, so a batch would keep only its last header.
+    // One goes through `on_headers`. The rest fill the cap. The calls below
+    // are what evict.
+    on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[siblings[0]])
+        .await
+        .unwrap();
+    fill_pending(&mut follow, &siblings[1..]);
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    let sibling_hash = siblings[0].block_hash();
+    assert_eq!(
+        announced_work_cmp(&hub, &follow.pending_headers, sibling_hash),
+        Some(Ordering::Greater),
+        "a child of the tip has more work than the tip"
+    );
+    assert_eq!(
+        announced_work_cmp(&hub, &follow.pending_headers, heavy),
+        Some(Ordering::Greater)
+    );
+
+    let next = pow_child(&tip, 9_000_000);
+    let next_hash = next.block_hash();
+    on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[next])
+        .await
+        .unwrap();
+    assert!(
+        follow.pending_headers.contains_key(&next_hash),
+        "a full map of tip children still accepts the next header"
+    );
+    assert!(follow.pending_headers.contains_key(&heavy));
+    let dropped = sibling_hashes
+        .iter()
+        .filter(|hash| !follow.pending_headers.contains_key(*hash))
+        .count();
+    assert_eq!(dropped, 1, "one equal-work sibling makes the slot");
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+
+    let grand = pow_child(&next, 9_000_001);
+    let grand_hash = grand.block_hash();
+    on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[grand])
+        .await
+        .unwrap();
+    assert!(follow.pending_headers.contains_key(&grand_hash));
+    assert!(
+        follow.pending_headers.contains_key(&next_hash),
+        "the parent of the new header stays"
+    );
+    assert!(follow.pending_headers.contains_key(&heavy));
+    let dropped = sibling_hashes
+        .iter()
+        .filter(|hash| !follow.pending_headers.contains_key(*hash))
+        .count();
+    assert_eq!(
+        dropped, 2,
+        "the grandchild drops one more sibling and leaves the longer fork"
+    );
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    assert_eq!(
+        work_of_header_path(&hub, &follow.pending_headers, grand_hash),
+        work_of_header_path(&hub, &follow.pending_headers, heavy),
+        "the three-header fork matches the grandchild"
+    );
+}
+
+/// Headers that miss their target and do not connect fill the map without a
+/// grind. One of them makes room for a header that meets the target. A
+/// connecting header that misses its target is not inserted.
+#[tokio::test]
+async fn cap_accepts_the_next_header_when_failed_pow_fills_the_map() {
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cap-evict-pow");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let tip = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(CAP_TIP))
+        .unwrap();
+    let parent = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(CAP_TIP - 1))
+        .unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = hostile_ver(bind);
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let peer = peers.register(
+        bind,
+        bind,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    let heavy_a = regtest_child(&parent, 0xd1);
+    let heavy_b = regtest_child(&heavy_a, 0xd2);
+    let heavy_c = regtest_child(&heavy_b, 0xd3);
+    let heavy = heavy_c.block_hash();
+    let mut follow = PeerFollowState::new();
+    on_headers(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&peer),
+        &[heavy_a, heavy_b, heavy_c],
+    )
+    .await
+    .unwrap();
+    let missed = child_missing_target(&tip, 0);
+    let missed_hash = missed.block_hash();
+    on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[missed])
+        .await
+        .unwrap();
+    assert!(
+        !follow.pending_headers.contains_key(&missed_hash),
+        "a connecting header that misses its target was inserted"
+    );
+    assert_eq!(follow.pending_headers.len(), 3);
+    let sample = unconnected_missing_target(0);
+    assert!(
+        !hub.header_claimed_pow_ok(&sample),
+        "the filler misses its target"
+    );
+    let fillers: Vec<_> = (0..MAX_PENDING_HEADERS as u32 - 3)
+        .map(unconnected_missing_target)
+        .collect();
+    let filler_hashes: HashSet<BlockHash> =
+        fillers.iter().map(|header| header.block_hash()).collect();
+    // One filler through the admit path. The rest are the same headers.
+    // The successor below is the eviction under test.
+    on_headers(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&peer),
+        &[fillers[0]],
+    )
+    .await
+    .unwrap();
+    assert!(
+        follow
+            .pending_headers
+            .contains_key(&fillers[0].block_hash()),
+        "a header that misses its target was not admitted"
+    );
+    fill_pending(&mut follow, &fillers[1..]);
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    assert!(follow.pending_headers.contains_key(&heavy));
+
+    let next = pow_child(&tip, 9_000_000);
+    let next_hash = next.block_hash();
+    on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[next])
+        .await
+        .unwrap();
+    assert!(
+        follow.pending_headers.contains_key(&next_hash),
+        "a valid successor was refused"
+    );
+    assert!(follow.pending_headers.contains_key(&heavy));
+    let dropped = filler_hashes
+        .iter()
+        .filter(|hash| !follow.pending_headers.contains_key(*hash))
+        .count();
+    assert_eq!(dropped, 1, "one header that misses its target makes the slot");
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    assert!(hub
+        .query
+        .get_header_by_hash(&next_hash.to_byte_array())
+        .unwrap()
+        .is_some());
+}
+
+/// One new header repeated for a whole `headers` message needs one slot.
+#[tokio::test]
+async fn cap_counts_one_repeated_header() {
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cap-evict-repeat");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = hostile_ver(bind);
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let peer = peers.register(
+        bind,
+        bind,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    let mut follow = PeerFollowState::new();
+    fill_nonconnecting_to_cap(&hub, &out_tx, &mut follow, &peer).await;
+    let before = pending_keys(&follow);
+    let mut next = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(CAP_TIP))
+        .unwrap();
+    next.prev_blockhash = hub.tip_hash().unwrap();
+    next.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0x61; 32]);
+    next.time = next.time.saturating_add(600);
+    next.nonce = 0;
+    rbitcoin_consensus::grind_regtest_pow(&mut next);
+    let next_hash = next.block_hash();
+    let repeated = vec![next; MAX_HEADERS_RESULTS];
+    on_headers(&hub, &out_tx, &mut follow, Some(&peer), &repeated)
+        .await
+        .unwrap();
+    assert!(
+        follow.pending_headers.contains_key(&next_hash),
+        "the repeated header was refused"
+    );
+    let dropped = before
+        .iter()
+        .filter(|hash| !follow.pending_headers.contains_key(*hash))
+        .count();
+    assert_eq!(dropped, 1, "one repeated header takes one slot");
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+}
+
+fn bad_diffbits_child(tip: &bitcoin::block::Header) -> bitcoin::block::Header {
+    let mut header = *tip;
+    header.prev_blockhash = tip.block_hash();
+    header.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0x22; 32]);
+    header.time = tip.time.saturating_add(600);
+    header.bits = bitcoin::CompactTarget::from_consensus(0x207f_fffe);
+    header.nonce = 0;
+    rbitcoin_consensus::grind_regtest_pow(&mut header);
+    header
+}
+
+/// Room left in the map. A child the store rejects for `bad-diffbits` is not
+/// inserted, and block asks do not move for it. Harder regtest bits would
+/// otherwise outrank the next valid header.
+#[tokio::test]
+async fn cap_store_kept_headers_skip_a_rejected_tip_child() {
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cap-evict-reject");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let tip = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(CAP_TIP))
+        .unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = hostile_ver(bind);
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let peer = peers.register(
+        bind,
+        bind,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    let mut follow = PeerFollowState::new();
+    let ask = BlockHash::from_byte_array([0x44; 32]);
+    follow.requested_blocks.insert(ask);
+    let bad = bad_diffbits_child(&tip);
+    assert!(hub.header_claimed_pow_ok(&bad));
+    let bad_hash = bad.block_hash();
+    on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[bad])
+        .await
+        .unwrap();
+    assert!(
+        !follow.pending_headers.contains_key(&bad_hash),
+        "a header the store rejects was inserted while the map had room"
+    );
+    assert!(hub
+        .query
+        .get_header_by_hash(&bad_hash.to_byte_array())
+        .unwrap()
+        .is_none());
+    assert!(
+        follow.requested_blocks.contains(&ask),
+        "a rejected header dropped an ask"
+    );
+    assert!(
+        !follow.requested_blocks.contains(&bad_hash),
+        "a rejected header was asked for"
+    );
+    assert!(follow.pending_headers.is_empty());
+}
+
+/// The last header of a message can be stored while an earlier hash is not
+/// on that walk. Only the stored hash is admitted. A full map still drops
+/// enough stale headers for that one hash.
+#[tokio::test]
+async fn cap_store_kept_headers_skip_an_earlier_hash() {
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cap-evict-walk");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let tip = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(CAP_TIP))
+        .unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = hostile_ver(bind);
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let peer = peers.register(
+        bind,
+        bind,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    let mut follow = PeerFollowState::new();
+    fill_nonconnecting_to_cap(&hub, &out_tx, &mut follow, &peer).await;
+    let before = pending_keys(&follow);
+    let side = pow_child(&tip, 0x51);
+    let accepted = pow_child(&tip, 0x52);
+    let side_hash = side.block_hash();
+    let accepted_hash = accepted.block_hash();
+    on_headers(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&peer),
+        &[side, accepted],
+    )
+    .await
+    .unwrap();
+    assert!(
+        !follow.pending_headers.contains_key(&side_hash),
+        "an earlier header the store never saw was admitted"
+    );
+    assert!(hub
+        .query
+        .get_header_by_hash(&side_hash.to_byte_array())
+        .unwrap()
+        .is_none());
+    assert!(follow.pending_headers.contains_key(&accepted_hash));
+    assert!(hub
+        .query
+        .get_header_by_hash(&accepted_hash.to_byte_array())
+        .unwrap()
+        .is_some());
+    let dropped = before
+        .iter()
+        .filter(|hash| !follow.pending_headers.contains_key(*hash))
+        .count();
+    assert_eq!(dropped, 1, "only the stored header takes a slot");
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+}
+
+/// The last header is already in the store, so this call writes nothing.
+/// Proof-of-work headers in front of it must not clear the map.
+#[tokio::test]
+async fn cap_already_stored_tip_frees_no_slot() {
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cap-evict-stored-tip");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let tip = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(CAP_TIP))
+        .unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = hostile_ver(bind);
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let peer = peers.register(
+        bind,
+        bind,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    let mut follow = PeerFollowState::new();
+    fill_nonconnecting_to_cap(&hub, &out_tx, &mut follow, &peer).await;
+    let before = pending_keys(&follow);
+    let front: Vec<Header> = (0..2u32).map(|n| pow_child(&tip, 0x70 + n)).collect();
+    let front_hashes: Vec<BlockHash> = front.iter().map(|h| h.block_hash()).collect();
+    let mut message = front;
+    message.push(tip);
+    on_headers(&hub, &out_tx, &mut follow, Some(&peer), &message)
+        .await
+        .unwrap();
+    for hash in &front_hashes {
+        assert!(
+            !follow.pending_headers.contains_key(hash),
+            "a header in front of the stored tip was admitted"
+        );
+        assert!(hub
+            .query
+            .get_header_by_hash(&hash.to_byte_array())
+            .unwrap()
+            .is_none());
+    }
+    let dropped = before
+        .iter()
+        .filter(|hash| !follow.pending_headers.contains_key(*hash))
+        .count();
+    assert_eq!(dropped, 0, "an already-stored last header frees no slot");
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
 }

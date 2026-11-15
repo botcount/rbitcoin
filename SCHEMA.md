@@ -1,7 +1,7 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 26` (`rbitcoin_primitives`).  
-**Status:** 26 is `header.body` 88 B (consensus fields only). Occupied 24/25
+**Version:** `SCHEMA_VERSION = 28` (`rbitcoin_primitives`).  
+**Status:** 28 rewrites `meta` only. A schema-27 binary does not read `spend.pages` and would hide spends it wrote into `spent.body` under a live log, so it refuses 28 `meta`. Historical spend slots, including the short tail page, live in `spend.pages` until fold. `--prune-seqsigwit` can leave `seqsigwit` at a header while creates remain. A 26 binary treats that empty locator as damage and truncates the chain. Opening any 22–27 datadir here, pruned or not, rewrites `meta` to 28 and syncs that directory. A 27 binary then refuses the directory. A 0.9.0 binary refuses it too. 26 is `header.body` 88 B (consensus fields only). Occupied 24/25
 rewrites each 96 B row down to 88 B (`header.body.grow` then rename), dropping
 the trailing `size:u32` + `weight:u32`. Block size and weight are summed from
 `txstat` for that header's create range. A 25 binary refuses 26 `meta`.
@@ -23,7 +23,7 @@ divisible by 10 is Corrupt; zero is `e=0`, mantissa 0). Meta older than 22
 is one refuse, empty or occupied: `schema before 22 refuses this datadir;
 wipe datadir and redo IBD`. That is the last time `tx.body`, `txout.body`,
 or `inwit.body` / `seqsigwit.body` had to be deleted rather than rewritten.
-`schema_file_openable` is 22 through 26. A 23 binary refuses 24 `meta`.
+`schema_file_openable` is 22 through 28. A 23 binary refuses 24 `meta`. A 26 binary refuses 27 `meta`. A 27 binary refuses 28 `meta`.
 
 Operator copy-paste (which dirs to wipe; kill-9 is not a migrate):
 [`docs/operator/storage.md`](./docs/operator/storage.md#schema-upgrade).
@@ -87,10 +87,12 @@ index refuses flat *.idx.meta; place files under store/{stem}.idx/ (meta + NNNNN
 index refuses Shared (file) scripthash.body; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --sh-index)
 index refuses pack8 Paged (mode 10) scripthash heads; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --sh-index)
 ```  
-Table file headers **22–26** remain `schema_file_openable`. A 22 binary refuses 23 `meta`.
+Table file headers **22–28** remain `schema_file_openable`. A 22 binary refuses 23 `meta`.
 **22→23 open:** occupied Class A rewrites `create.loc.ovf` 12 B rows (`fk:u64` + two u16) to 16 B (`fk:u64` + two u32) and `store/meta` to 23. Empty 22 rewrites `meta`. A 22 binary refuses 23 `meta`. Spent vin stays u16 (stripped input ≥ ~41 B ⇒ ≲24k vins in a 1 MB block; widening would bump the 8 B spent slot).
-**23→24 open** (schema 24/25 binaries): rewrote `header.body` 88 B rows to 96 B. This binary does not expand. An 88 B body stays 88 B and `meta` rewrites to 26.
+**23→24 open** (schema 24/25 binaries): rewrote `header.body` 88 B rows to 96 B. This binary does not expand. An 88 B body stays 88 B and `meta` rewrites to 28.
 **24/25→26 open:** rewrite each 96 B `header.body` row to 88 B (drop trailing `size`/`weight`) via `header.body.grow` then rename; rewrite `meta` to 26. A body that is already 88 B is unchanged. A 25 binary refuses 26 `meta`. Crash with leftover `.grow` discards it and retries.
+**27→28 open:** rewrite `store/meta` to 28 and sync its directory. No table rewrite. A 27 binary refuses 28 `meta`. That binary does not read `spend.pages`, so leaving it on 27 would let it write spends under a live log.
+**26→27 open** (schema 27 binaries): rewrote `store/meta` to 27. No table rewrite. A 26 binary refuses 27 `meta`. The sync lands before a witness stem cut, so a crash cannot leave schema 26 beside an empty witness locator. This binary continues from 27 to 28.
 **24→25 open:** rewrite `meta` to 25; create or zero-extend `txstat.body` to `create.loc` count. Do **not** rewrite `txout.body`. Unlink leftover `txfixed.body`. A 24 binary refuses 25 `meta`.
 **Endianness:** little-endian for all multi-byte integers.
 
@@ -101,8 +103,8 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 ## Schema 17 freeze
 
 Class A shape settled here at schema 17 and is still the live layout under
-the `SCHEMA_VERSION` at the top of this file (26). Schemas 18–26 already
-shipped. Meta 22–26 is what this binary opens (rules above). Earlier
+the `SCHEMA_VERSION` at the top of this file (28). Schemas 18–28 already
+shipped. Meta 22–28 is what this binary opens (rules above). Earlier
 layouts are history in
 [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md). A byte-incompatible change bumps
 from that live constant
@@ -131,7 +133,7 @@ catalogs, or 16-layout Class A with creates is **refused**.
 |--------|--------|
 | Loc | One loc pair per create; `seqsigwit` is the fat stem (cold) and does not force `txout` splits. `tx.head` rolls at OA 80% slots only. |
 | `strong_tx` | Always L2. **`confirmed`** and **`header_txs_*`** stay in RAM up to 256 MiB, then fd. |
-| `RWF_DONTCACHE` | **Not used.** Annotate pwrites hit `spent.body` only; evicting those pages does not protect `txout`, and the next block wants the same spent pages. |
+| `RWF_DONTCACHE` | **Not used.** Confirm logs every published spend slot, including the short tail. The cooled fold still writes `spent.body`. Evicting spent pages does not protect `txout`, and the next block wants the same spent pages. |
 
 ### New script kinds without a wipe
 
@@ -224,11 +226,12 @@ itself changed.
     header.adopt                     # IBD checkpoint list + milestone hash (not a header-chain copy)
     block.invalid                    # blocks that failed connect, kept across restart
     txout.body / create.loc / create.off / create.loc.ovf   # Class A outs (hot loc)
-    seqsigwit.body / seqsigwit.loc / seqsigwit.off / seqsigwit.loc.ovf       # Class A inputs+witness (cold loc)
-    seqsigwit.prune                  # optional: u32 LE pruneheight sidecar (`--prune-seqsigwit`; missing = off)
-    seqsigwit.window/                # optional prune window: one {height}.bin per kept height
+    seqsigwit.body / seqsigwit.loc / seqsigwit.off / seqsigwit.loc.ovf       # Class A inputs+witness when unpruned (cold loc). With seqsigwit.prune these four stay at the file header
+    seqsigwit.prune                  # optional: u32 LE pruneheight sidecar (`--prune-seqsigwit`; missing = off). Presence is prune mode
+    seqsigwit.window/                # prune window: one {height}.bin per kept height. The only witness payload while seqsigwit.prune exists
     seqsigwit.reloc                  # optional: append-only files live under --datadir-cold/store
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked
+    spend.pages / spend.pages.commit                       # historical spend slots until fold (schema 28)
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
     txid.body                                       # dense create_fk-ordered txids (schema 13+)
     txstat.body / txstat.ovf / txstat.blk            # 8 B/create ULEB econ + per-header tails (schema 25)
@@ -270,9 +273,10 @@ itself changed.
 files the IBD pin path does not read under `PATH/store/` and writes
 `seqsigwit.reloc` in the hot store: `seqsigwit.*`, `txstat.*`, `input.*`,
 and, once those indexes exist, `blockfilter.*` and `sp_tweaks.*`. Pin / SH /
-spend-annotate stay on the hot volume. `--prune-seqsigwit` is separate: it
-drops historical `seqsigwit` below tip−288 and keeps that window on the hot
-store. `txstat`, `input`, block filters, and tweaks are not pruned.
+spend-annotate stay on the hot volume. `--prune-seqsigwit` is separate: witness
+for the last 288 heights is only `seqsigwit.window/{height}.bin` on the hot
+store, and the stem stays a header (an archive enable copies that window out
+and cuts it). `txout`, `txstat`, `input`, block filters, and tweaks are not pruned.
 
 **Height → txs:** `confirmed[h]` → `header_fk` → contiguous Class A range  
 `[header_txs_first[h−1], header_txs_first[h−1] + header_txs_count[h−1])`.
@@ -286,7 +290,7 @@ store. `txstat`, `input`, block filters, and tweaks are not pruned.
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Magic `RBT1` |
-| 4 | 2 | Schema version (u16) — live **26** (`SCHEMA_VERSION`). Occupied files keep the version they were written; **22–26** remain `schema_file_openable` |
+| 4 | 2 | Schema version (u16) — live **28** (`SCHEMA_VERSION`). Occupied files keep the version they were written; **22–28** remain `schema_file_openable` |
 | 6 | 2 | Table kind (u16) |
 | 8 | 8 | Logical length (bytes), including this header |
 
@@ -605,6 +609,9 @@ the new `meta` or an unknown kind). See [Schema 17 freeze](#schema-17-freeze).
 | 1 | head fk into `spent.ovf` (`vin` in the sole slot is 0; vins live on ovf nodes) |
 
 Best-chain spentness also requires `is_confirmed_strong(spender)` (annotations may outlive reorgs).
+A Class A append fills the slot for a spend in the same write. When the write holds more than one spender of a vout (a double spend that write rejects), it names the first in chain order, the lowest fk. A rejected write keeps that append for the retry.
+
+`spend.pages` and `spend.pages.commit` name historical spend slots that are not yet folded onto `spent.body`, including the short tail page. Schema is 28. A schema-27 binary refuses 28 `meta`, so it never reads `spent.body` while this log is live. A missing commit means no unsealed historical page. A commit that names bytes whose image file is missing or shorter than the committed length refuses open. That file is `spend.pages.{generation}` when a crash left it beside the new commit, and `spend.pages` otherwise. An empty claim with no pages file opens. `spend.pages` holds the page images. `spend.pages.commit` names the snapshot height, generation, committed byte length, and the page list. Four little-endian bytes after those records are the confirmed tip frozen with the snapshot. A commit that ends on the page list uses the snapshot height as that tip. A record past that length refuses open. A slot past a short image is not in the log. The checkpoint rewrites `spend.pages` to the images still named and syncs the commit before `spend_durable` advances. Fold copies a quiet generation onto `spent.body` after a later checkpoint, starting at byte 16 on the first page so the file header stays put, and skips a page confirm has re-dirtied. It deletes both files only once nothing committed, open, frozen, or pending remains. The body copy does not hold the utxo view. The directory drop does.
 
 ### Multi-spender overflow (`spent.ovf`)
 
@@ -764,8 +771,11 @@ pages if `n ≥ 257`). One write per key. No half-empty 4 KiB.
   except via rematerialize.
 - Lookup: **ingest OA → L0 SHSR newest→oldest (fuse) → L1 MPHF (fuse) →
   main MPHF+val (tags)**. A leftover live OA or schema-17 `SHSR` at
-  `scripthash.head` (or non-`SHSR` six-digit `ovf/NNNNNN`) is **refused**.
-  A key has **exactly one** home.
+  `scripthash.head` when no packed main shard is present, and a readable
+  non-`SHSR` six-digit `ovf/NNNNNN`, are removed on open. A segment this
+  open cannot read stays. The next seal takes the id after the highest
+  six-digit name. A packed main index stays. `--sh-index` materializes the
+  head that was removed. A key has **exactly one** home.
 
 At ~2.5×10⁵ new unique scripts/day, first L1 is ~2.3 years after rematerialize
 and the frozen-L1 warning is ~4.7 years. That is not a calendar guarantee.
@@ -923,4 +933,5 @@ Hot pin+annotate working set: **txout + spent + create.loc + txid + tx.head**
 | [`docs/concurrency.md`](./docs/concurrency.md) | Writer ownership, IBD vs tip |
 | [`docs/invariants.md`](docs/invariants.md) | Confirm stage IO / leftover union |
 | [`docs/crash-recovery.md`](./docs/crash-recovery.md) | Kill safety, reorg, segmented head seal |
-| [`OPERATOR.md`](./OPERATOR.md) | Datadir ops, env knobs |
+| [`docs/operator/storage.md`](./docs/operator/storage.md) | Schema open and store flags |
+| [`docs/env-knobs.md`](./docs/env-knobs.md) | Residual `RBITCOIN_*` |

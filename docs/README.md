@@ -35,7 +35,7 @@ into `AGENTS.md`.
 |-----|------|
 | [`ORIENT.md`](./ORIENT.md) | Agent task router and read-first links. Open one matching row. Not a second index of facts. |
 | [`CRATES.md`](./CRATES.md) | Workspace crate roles and dependency orientation. |
-| [`operator/`](./operator/) | Task guides linked from `OPERATOR.md`: setup, node operations, storage/indexes, client interfaces, and field notes. |
+| [`operator/`](./operator/) | Flags, config keys, and the task guides linked from `OPERATOR.md`: setup, node operations, storage/indexes, client interfaces, and field notes. |
 | [`architecture.md`](./architecture.md) | Why this node is different (Core / Fulcrum contrasts). No stage-IO table copy. |
 | [`concurrency.md`](./concurrency.md) | Writer roles, publish order, body-queue, pins. Links invariants for leftover union. |
 | [`invariants.md`](./invariants.md) | Confirm stage IO (the **only** copy), leftover union, store start states S0–S4, no silent fallbacks. |
@@ -49,17 +49,17 @@ into `AGENTS.md`.
 | [`rpc.md`](./rpc.md) | Core-class JSON-RPC subset. |
 | [`consensus-tests.md`](./consensus-tests.md) | Rules we own vs Core corpora. |
 | [`blvm-consensus-crosswalk.md`](./blvm-consensus-crosswalk.md) | BLVM register ids mapped to our code and tests. Gaps both ways stay there. |
-| [`core-functional.md`](./core-functional.md) | Core v32.1 functional harness. |
+| [`core-functional.md`](./core-functional.md) | Core functional harness. |
 | [`overlay-functional.md`](./overlay-functional.md) | Private Tor / i2pd / cjdns mesh harness (labeled / nightly). |
 | [`how-we-plan.md`](./how-we-plan.md) | Agent contract (cycle, Agent RAM, keep-compiling), then human rationale. |
-| [`sv2-template-provider.md`](./sv2-template-provider.md) | SV2 Template Distribution Protocol server roadmap (**Q-64**): Step 0 finding and plans A–C. Live flags/COMPAT rows land in OPERATOR/COMPAT with the plan that ships them. |
+| [`sv2-template-provider.md`](./sv2-template-provider.md) | Landed SV2 template-provider outcome (Q-64). Flags and session limits stay in [`operator/interfaces.md`](./operator/interfaces.md). |
 | [`releases.md`](./releases.md) | Tag `vX.Y.Z`, `vX.Y.x` patch line, `.99` bump, Highlights / GitHub notes. |
 | [`code-shape.md`](./code-shape.md) | Control flow, types, naming, composition (CONTRIBUTING principle 10). First cause is rule 10. Named extracts: quality.md **Q-61** (Completed). Clippy: no workspace `allow` list; leftover lints are site-local with a reason. |
 | [`quality.md`](./quality.md) | Living quality roadmap (Open + Won't-fix + Parked + Protect). |
 | [`reproducible-builds.md`](./reproducible-builds.md) | Pinned Nix / musl byte-identity. |
 | [`rust-bitcoin-limitations.md`](./rust-bitcoin-limitations.md) | rust-bitcoin workarounds, and the upstream issue queue (user-facing bugs, node-only gaps, performance). |
 | [`mempool-fee-estimation.md`](./mempool-fee-estimation.md) | Fee estimator notes. |
-| [`errata.md`](./errata.md) | Known one-off store/confirm quirks. Retired confirm dual-path names. |
+| [`errata.md`](./errata.md) | Known one-off store/confirm quirks. |
 | [`peer-clients.md`](./peer-clients.md) | Hornet Node and satd: what to steal (tests/ideas) and what not to copy. Ranked items stay here; do not copy into quality.md. |
 | [`lightning.md`](./lightning.md) | CLN, ldk-node, and LND as Bitcoin backends: `bcli` calls, Esplora/Electrum chain sync, LND `rpcpolling`, `--sh-index` API matrix. | 
 | [`wallets.md`](./wallets.md) | Which on-chain wallets connect, and the server string or RPC cookie for each. Lightning stays in `lightning.md`. |
@@ -71,7 +71,7 @@ into `AGENTS.md`.
 | Doc | Owns |
 |-----|------|
 | [`README.md`](../README.md) | Product pitch + short pointer table (this map is the rest). |
-| [`OPERATOR.md`](../OPERATOR.md) | Day-to-day ops, flags. |
+| [`OPERATOR.md`](../OPERATOR.md) | Task index into [`operator/`](./operator/). |
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | Getting started (rustup; Linux / macOS / Windows) + human+agent principles + issue and review text + checklist. |
 | [`AGENTS.md`](../AGENTS.md) | Harness-injected agent contract (hard rules + pointers; not a second design book). |
 | [`rearden-vm-HOST.md`](../rearden-vm-HOST.md) | `rearden-grok[bot]` operator VM (per-session worktree and cargo target, bot push). Other identities ignore it. |

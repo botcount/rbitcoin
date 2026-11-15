@@ -1,8 +1,8 @@
-//! Bitcoin Core v32.1 `VerifyScript` for the in-tree script corpus.
+//! Bitcoin Core `VerifyScript` for the in-tree script corpus.
 //!
 //! Not a workspace member: the main graph must not link `bitcoinconsensus`
 //! (that crates.io crate is Core 26). This crate compiles `VerifyScript`
-//! from `third_party/bitcoin` at the v32.1 pin. The Rust side only runs
+//! from `third_party/bitcoin` at its pin. The Rust side only runs
 //! as tests; the C++ wrapper is what the build script links.
 
 #[cfg(test)]

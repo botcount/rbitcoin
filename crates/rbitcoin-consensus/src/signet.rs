@@ -13,6 +13,7 @@ use bitcoin::{Amount, Block, OutPoint, Sequence, Transaction, TxIn, TxOut, Witne
 
 use crate::block::ScriptCheckJob;
 use crate::error::ConsensusError;
+use rbitcoin_primitives::bytes;
 
 /// BIP325 magic prefix inside the witness commitment push.
 #[doc(hidden)]
@@ -34,9 +35,8 @@ pub fn default_signet_challenge() -> ScriptBuf {
 /// its CompactSize length prefix, and uses the first four digest bytes.
 pub fn signet_magic(challenge: &Script) -> [u8; 4] {
     let encoded = serialize(&challenge.as_bytes().to_vec());
-    sha256d::Hash::hash(&encoded).to_byte_array()[..4]
-        .try_into()
-        .expect("four-byte digest prefix")
+    let digest = sha256d::Hash::hash(&encoded).to_byte_array();
+    bytes!(digest, 0, 4)
 }
 
 /// Validate BIP325 signet block solution against `challenge`.
@@ -242,30 +242,30 @@ pub fn read_signet_compact(rdr: &mut &[u8]) -> Result<u64, ConsensusError> {
     let (v, n) = match rdr[0] {
         tag @ 0..=252 => (u64::from(tag), 1usize),
         253 => {
-            if rdr.len() < 3 {
+            let Some(raw) = rdr.first_chunk::<3>() else {
                 return Err(ConsensusError::BadBlock("signet: compact size"));
-            }
-            let v = u16::from_le_bytes([rdr[1], rdr[2]]);
+            };
+            let v = rbitcoin_primitives::le_u16!(raw, 1);
             if v < 253 {
                 return Err(ConsensusError::BadBlock("signet: non-minimal compact size"));
             }
             (u64::from(v), 3)
         }
         254 => {
-            if rdr.len() < 5 {
+            let Some(raw) = rdr.first_chunk::<5>() else {
                 return Err(ConsensusError::BadBlock("signet: compact size"));
-            }
-            let v = u32::from_le_bytes(rdr[1..5].try_into().expect("4 bytes"));
+            };
+            let v = rbitcoin_primitives::le_u32!(raw, 1);
             if v <= u32::from(u16::MAX) {
                 return Err(ConsensusError::BadBlock("signet: non-minimal compact size"));
             }
             (u64::from(v), 5)
         }
         255 => {
-            if rdr.len() < 9 {
+            let Some(raw) = rdr.first_chunk::<9>() else {
                 return Err(ConsensusError::BadBlock("signet: compact size"));
-            }
-            let v = u64::from_le_bytes(rdr[1..9].try_into().expect("8 bytes"));
+            };
+            let v = rbitcoin_primitives::le_u64!(raw, 1);
             if v <= u64::from(u32::MAX) {
                 return Err(ConsensusError::BadBlock("signet: non-minimal compact size"));
             }
@@ -306,6 +306,23 @@ pub fn read_witness_stack(rdr: &mut &[u8]) -> Result<Witness, ConsensusError> {
     Ok(Witness::from_slice(&refs))
 }
 
+/// An odd leaf count is at least one. An even count is not duplicated.
+struct OddLeafCount<'a>(&'a [[u8; 32]]);
+
+impl<'a> OddLeafCount<'a> {
+    fn new(leaves: &'a [[u8; 32]]) -> Option<Self> {
+        if leaves.len() % 2 == 1 {
+            Some(Self(leaves))
+        } else {
+            None
+        }
+    }
+
+    fn last(self) -> [u8; 32] {
+        self.0[self.0.len() - 1]
+    }
+}
+
 #[doc(hidden)]
 pub fn modified_merkle_root(
     modified_cb: &Transaction,
@@ -317,9 +334,8 @@ pub fn modified_merkle_root(
         leaves.push(tx.compute_txid().to_byte_array());
     }
     while leaves.len() > 1 {
-        if leaves.len() % 2 == 1 {
-            let last = *leaves.last().expect("signet merkle loop keeps a leaf");
-            leaves.push(last);
+        if let Some(odd) = OddLeafCount::new(&leaves) {
+            leaves.push(odd.last());
         }
         let mut next = Vec::with_capacity(leaves.len() / 2);
         for pair in leaves.chunks(2) {

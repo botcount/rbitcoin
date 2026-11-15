@@ -87,12 +87,16 @@ pub struct IndexJobs {
 }
 
 pub fn index_want(query: &Query) -> IndexWant {
-    if !query.index_live() {
+    let live = query.index_live();
+    let follow = query.tweak_follow();
+    if !live && !follow {
         return IndexWant::default();
     }
     IndexWant {
-        filters: query.filter_index_next().is_some(),
-        tweak_origin: query.tweak_index_next().map(|_| query.sptweaks_origin().0),
+        filters: live && query.filter_index_next().is_some(),
+        tweak_origin: (live || follow)
+            .then(|| query.tweak_index_next().map(|_| query.sptweaks_origin().0))
+            .flatten(),
     }
 }
 
@@ -368,13 +372,21 @@ pub fn resolve_prevout(work: &BlockWork, spend: &SpendRef) -> Result<TxOut, Conf
 /// the first row is corrupt. An empty seal (live append off) is a no-op.
 pub fn seal_live_indexes(query: &Query, seal: IndexSeal) -> Result<u64, ConfirmError> {
     if seal.filters.is_empty() && seal.tweaks.is_empty() {
+        refresh_tweak_follow(query);
         return Ok(0);
     }
     let commit = index_rows::commit_index_rows(query, seal)?;
+    refresh_tweak_follow(query);
     if commit.moved {
         return Err(corrupt("invariant: live index commit"));
     }
     Ok(commit.put_ns)
+}
+
+/// Prune follow stays on only while the tweak watermark is still contiguous
+/// with the tip. A skipped batch turns it off until startup repair.
+pub fn refresh_tweak_follow(query: &Query) {
+    query.set_tweak_follow(crate::index_writebehind::tweak_follow_for(query));
 }
 
 #[doc(hidden)]

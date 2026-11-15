@@ -1,0 +1,3 @@
+Fixed
+
+- **Idle listeners no longer take every file descriptor.** Health and Esplora cap accepted connections and close one that never sends a request. Esplora shutdown closes those sockets. An inbound peer that stays silent or dribbles bytes during the BIP324 handshake is dropped at the handshake deadline, which stays at most 60 seconds when `--peer-timeout` is longer. One address cannot fill the inbound slots with unfinished handshakes. Electrum logs an accept error that will clear, including a reset and a full Windows socket table, and tries again. `/readyz` reports the Electrum listener down when that task has stopped. Listeners leave descriptors for the store and RPC, and a listener that cannot count open descriptors drops the new socket.

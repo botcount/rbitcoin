@@ -6,14 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 fn tmp() -> PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "rbitcoin-shsort-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let p = rbitcoin_store::testutil::fresh_path("shsort");
     let _ = std::fs::create_dir_all(&p);
     p.join("head")
 }
@@ -31,6 +24,34 @@ fn recs(n: u32) -> Vec<(ShHeadKey, [u8; SH_HEAD_VALUE_LEN])> {
             (key_of(i), pack8_bytes(&v).unwrap())
         })
         .collect()
+}
+
+#[test]
+fn sorted_head_open_reads_the_count() {
+    let path = tmp();
+    let recs = recs(3);
+    SortedHead::write(&path, &recs).unwrap();
+    let h = SortedHead::open(&path).unwrap();
+    assert_eq!(h.count, 3);
+    assert_eq!(
+        h.get(&key_of(1)).unwrap().unwrap().inline_fks(),
+        vec![Fk(2)]
+    );
+
+    let mut bad_ver = std::fs::read(&path).unwrap();
+    bad_ver[4..6].copy_from_slice(&99u16.to_le_bytes());
+    let verp = path.with_extension("count-ver");
+    std::fs::write(&verp, &bad_ver).unwrap();
+    std::fs::copy(idx_path(&path), idx_path(&verp)).unwrap();
+    std::fs::copy(fuse_path(&path), fuse_path(&verp)).unwrap();
+    let err = match SortedHead::open(&verp) {
+        Ok(_) => panic!("open accepted a foreign version"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, StoreError::Corrupt(m) if m.contains("unsupported version")),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -129,4 +150,27 @@ fn sorted_ovf_fuse_skips_pread_on_miss() {
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(idx_path(&path));
+}
+
+#[test]
+fn sorted_idx_roundtrip_and_short_file() {
+    let path = tmp();
+    let rows = vec![(key_of(1), 24u64), (key_of(2), 48)];
+    write_idx(&path, &rows).unwrap();
+    assert_eq!(read_idx(&path).unwrap(), rows);
+    std::fs::write(&path, b"SHIX").unwrap();
+    match read_idx(&path) {
+        Err(StoreError::Corrupt("scripthash sorted head: bad idx")) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("a short idx opened"),
+    }
+    let mut hdr = vec![0u8; IDX_HEADER_LEN + 8];
+    hdr[0..4].copy_from_slice(IDX_MAGIC);
+    hdr[6..10].copy_from_slice(&1u32.to_le_bytes());
+    std::fs::write(&path, &hdr).unwrap();
+    match read_idx(&path) {
+        Err(StoreError::Corrupt("scripthash sorted head: short idx")) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("a truncated idx entry opened"),
+    }
 }

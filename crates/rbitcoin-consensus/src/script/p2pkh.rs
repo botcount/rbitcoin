@@ -18,10 +18,9 @@ pub fn verify(
     input_index: crate::block::InputIndex,
     tx: &Transaction,
     cache: &mut SighashCache<&Transaction>,
-    spk: &[u8],
+    spk: &[u8; 25],
 ) -> Result<(), ConsensusError> {
     let _ = tx;
-    debug_assert!(spk.len() == 25);
     let keyhash = &spk[3..23];
 
     let input = &tx.input[input_index.get()];
@@ -85,8 +84,8 @@ pub fn parse_two_pushes(script: &Script) -> Result<(Vec<u8>, Vec<u8>), Consensus
 /// The signature push matches an instruction boundary only when it is those
 /// 20 keyhash bytes. The template has no bare `OP_CODESEPARATOR`. Any other
 /// signature hashes `spk` unchanged, with no script walk and no allocation.
-fn sighash_script_code<'a>(spk: &'a [u8], sig: &[u8]) -> Cow<'a, [u8]> {
-    if spk.len() == 25 && sig.len() == 20 && sig == &spk[3..23] {
+fn sighash_script_code<'a>(spk: &'a [u8; 25], sig: &[u8]) -> Cow<'a, [u8]> {
+    if sig.len() == 20 && sig == &spk[3..23] {
         Cow::Borrowed(&P2PKH_SCRIPT_CODE_KEYHASH_REMOVED)
     } else {
         Cow::Borrowed(spk)
@@ -110,7 +109,8 @@ mod tests {
         let pk = PublicKey::new(sk.public_key(&secp));
         let spk = bitcoin::ScriptBuf::new_p2pkh(&bitcoin::PubkeyHash::hash(&pk.to_bytes()));
         let keyhash = bitcoin::PubkeyHash::hash(&pk.to_bytes());
-        let code = super::sighash_script_code(spk.as_bytes(), keyhash.as_byte_array());
+        let raw: &[u8; 25] = spk.as_bytes().try_into().unwrap();
+        let code = super::sighash_script_code(raw, keyhash.as_byte_array());
         // OP_DUP OP_HASH160 OP_EQUALVERIFY OP_CHECKSIG. The 20-byte push is gone.
         // Borrowed: the fast path must not allocate a scriptCode for this hit.
         assert!(matches!(code, std::borrow::Cow::Borrowed(_)));
@@ -125,13 +125,14 @@ mod tests {
         let pk = PublicKey::new(sk.public_key(&secp));
         let spk = bitcoin::ScriptBuf::new_p2pkh(&bitcoin::PubkeyHash::hash(&pk.to_bytes()));
         let raw = spk.as_bytes();
+        let typed: &[u8; 25] = raw.try_into().unwrap();
         let ordinary = [0x30u8; 71];
-        let same = super::sighash_script_code(raw, &ordinary);
+        let same = super::sighash_script_code(typed, &ordinary);
         assert!(matches!(same, std::borrow::Cow::Borrowed(_)));
         assert!(std::ptr::eq(same.as_ref(), raw));
         let mut miss = [0u8; 20];
         miss[0] = 0x30;
-        let untouched = super::sighash_script_code(raw, &miss);
+        let untouched = super::sighash_script_code(typed, &miss);
         assert!(std::ptr::eq(untouched.as_ref(), raw));
     }
 }

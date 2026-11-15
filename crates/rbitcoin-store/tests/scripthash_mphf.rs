@@ -8,14 +8,7 @@ use std::path::PathBuf;
 use rbitcoin_primitives::Fk;
 
 fn tmp() -> PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "rbitcoin-sh-mphf-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let p = rbitcoin_store::testutil::fresh_path("sh-mphf");
     std::fs::create_dir_all(&p).unwrap();
     p
 }

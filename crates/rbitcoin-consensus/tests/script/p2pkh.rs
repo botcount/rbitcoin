@@ -20,6 +20,14 @@ fn parse_two_pushes_errors() {
     assert!(parse_two_pushes(Script::from_bytes(&big)).is_err()); // push size
     let ok = parse_two_pushes(Script::from_bytes(&[0x01, 0xaa, 0x01, 0xbb])).unwrap();
     assert_eq!(ok, (vec![0xaa], vec![0xbb]));
+    assert!(parse_two_pushes(Script::from_bytes(&[0x01, 0xaa, 0x01, 0xbb, 0x01, 0xcc])).is_err());
+    // 520 is MAX_SCRIPT_ELEMENT_SIZE. The next byte is the over-size push above.
+    let mut at_cap = vec![0x4d, 0x08, 0x02];
+    at_cap.extend([0x11u8; 520]);
+    at_cap.extend([0x01, 0xbb]);
+    let capped = parse_two_pushes(Script::from_bytes(&at_cap)).unwrap();
+    assert_eq!(capped.0.len(), 520);
+    assert_eq!(capped.1, vec![0xbb]);
 }
 
 #[test]
@@ -74,6 +82,7 @@ fn verify_pubkey_hash_mismatch() {
     let err = {
         let i = job.inputs().next().unwrap();
         let spk = job.prevout_script(i).expect("prevout");
+        let spk: &[u8; 25] = spk.try_into().expect("p2pkh template");
         verify(&job, i, &job.tx, &mut cache, spk)
     }
     .unwrap_err();

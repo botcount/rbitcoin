@@ -9,7 +9,8 @@
 #   ./scripts/release.sh --dry-run
 #
 # Version is workspace.package.version (Cargo.toml). Files that must match:
-# Cargo.toml, nix/rbitcoin.nix, CHANGELOG.md ## [X.Y.Z]. Tag is vX.Y.Z.
+# Cargo.toml, every Cargo.lock workspace member, nix/rbitcoin.nix,
+# CHANGELOG.md ## [X.Y.Z]. Tag is vX.Y.Z.
 # Patch 99 is the in-tree sentinel and is never tagged.
 # Allowed branches: master, main, vX.Y.x. Does not force-push or rewrite remotes.
 set -euo pipefail
@@ -70,6 +71,7 @@ tag="v${ver}"
 
 nix_ver="$(release_nix_package_version)"
 [[ "$nix_ver" == "$ver" ]] || release_die "nix/rbitcoin.nix version=$nix_ver != Cargo.toml $ver"
+release_check_lock_versions "$ver"
 
 release_changelog_has_heading "$ver" || release_die "CHANGELOG.md has no ## [$ver] heading"
 

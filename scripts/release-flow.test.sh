@@ -291,6 +291,152 @@ assert_ok "cut --patch writes 0.5.3" \
 assert_ok "cut --patch adds 0.5.3 heading" \
   grep -qE '^## \[0\.5\.3\] — 2026-09-06' "$PATCH/CHANGELOG.md"
 
+# A workspace member whose lock still names the pre-cut version. A
+# third-party package that happens to use that same version string, and a
+# nested lock's own package, must stay put.
+seed_locked_member() {
+  local dest="$1"
+  local ver="$2"
+  mkdir -p "$dest/crates/rbitcoin-node" "$dest/fuzz"
+  cat >"$dest/crates/rbitcoin-node/Cargo.toml" <<'EOF'
+[package]
+name = "rbitcoin-node"
+version.workspace = true
+EOF
+  cat >>"$dest/Cargo.toml" <<'EOF'
+
+[workspace]
+members = ["crates/rbitcoin-node"]
+EOF
+  cat >"$dest/Cargo.lock" <<EOF
+version = 3
+
+[[package]]
+name = "chacha20"
+version = "${ver}"
+
+[[package]]
+name = "rbitcoin-node"
+version = "${ver}"
+dependencies = [
+ "rbitcoin-node ${ver}",
+ "rbitcoin-node ${ver} (registry+https://github.com/rust-lang/crates.io-index)",
+ "chacha20 ${ver}",
+]
+EOF
+  cat >"$dest/fuzz/Cargo.lock" <<EOF
+version = 3
+
+[[package]]
+name = "rbitcoin-fuzz"
+version = "0.0.0"
+
+[[package]]
+name = "rbitcoin-node"
+version = "${ver}"
+EOF
+}
+
+assert_lock_moved() {
+  local dest="$1"
+  local new="$2"
+  local old="$3"
+  grep -A1 'name = "rbitcoin-node"' "$dest/Cargo.lock" | grep -q "version = \"${new}\"" \
+    && grep -A1 'name = "chacha20"' "$dest/Cargo.lock" | grep -q "version = \"${old}\"" \
+    && grep -q "\"rbitcoin-node ${new}\"" "$dest/Cargo.lock" \
+    && grep -q "\"rbitcoin-node ${new} (registry+" "$dest/Cargo.lock" \
+    && grep -q "\"chacha20 ${old}\"" "$dest/Cargo.lock" \
+    && grep -A1 'name = "rbitcoin-node"' "$dest/fuzz/Cargo.lock" | grep -q "version = \"${new}\"" \
+    && grep -A1 'name = "rbitcoin-fuzz"' "$dest/fuzz/Cargo.lock" | grep -q 'version = "0.0.0"'
+}
+
+LOCKCUT="$WORKDIR/lockcut"
+mkdir -p "$LOCKCUT"
+seed_dev_tree "$LOCKCUT"
+seed_locked_member "$LOCKCUT" "0.5.99"
+mkdir -p "$LOCKCUT/third_party/vendor"
+cat >"$LOCKCUT/third_party/vendor/Cargo.lock" <<'EOF'
+version = 3
+
+[[package]]
+name = "rbitcoin-node"
+version = "0.5.99"
+dependencies = [
+ "rbitcoin-node 0.5.99",
+]
+EOF
+bash "$CUT" --root "$LOCKCUT" --minor --date 2026-09-06
+assert_ok "cut leaves a third_party lock alone" \
+  bash -c "grep -q 'version = \"0.5.99\"' '$LOCKCUT/third_party/vendor/Cargo.lock' && grep -q '\"rbitcoin-node 0.5.99\"' '$LOCKCUT/third_party/vendor/Cargo.lock'"
+assert_ok "cut --minor rewrites workspace versions in Cargo.lock" \
+  assert_lock_moved "$LOCKCUT" "0.6.0" "0.5.99"
+
+LOCKDEV="$WORKDIR/lockdev"
+mkdir -p "$LOCKDEV"
+seed_ship_tree "$LOCKDEV"
+seed_locked_member "$LOCKDEV" "0.6.0"
+bash "$CUT" --root "$LOCKDEV" --dev-next
+assert_ok "cut --dev-next rewrites workspace versions in Cargo.lock" \
+  assert_lock_moved "$LOCKDEV" "0.6.99" "0.6.0"
+
+LOCKPATCH="$WORKDIR/lockpatch"
+mkdir -p "$LOCKPATCH"
+write_version_files "$LOCKPATCH" "0.5.2"
+cat >"$LOCKPATCH/CHANGELOG.md" <<'EOF'
+## [Unreleased]
+
+### Fixed
+
+- **Bug:** cherry-pick this.
+
+## [0.5.2] — 2026-08-28
+
+Patch notes.
+EOF
+seed_locked_member "$LOCKPATCH" "0.5.2"
+git_c -C "$LOCKPATCH" init -q -b v0.5.x
+git_c -C "$LOCKPATCH" add Cargo.toml nix/rbitcoin.nix CHANGELOG.md crates fuzz
+git_c -C "$LOCKPATCH" commit -q -m init
+bash "$CUT" --root "$LOCKPATCH" --patch --date 2026-09-06
+assert_ok "cut --patch rewrites workspace versions in Cargo.lock" \
+  assert_lock_moved "$LOCKPATCH" "0.5.3" "0.5.2"
+
+STALE="$WORKDIR/stale-lock"
+mkdir -p "$STALE"
+write_version_files "$STALE" "0.6.0"
+cat >"$STALE/CHANGELOG.md" <<'EOF'
+## [Unreleased]
+
+## [0.6.0] — 2026-09-06
+
+### Highlights
+
+- **Pin:** lock must match.
+EOF
+seed_locked_member "$STALE" "0.5.99"
+assert_fail_msg "gate fails when Cargo.lock still names the old workspace version" \
+  "Cargo.lock" \
+  bash "$GATE" --root "$STALE"
+
+# The lock is not on the pre-cut version. Rewriting only an exact old
+# string would leave it stale and still exit 0.
+DRIFT="$WORKDIR/lock-drift"
+mkdir -p "$DRIFT"
+seed_dev_tree "$DRIFT"
+seed_locked_member "$DRIFT" "0.4.0"
+assert_fail_msg "cut refuses a lock that is not on the pre-cut version" \
+  "Cargo.lock" \
+  bash "$CUT" --root "$DRIFT" --minor --date 2026-09-06
+
+NOLOCK="$WORKDIR/no-lock"
+mkdir -p "$NOLOCK"
+seed_dev_tree "$NOLOCK"
+seed_locked_member "$NOLOCK" "0.5.99"
+rm -f "$NOLOCK/Cargo.lock"
+assert_fail_msg "cut refuses a tree with no root Cargo.lock" \
+  "Cargo.lock is missing" \
+  bash "$CUT" --root "$NOLOCK" --minor --date 2026-09-06
+
 DEV99="$WORKDIR/dev99"
 mkdir -p "$DEV99"
 seed_dev_tree "$DEV99"

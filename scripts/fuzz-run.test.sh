@@ -501,6 +501,50 @@ assert_ok "v2 getheaders seed" \
 assert_ok "electrum subscribe seed" \
   test -s "$ROOT/crates/rbitcoin-electrum/tests/fixtures/blockchain_scripthash_subscribe.json"
 
+# fuzz-clang.sh: skip apt when clang is already on PATH. A missing clang
+# installs, and a failed install rewrites the Azure mirror then retries.
+apt_calls=0
+apt_install() {
+  apt_calls=$((apt_calls + 1))
+  if [[ "${APT_FAIL_FIRST:-}" == 1 && "$apt_calls" -eq 1 ]]; then
+    return 100
+  fi
+  return 0
+}
+# shellcheck disable=SC1091
+source "$ROOT/scripts/fuzz-clang.sh"
+apt_calls=0
+FUZZ_CLANG_BIN=/bin/sh ensure_clang
+assert_ok "clang already present skips apt" \
+  test "$apt_calls" -eq 0
+
+mirror="$(mktemp -d "$WORKDIR/apt.XXXXXX")"
+mkdir -p "$mirror/sources.list.d"
+printf '%s\n' 'deb http://azure.archive.ubuntu.com/ubuntu noble main' >"$mirror/sources.list"
+printf '%s\n' 'URIs: http://azure.archive.ubuntu.com/ubuntu/' >"$mirror/sources.list.d/ubuntu.sources"
+printf '%s\n' 'http://azure.archive.ubuntu.com/ubuntu/' >"$mirror/apt-mirrors.txt"
+apt_calls=0
+APT_FAIL_FIRST= FUZZ_CLANG_BIN=/no/such/clang APT_MIRROR_ROOT="$mirror" ensure_clang
+assert_ok "missing clang apt-installs once" \
+  test "$apt_calls" -eq 1
+assert_ok "successful apt leaves the azure mirror" \
+  grep -q 'azure.archive.ubuntu.com' "$mirror/sources.list"
+
+printf '%s\n' 'deb http://azure.archive.ubuntu.com/ubuntu noble main' >"$mirror/sources.list"
+printf '%s\n' 'URIs: http://azure.archive.ubuntu.com/ubuntu/' >"$mirror/sources.list.d/ubuntu.sources"
+printf '%s\n' 'http://azure.archive.ubuntu.com/ubuntu/' >"$mirror/apt-mirrors.txt"
+apt_calls=0
+APT_FAIL_FIRST=1 FUZZ_CLANG_BIN=/no/such/clang APT_MIRROR_ROOT="$mirror" ensure_clang
+assert_ok "failed apt retries once" \
+  test "$apt_calls" -eq 2
+assert_ok "retry rewrites sources.list" \
+  grep -qx 'deb http://archive.ubuntu.com/ubuntu noble main' "$mirror/sources.list"
+assert_ok "retry rewrites deb822 sources" \
+  grep -qx 'URIs: http://archive.ubuntu.com/ubuntu/' "$mirror/sources.list.d/ubuntu.sources"
+assert_ok "retry rewrites apt-mirrors.txt" \
+  grep -qx 'http://archive.ubuntu.com/ubuntu/' "$mirror/apt-mirrors.txt"
+unset APT_FAIL_FIRST
+
 rm -rf "$WORKDIR"
 
 # Pin/fetch tests land before the operator YAML commit; required CI already

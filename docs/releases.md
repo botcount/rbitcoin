@@ -23,10 +23,14 @@ Patch **99** is the in-tree sentinel, not a published patch. `./scripts/release.
 refuses to tag it. `--patch` refuses to create it (`Z` stays `< 99`).
 
 Homes that must match on a ship commit: `Cargo.toml`
-`[workspace.package].version`, `nix/rbitcoin.nix` `version`, `CHANGELOG.md`
+`[workspace.package].version`, every `Cargo.lock` that records a workspace
+member (`Cargo.lock`, `fuzz/Cargo.lock`, `script-oracle/Cargo.lock`),
+`nix/rbitcoin.nix` `version`, `CHANGELOG.md`
 `## [X.Y.Z]` with a **`### Highlights`** subsection (1–11 bullets,
 operator-facing, then the thanks paragraph when this release has one).
-`./scripts/release-gate.sh` checks the bullets. Narrative banners
+`./scripts/release-gate.sh` checks the bullets. `./scripts/release.sh`
+refuses to tag when a workspace member's lock entry disagrees or the root
+lock is missing. Narrative banners
 (README, SECURITY, `docs/operator/mainnet.md`)
 are edited on the same bump PR; the scripts do not rewrite them.
 
@@ -105,18 +109,19 @@ All hermetic pins: `./scripts/release.test.sh` (includes
 
 | Command | Does |
 |---------|------|
-| `./scripts/release-cut.sh --minor` | `X.Y.99` → `X.(Y+1).0`; folds `changelog.d/` into CHANGELOG, then cuts |
-| `./scripts/release-cut.sh --major` | `X.Y.99` → `(X+1).0.0`; same changelog fold as `--minor` |
-| `./scripts/release-cut.sh --patch` | `X.Y.Z` → `X.Y.(Z+1)` on `vX.Y.x`; same changelog fold |
-| `./scripts/release-cut.sh --dev-next` | just-shipped `X.Y.0` → `X.Y.99` |
+| `./scripts/release-cut.sh --minor` | `X.Y.99` → `X.(Y+1).0`; folds `changelog.d/` into CHANGELOG, then cuts. Rewrites workspace package versions in every `Cargo.lock` |
+| `./scripts/release-cut.sh --major` | `X.Y.99` → `(X+1).0.0`; same changelog fold and lock rewrite as `--minor` |
+| `./scripts/release-cut.sh --patch` | `X.Y.Z` → `X.Y.(Z+1)` on `vX.Y.x`; same changelog fold and lock rewrite |
+| `./scripts/release-cut.sh --dev-next` | just-shipped `X.Y.0` → `X.Y.99`; same lock rewrite |
 | `./scripts/release-cut.sh --print-plan …` | prints `ship=` / `maint=` / `dev_next=` |
 | `./scripts/release-cut.sh --latest-maint` | highest `vX.Y.x` ref |
-| `./scripts/release-gate.sh` | cargo/nix/changelog; ship needs Highlights; `--kind` → `ship`\|`dev` |
+| `./scripts/release-gate.sh` | cargo/nix/changelog/lock; ship needs Highlights; `--kind` → `ship`\|`dev` |
 | `./scripts/release-notes.sh` | GitHub Release / tag text (blurb + Highlights) |
-| `./scripts/release.sh` | annotated tag on a **ship** version |
+| `./scripts/release.sh` | annotated tag on a **ship** version; refuses a stale or missing `Cargo.lock` |
 | `./scripts/release.sh --tag-only` | push the tag, not the branch |
 | `./scripts/release-post.sh` | tag + for `X.Y.0` create `vX.Y.x` |
 | `./scripts/docker-tags.sh vX.Y.Z` | image tags: `X.Y.Z`; `X.Y` when newest on its line; `latest` when newest overall |
+| `./scripts/docker-tags.sh --nightly YYYYMMDD` | nightly image tags: `nightly-YYYYMMDD`, then `nightly` |
 | `./scripts/docker-smoke.sh IMAGE SUMS` | image run contract (hashes, version, regtest boot, cli, SIGTERM) |
 
 `--minor` / `--major` require a `.99` tree. `--patch` is refused on `.99`.
@@ -150,11 +155,30 @@ aarch64 binary before it ships. `docker-publish` rebuilds the image in one
 call from the same staged binaries (the Dockerfile has no `RUN`, so no
 emulation) and `sha256sum -c`s them first.
 
-`workflow_dispatch` runs both builds and both smoke legs and never
-publishes. If `docker-publish` fails after a good Release, rerun that job:
+`workflow_dispatch` without **nightly** runs both builds and both smoke
+legs and never publishes. If `docker-publish` fails after a good Release, rerun that job:
 the same tag gives the same platform manifests.
 
-`docker-publish` runs one tag at a time across the repo (its own
+### Nightly image
+
+The same workflow runs nightly at `13 8 * * *` (08:13 UTC) on master. It
+runs the two `musl` legs and the two `docker` smoke legs, then
+`docker-publish` pushes the master tip as `nightly` and
+`nightly-YYYYMMDD` (UTC run date) to the same registries. `windows`,
+`macos`, `nixos-module-runtime`, and `github-release` are skipped. The
+image version label is `nightly-YYYYMMDD`, and the revision label is the
+commit.
+
+To publish one now: Actions → **release** → Run workflow on `master`,
+tick **nightly**, and leave **ref** empty. The `musl` legs fail at once on
+any other branch or with a ref, so `nightly` only ever names master. A
+second nightly on the same day moves both tags.
+
+Before it pushes, `docker-publish` reads the commit the published
+`nightly` names. When that commit is newer than this build, the job skips
+the push. A re-run or a late nightly never moves `nightly` back.
+
+`docker-publish` runs one tag (or nightly) at a time across the repo (its own
 concurrency group), and each run reads the tag list at its start. Two tags
 cut together, such as `X.Y.0` and a patch on `vX.(Y-1).x`, cannot move
 `latest` or `X.Y` backwards. The group sets `queue: max`, so a third tag

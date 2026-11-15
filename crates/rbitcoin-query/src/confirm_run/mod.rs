@@ -36,7 +36,7 @@ use rbitcoin_consensus::block::{block_has_witness_from_pres, ScriptCheckJob, Val
 use rbitcoin_consensus::header::pow_hash_meets_target;
 use rbitcoin_consensus::{ChainParams, ConsensusError, Milestone};
 use rbitcoin_primitives::Height;
-use rbitcoin_store::{StoreError, WriteIoBackend};
+use rbitcoin_store::StoreError;
 use std::cell::Cell;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -93,13 +93,6 @@ pub use write::{
     fill_planned_create_layout_after_commit, write_batch_vs_tip, write_height_needed,
     WriteBatchVsTip,
 };
-/// Pure-write annotate backend from global `RBITCOIN_IO`.
-#[inline]
-#[doc(hidden)]
-pub fn spend_ann_backend_next() -> WriteIoBackend {
-    rbitcoin_store::spend_ann_backend()
-}
-
 /// One height resolved for the confirm wave (header + Class A body fks).
 #[doc(hidden)]
 pub struct BodyMeta {

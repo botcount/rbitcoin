@@ -722,6 +722,8 @@ static STAGE_PARKED: AtomicBool = AtomicBool::new(false);
 #[test]
 fn second_stage_keeps_the_first_publisher_wake() {
     let phase = Arc::new(AtomicUsize::new(0));
+    let a_id = Arc::new(Mutex::new(None));
+    let b_id = Arc::new(Mutex::new(None));
     let a_registered = Arc::new(AtomicBool::new(false));
     let b_registered = Arc::new(AtomicBool::new(false));
     let release_b = Arc::new(AtomicBool::new(false));
@@ -729,6 +731,7 @@ fn second_stage_keeps_the_first_publisher_wake() {
     let wakes = Arc::new(AtomicUsize::new(0));
 
     let phase_a = Arc::clone(&phase);
+    let a_id_slot = Arc::clone(&a_id);
     let a_flag = Arc::clone(&a_registered);
     let b_flag_for_a = Arc::clone(&b_registered);
     let wakes_a = Arc::clone(&wakes);
@@ -740,35 +743,49 @@ fn second_stage_keeps_the_first_publisher_wake() {
             }
         }
         set_script_publisher(Some(thread::current()));
+        *a_id_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(thread::current().id());
         let _clear = Clear;
         a_flag.store(true, Ordering::Release);
         note_script_progress();
         wait_until("second stage did not register", || {
             b_flag_for_a.load(Ordering::Acquire)
         });
+        let take_wake = || {
+            phase_a.store(0, Ordering::Release);
+            STAGE_PARKED.store(false, Ordering::Release);
+            wakes_a.fetch_add(1, Ordering::Release);
+            note_script_progress();
+        };
         for _ in 0..2 {
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
-                // Drop a stale unpark permit so the next park waits for this round.
-                thread::park_timeout(Duration::ZERO);
-                phase_a.store(1, Ordering::Release);
+                // phase 2 is this round's unpark. Storing 1 over it, or
+                // park_timeout(0), drops a wake the driver does not repeat.
+                if phase_a.load(Ordering::Acquire) == 2 {
+                    take_wake();
+                    break;
+                }
+                let raced = phase_a
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err();
+                if raced && phase_a.load(Ordering::Acquire) == 2 {
+                    continue;
+                }
                 STAGE_PARKED.store(true, Ordering::Release);
                 note_script_progress();
+                if phase_a.load(Ordering::Acquire) == 2 {
+                    continue;
+                }
                 let left = deadline.saturating_duration_since(Instant::now());
                 assert!(!left.is_zero(), "script stage was not woken");
                 thread::park_timeout(left);
                 STAGE_PARKED.store(false, Ordering::Release);
-                if phase_a.load(Ordering::Acquire) == 2 {
-                    phase_a.store(0, Ordering::Release);
-                    wakes_a.fetch_add(1, Ordering::Release);
-                    note_script_progress();
-                    break;
-                }
             }
         }
     });
 
     let b_flag = Arc::clone(&b_registered);
+    let b_id_slot = Arc::clone(&b_id);
     let start_b = Arc::clone(&a_registered);
     let release = Arc::clone(&release_b);
     let cleared = Arc::clone(&b_cleared);
@@ -783,6 +800,7 @@ fn second_stage_keeps_the_first_publisher_wake() {
             start_b.load(Ordering::Acquire)
         });
         set_script_publisher(Some(thread::current()));
+        *b_id_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(thread::current().id());
         let _clear = Clear;
         b_flag.store(true, Ordering::Release);
         note_script_progress();
@@ -814,9 +832,74 @@ fn second_stage_keeps_the_first_publisher_wake() {
     wait_until("second stage did not clear", || {
         b_cleared.load(Ordering::Acquire)
     });
+    let publishers: Vec<_> = PUBLISHERS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .map(|t| t.id())
+        .collect();
+    assert!(
+        publishers.contains(&a_id.lock().unwrap().expect("stage a id")),
+        "clearing the second stage dropped the first"
+    );
+    assert!(
+        !publishers.contains(&b_id.lock().unwrap().expect("stage b id")),
+        "clearing the second stage kept it"
+    );
     drive(2);
     a.join().expect("stage a");
     b.join().expect("stage b");
+}
+
+#[test]
+fn fg_has_unclaimed_while_a_chunk_remains() {
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
+    let n = worker_spawn_count();
+    let occupy = OccupyGate::occupy_n(n.saturating_sub(1));
+    let arm = DelayClaimArm::arm();
+    let wave = thread::spawn(|| {
+        start_for_each_owned_chunk((0..64u32).collect(), ok_u32, 1)
+            .unwrap()
+            .expect("wave")
+            .finish()
+    });
+    wait_until("claimer did not enter the claim delay", || {
+        DELAY_CLAIM_ENTERED.load(Ordering::SeqCst) != 0
+    });
+    assert!(fg_has_unclaimed());
+    arm.go();
+    wave.join().expect("join").expect("wave ok");
+    occupy.release();
+}
+
+#[test]
+fn warn_fault_without_keep_fails_the_wave() {
+    fn warn(_: &u32) -> Result<(), ConsensusError> {
+        Err(ConsensusError::BadTx("not final"))
+    }
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
+    let err = start_for_each_owned((0..2u32).collect(), warn)
+        .unwrap()
+        .expect("wave")
+        .finish();
+    assert!(
+        err.is_err(),
+        "a warn fault is a failure when keep_faults is off"
+    );
+}
+
+#[test]
+fn park_delay_waits_until_go() {
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
+    let arm = DelayParkArm::arm();
+    let entered = thread::spawn(maybe_delay_park);
+    wait_until("park delay was not entered", || {
+        DELAY_PARK_ENTERED.load(Ordering::SeqCst) != 0
+    });
+    thread::sleep(Duration::from_millis(50));
+    assert!(!entered.is_finished(), "park delay returned before go");
+    arm.go();
+    entered.join().expect("park delay");
 }
 
 static CPU_ORDER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
@@ -920,4 +1003,131 @@ fn run_cpu_guest_cannot_touch_store_io() {
     }))
     .expect("script worker");
     assert!(hit, "store read on a script worker must panic");
+}
+
+/// Lost-wakeup close: work pending or a newer epoch returns before park.
+/// A parked mutant is unparked so this process still exits.
+fn expect_idle_miss(pool: Arc<ScriptWorkers>, epoch: usize) -> bool {
+    let idle = Arc::new(rbitcoin_consensus::sync::Mutex::new(Vec::new()));
+    let (tx, rx) = mpsc::channel();
+    let pool_t = Arc::clone(&pool);
+    let idle_t = Arc::clone(&idle);
+    let handle = thread::spawn(move || {
+        let v = park_if_still_idle(&pool_t, epoch, &idle_t);
+        let _ = tx.send(v);
+    });
+    match rx.recv_timeout(Duration::from_millis(400)) {
+        Ok(v) => {
+            handle.join().expect("idle turn");
+            v
+        }
+        Err(_) => {
+            handle.thread().unpark();
+            let v = rx.recv_timeout(Duration::from_secs(2)).unwrap_or(true);
+            handle.join().expect("idle turn");
+            v
+        }
+    }
+}
+
+fn local_pool(epoch: usize) -> Arc<ScriptWorkers> {
+    Arc::new(ScriptWorkers {
+        jobs: rbitcoin_consensus::sync::Mutex::new(Default::default()),
+        epoch: AtomicUsize::new(epoch),
+    })
+}
+
+#[test]
+fn park_returns_before_sleep_when_work_or_epoch_moved() {
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
+    let pool = local_pool(7);
+    {
+        let mut jobs = rbitcoin_consensus::sync::lock(&pool.jobs);
+        jobs.push_back(Box::new(|| {}));
+    }
+    // The recheck repeats this predicate. Queued work must return before that gate.
+    // Pool workers share `DELAY_PARK`. Wait until they are parked so one of
+    // them cannot enter the gate for this arm.
+    wait_all_idle(worker_spawn_count());
+    let arm = DelayParkArm::arm();
+    let idle = Arc::new(rbitcoin_consensus::sync::Mutex::new(Vec::new()));
+    let (tx, rx) = mpsc::channel();
+    let pool_t = Arc::clone(&pool);
+    let idle_t = Arc::clone(&idle);
+    let handle = thread::spawn(move || {
+        let v = park_if_still_idle(&pool_t, 7, &idle_t);
+        let _ = tx.send(v);
+    });
+    let reached_gate = match rx.recv_timeout(Duration::from_millis(400)) {
+        Ok(false) => false,
+        Ok(true) => true,
+        Err(_) => {
+            arm.go();
+            let _ = rx.recv_timeout(Duration::from_secs(2));
+            true
+        }
+    };
+    handle.join().expect("queued work");
+    assert!(
+        !reached_gate,
+        "queued work must return before the park gate"
+    );
+    drop(arm);
+    let fresh = local_pool(7);
+    assert!(
+        !expect_idle_miss(Arc::clone(&fresh), 3),
+        "a newer epoch must not park"
+    );
+
+    let second = local_pool(4);
+    wait_all_idle(worker_spawn_count());
+    let arm = DelayParkArm::arm();
+    let idle = Arc::new(rbitcoin_consensus::sync::Mutex::new(Vec::new()));
+    let (tx, rx) = mpsc::channel();
+    let pool_t = Arc::clone(&second);
+    let idle_t = Arc::clone(&idle);
+    let handle = thread::spawn(move || {
+        let v = park_if_still_idle(&pool_t, 4, &idle_t);
+        let _ = tx.send(v);
+    });
+    wait_until("park recheck", || {
+        DELAY_PARK_ENTERED.load(Ordering::SeqCst) != 0
+    });
+    second.epoch.fetch_add(1, Ordering::Release);
+    arm.go();
+    let parked = match rx.recv_timeout(Duration::from_millis(400)) {
+        Ok(v) => v,
+        Err(_) => {
+            handle.thread().unpark();
+            rx.recv_timeout(Duration::from_secs(2)).unwrap_or(true)
+        }
+    };
+    handle.join().expect("second check");
+    assert!(!parked, "an epoch bump during the recheck must not park");
+
+    let third = local_pool(4);
+    wait_all_idle(worker_spawn_count());
+    let arm = DelayParkArm::arm();
+    let idle = Arc::new(rbitcoin_consensus::sync::Mutex::new(Vec::new()));
+    let (tx, rx) = mpsc::channel();
+    let pool_t = Arc::clone(&third);
+    let idle_t = Arc::clone(&idle);
+    let handle = thread::spawn(move || {
+        let v = park_if_still_idle(&pool_t, 4, &idle_t);
+        let _ = tx.send(v);
+    });
+    wait_until("park recheck work", || {
+        DELAY_PARK_ENTERED.load(Ordering::SeqCst) != 0
+    });
+    rbitcoin_consensus::sync::lock(&third.jobs).push_back(Box::new(|| {}));
+    arm.go();
+    let parked = match rx.recv_timeout(Duration::from_millis(400)) {
+        Ok(v) => v,
+        Err(_) => {
+            handle.thread().unpark();
+            rx.recv_timeout(Duration::from_secs(2)).unwrap_or(true)
+        }
+    };
+    handle.join().expect("second check work");
+    assert!(!parked, "work queued during the recheck must not park");
 }

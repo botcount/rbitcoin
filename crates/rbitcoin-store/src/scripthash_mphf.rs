@@ -4,6 +4,8 @@
 //! (not loaded into RAM). `base.val` is `n × 8` pack8. A key not in the set
 //! fails the tag check.
 
+use rbitcoin_primitives::le_u64;
+
 use crate::bdz::BdzMphf;
 use crate::error::StoreError;
 use crate::scripthash_layout::{pack8, unpack8, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN};
@@ -35,8 +37,9 @@ pub fn sidecar(base: &Path, ext: &str) -> PathBuf {
 }
 
 pub fn mix_key16(key: &ShHeadKey) -> u64 {
-    u64::from_le_bytes(key[0..8].try_into().expect("key16 half"))
-        ^ u64::from_le_bytes(key[8..16].try_into().expect("key16 half"))
+    let lo = le_u64!(key, 0);
+    let hi = le_u64!(key, 8);
+    lo ^ hi
 }
 
 pub fn mix64_keys(recs: &[(ShHeadKey, u64)]) -> Vec<u64> {

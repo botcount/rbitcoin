@@ -109,7 +109,7 @@ fn trust_peer_dials_only_that_peer() {
         unresolved.is_empty(),
         "unresolved trust-peer must not dial the peers file"
     );
-    let open = follow_dial_targets(&[], &book, 8, &[]);
+    let open = follow_dial_targets(&[], &book, 8, &[], false);
     assert!(
         !open.is_empty(),
         "the peers file is still a dial target when trust-peer is off"
@@ -117,14 +117,15 @@ fn trust_peer_dials_only_that_peer() {
     let shared = std::sync::Arc::new(std::sync::Mutex::new(book));
     let pinned = rbitcoin_net::NetAddr::Ip(addr.parse().unwrap());
     let trust_book = rbitcoin_ibd::PeerBookSession::new(ibd_shared_peers(true, &shared), &[pinned]);
-    let trust_cands = trust_book
-        .book()
-        .take_dial_candidates_net(8, &Default::default(), &[]);
+    let trust_cands =
+        trust_book
+            .book()
+            .take_dial_candidates_net(8, &Default::default(), &[], false);
     assert_eq!(trust_cands, vec![pinned], "{trust_cands:?}");
     let open_book = rbitcoin_ibd::PeerBookSession::new(ibd_shared_peers(false, &shared), &[]);
     let open_cands = open_book
         .book()
-        .take_dial_candidates_net(8, &Default::default(), &[]);
+        .take_dial_candidates_net(8, &Default::default(), &[], false);
     assert!(
         open_cands
             .iter()
@@ -152,7 +153,10 @@ fn follow_dial_targets_connect_bypasses_diversity() {
         IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         8333,
     ))];
-    assert_eq!(follow_dial_targets(&connect, &am, 8, &occupied), want);
+    assert_eq!(
+        follow_dial_targets(&connect, &am, 8, &occupied, false),
+        want
+    );
     // Core reports `-connect` peers as `manual`; addrman picks are full relay.
     assert_eq!(follow_dial_type(&connect), PeerConnType::Manual);
     assert_eq!(follow_dial_type(&[]), PeerConnType::OutboundFullRelay);
@@ -363,7 +367,7 @@ fn follow_dial_targets_keeps_i2p_connect() {
         port: 8333,
     };
     let connect = vec![i2p];
-    let got = follow_dial_targets(&connect, &am, 8, &[]);
+    let got = follow_dial_targets(&connect, &am, 8, &[], false);
     assert_eq!(got, vec![i2p]);
 }
 
@@ -379,7 +383,7 @@ fn follow_dial_targets_skips_occupied_group() {
         IpAddr::V4(Ipv4Addr::new(1, 2, 0, 9)),
         8333,
     ))];
-    let got = follow_dial_targets(&[], &am, 1, &occupied);
+    let got = follow_dial_targets(&[], &am, 1, &occupied, false);
     assert_eq!(got, vec![rbitcoin_net::NetAddr::Ip(other)]);
 }
 
@@ -393,9 +397,9 @@ fn follow_dial_targets_picks_addrman_onion() {
     am.set_onion_reachable(true);
     am.set_only_net(vec![rbitcoin_net::OnlyNet::Onion]);
     am.add_addr(onion);
-    assert_eq!(follow_dial_targets(&[], &am, 1, &[]), vec![onion]);
+    assert_eq!(follow_dial_targets(&[], &am, 1, &[], false), vec![onion]);
     assert!(
-        follow_dial_targets(&[], &am, 1, &[onion]).is_empty(),
+        follow_dial_targets(&[], &am, 1, &[onion], true).is_empty(),
         "live onion net must not be re-dialed via 0.0.0.0 hint"
     );
 }
@@ -734,6 +738,20 @@ fn relay_requires_min_chain_work_even_when_following() {
 }
 
 #[test]
+fn discover_from_peers_needs_a_reachable_bind() {
+    let on = |bind: &str| discover_from_peers_on(true, bind.parse().unwrap());
+    assert!(!on("127.0.0.1:8333"), "the default bind is loopback");
+    assert!(!on("127.0.0.1:0"), "the onion listener alone is loopback");
+    assert!(!on("[::1]:8333"));
+    assert!(!on("[::ffff:127.0.0.1]:8333"));
+    assert!(on("0.0.0.0:8333"));
+    assert!(on("[::]:8333"));
+    assert!(on("192.168.1.5:8333"), "behind NAT, forwarded");
+    let any: SocketAddr = "0.0.0.0:8333".parse().unwrap();
+    assert!(!discover_from_peers_on(false, any));
+}
+
+#[test]
 fn cjdns_listen_is_advertised_without_external_ip() {
     use std::net::{IpAddr, Ipv6Addr};
     let fc = Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7);
@@ -903,6 +921,262 @@ fn dns_seeds_not_resolved_locally_when_proxy() {
     assert!(
         !should_resolve_default_seeds(&cfg),
         "proxy path must not ToSocketAddrs DNS/fixed seeds"
+    );
+}
+
+/// `--only-net onion` has no IPv4 or IPv6 to reach. A DNS seed lookup, local
+/// or through `--proxy`, would tell a clearnet resolver or seed that this
+/// host runs a node. Only the fixed onion seeds apply.
+#[test]
+fn only_net_without_clearnet_asks_no_dns_seed() {
+    use rbitcoin_net::OnlyNet;
+    let mut cfg = NodeConfig::default();
+    cfg.listen.onion = Some("127.0.0.1:9050".parse().unwrap());
+    cfg.listen.only_net = vec![OnlyNet::Onion];
+    assert!(should_resolve_default_seeds(&cfg), "fixed onion seeds stay");
+    assert!(!should_resolve_dns_seeds(&cfg));
+    cfg.listen.only_net = vec![OnlyNet::Onion, OnlyNet::Ipv4];
+    assert!(should_resolve_dns_seeds(&cfg));
+    cfg.listen.only_net.clear();
+    assert!(should_resolve_dns_seeds(&cfg));
+
+    let mut proxied = NodeConfig::default();
+    proxied.listen.proxy = Some("127.0.0.1:9050".parse().unwrap());
+    assert!(should_queue_proxy_seeds(&proxied));
+    proxied.listen.only_net = vec![OnlyNet::Onion];
+    assert!(!should_queue_proxy_seeds(&proxied));
+}
+
+#[test]
+fn proxy_seeds_follow_the_local_seed_rules() {
+    use rbitcoin_primitives::Network;
+    let proxied = |network| {
+        let mut cfg = NodeConfig::default().with_network(network);
+        cfg.listen.proxy = Some("127.0.0.1:9050".parse().unwrap());
+        cfg
+    };
+    assert!(should_queue_proxy_seeds(&proxied(Network::Signet)));
+    assert!(!should_queue_proxy_seeds(&NodeConfig::default()));
+    assert!(
+        !should_queue_proxy_seeds(&proxied(Network::Regtest)),
+        "regtest has no seed to ask"
+    );
+
+    let mut connect = proxied(Network::Signet);
+    connect.listen.connect = vec![rbitcoin_net::NetAddr::from_socket(
+        "127.0.0.1:38333".parse().unwrap(),
+    )];
+    assert!(
+        !should_queue_proxy_seeds(&connect),
+        "--connect pins the peers"
+    );
+
+    let mut named = proxied(Network::Signet);
+    named.listen.connect_dns = vec!["node.example:38333".into()];
+    assert!(!should_queue_proxy_seeds(&named));
+
+    let mut custom = proxied(Network::Signet);
+    custom.signet_challenge = Some(bitcoin::ScriptBuf::from_bytes(vec![0x51]));
+    assert!(
+        !should_queue_proxy_seeds(&custom),
+        "default signet seeds serve another chain"
+    );
+
+    let mut no_seeds = proxied(Network::Signet);
+    no_seeds.listen.use_seeds = false;
+    assert!(!should_queue_proxy_seeds(&no_seeds));
+
+    let mut trusted = proxied(Network::Signet);
+    trusted.trust_peer = Some(rbitcoin_net::NetAddr::from_socket(
+        "127.0.0.1:38333".parse().unwrap(),
+    ));
+    assert!(
+        !should_queue_proxy_seeds(&trusted),
+        "--trust-peer pins one peer"
+    );
+}
+
+#[tokio::test]
+async fn regtest_proxy_start_does_not_wait_for_seeds() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("rbitcoin-regtest-proxy-seeds-{nanos}"));
+    let proxy_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
+    cfg.listen.proxy = Some(proxy_l.local_addr().unwrap());
+    cfg.max_run_secs = Some(0);
+    let result = tokio::time::timeout(Duration::from_secs(5), run_p2p(cfg)).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+        .expect("regtest has no seed answer to wait for")
+        .unwrap();
+}
+
+/// A P2P port another process holds is Core's bind InitError, not a log line
+/// (bitcoin/bitcoin#36305, `feature_port.py`). The primary and an extra
+/// listen fail the same way.
+#[tokio::test]
+async fn held_p2p_port_is_the_core_bind_init_error() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = held.local_addr().unwrap();
+    let want = format!(
+        "Error: Unable to bind to {taken} on this computer. rbitcoin is probably already running."
+    );
+
+    let dir = std::env::temp_dir().join(format!("rbitcoin-held-p2p-{nanos}"));
+    let cfg = tiny_regtest(&dir).with_p2p_listen(taken);
+    let err = run_p2p(cfg).await.expect_err("held port");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(matches!(err, rbitcoin_node::NodeError::Init(_)), "{err:?}");
+    assert_eq!(err.to_string(), want);
+
+    let dir = std::env::temp_dir().join(format!("rbitcoin-held-p2p-extra-{nanos}"));
+    let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
+    cfg.listen.p2p_extra.push(taken);
+    let err = run_p2p(cfg).await.expect_err("held extra port");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(matches!(err, rbitcoin_node::NodeError::Init(_)), "{err:?}");
+    assert_eq!(err.to_string(), want);
+}
+
+/// Any other bind failure is Core's second bind InitError, with the OS text as
+/// `NetworkErrorString` gives it: `<strerror> (<errno>)`, not Rust's
+/// `(os error N)`. 192.0.2.1 (TEST-NET-1) is never a local address, so `bind`
+/// fails without root.
+#[tokio::test]
+async fn unassignable_p2p_address_is_the_core_bind_error_text() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let addr: std::net::SocketAddr = "192.0.2.1:0".parse().unwrap();
+    let dir = std::env::temp_dir().join(format!("rbitcoin-unassignable-p2p-{nanos}"));
+    let cfg = tiny_regtest(&dir).with_p2p_listen(addr);
+    let err = run_p2p(cfg).await.expect_err("unassignable address");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(matches!(err, rbitcoin_node::NodeError::Init(_)), "{err:?}");
+    let msg = err.to_string();
+    let head = format!("Error: Unable to bind to {addr} on this computer (bind returned error ");
+    assert!(!msg.contains("os error"), "{msg}");
+    let os = msg
+        .strip_prefix(&head)
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("{msg}"));
+    let (text, code) = os.rsplit_once(" (").unwrap_or_else(|| panic!("{msg}"));
+    let code: i32 = code
+        .strip_suffix(')')
+        .and_then(|c| c.parse().ok())
+        .unwrap_or_else(|| panic!("{msg}"));
+    assert_eq!(
+        text,
+        std::io::Error::from_raw_os_error(code)
+            .to_string()
+            .trim_end_matches(&format!(" (os error {code})")),
+        "{msg}"
+    );
+}
+
+/// `--proxy --only-net onion` reaches no clearnet seed, so the fixed onion
+/// seeds are the only way to a first peer. The node dials one through SOCKS.
+#[tokio::test]
+async fn proxy_only_net_onion_dials_a_fixed_onion_seed() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = rbitcoin_store::testutil::TempDir::new().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = NodeConfig::default()
+        .with_datadir(dir.path())
+        .with_network(rbitcoin_primitives::Network::Signet)
+        .with_tiny_heads();
+    cfg.apply_kv("milestone", "0").unwrap();
+    cfg.apply_kv("listen", "0").unwrap();
+    cfg.apply_kv("max_inbound", "0").unwrap();
+    cfg.apply_kv("only_net", "onion").unwrap();
+    cfg.apply_kv("proxy", &listener.local_addr().unwrap().to_string())
+        .unwrap();
+    cfg.max_run_secs = Some(0);
+    cfg.validate().unwrap();
+
+    let capture = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut greeting = [0; 2];
+        socket.read_exact(&mut greeting).await.unwrap();
+        let mut methods = vec![0; greeting[1] as usize];
+        socket.read_exact(&mut methods).await.unwrap();
+        if methods.contains(&2) {
+            socket.write_all(&[5, 2]).await.unwrap();
+            assert_eq!(socket.read_u8().await.unwrap(), 1);
+            for _ in 0..2 {
+                let len = socket.read_u8().await.unwrap();
+                let mut field = vec![0; len as usize];
+                socket.read_exact(&mut field).await.unwrap();
+            }
+            socket.write_all(&[1, 0]).await.unwrap();
+        } else {
+            socket.write_all(&[5, 0]).await.unwrap();
+        }
+        let mut header = [0; 5];
+        socket.read_exact(&mut header).await.unwrap();
+        assert_eq!(&header[..4], &[5, 1, 0, 3]);
+        let mut host = vec![0; header[4] as usize];
+        socket.read_exact(&mut host).await.unwrap();
+        socket
+            .write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        String::from_utf8(host).unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(45), run_p2p(cfg))
+        .await
+        .expect("run must stop")
+        .unwrap();
+    let host = tokio::time::timeout(Duration::from_secs(1), capture)
+        .await
+        .expect("a fixed onion seed must reach SOCKS CONNECT")
+        .unwrap();
+    assert!(host.ends_with(".onion"), "dialed {host}");
+}
+
+/// Under `--proxy` a `--connect` hostname is pinned by name: catch-up and the
+/// follow dial hand that name to SOCKS, and `--trust-peer` sees a pin. A bare
+/// IPv6 literal needs no lookup and stays a socket at the default port.
+#[test]
+fn proxy_pins_the_connect_hostname_for_the_follow_dial() {
+    let pinned = proxied_connect_names(
+        &[
+            "peer.example:8444".to_string(),
+            "bare.example".to_string(),
+            "2001:db8::1".to_string(),
+        ],
+        rbitcoin_primitives::Network::Regtest,
+    );
+    let dialed: Vec<_> = outbound_dial_targets(true, &pinned, &AddrMan::default(), 8, &[])
+        .into_iter()
+        .map(rbitcoin_net::DialTarget::from_net)
+        .collect();
+    let want = |host: &str, port| rbitcoin_net::DialTarget::Domain {
+        host: host.into(),
+        port,
+    };
+    assert_eq!(
+        dialed,
+        [
+            want("peer.example", 8444),
+            want(
+                "bare.example",
+                rbitcoin_primitives::Network::Regtest.default_p2p_port()
+            ),
+            rbitcoin_net::DialTarget::Socket(std::net::SocketAddr::new(
+                "2001:db8::1".parse().unwrap(),
+                rbitcoin_primitives::Network::Regtest.default_p2p_port()
+            ))
+        ]
     );
 }
 
@@ -1368,6 +1642,112 @@ fn startup_sets_sh_force_rebuild_on_the_query() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A pruned datadir does not start when this process omitted the flag.
+/// The witness files are already the only copy.
+#[test]
+fn pruned_datadir_without_the_flag_does_not_start() {
+    let dir = scratch_dir("prune-flag-off");
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    let cfg = NodeConfig::default();
+    let err = apply_startup_index_mode(&q, &cfg, 0).unwrap_err();
+    assert!(
+        err.to_string().contains("restart with --prune-seqsigwit"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--sh-index` on a store with no scripthash head stays in Direct mode.
+/// Confirm still defers Class B until the head exists.
+#[test]
+fn startup_with_shindex_stays_direct_without_a_durable_head() {
+    let dir = scratch_dir("sh-direct");
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    let mut cfg = NodeConfig::default();
+    cfg.shindex = true;
+    apply_startup_index_mode(&q, &cfg, 0).unwrap();
+    assert!(q.index_mode().unwrap().is_direct());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A pack-marked head is already the scripthash index. Startup resumes Tip
+/// mode instead of collecting Class A again.
+#[test]
+fn startup_resumes_tip_mode_when_the_scripthash_head_is_durable() {
+    let dir = scratch_dir("sh-tip");
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    let bump = q.store().scripthash.alloc_bump();
+    let session = q.store().scripthash.pack_shard_session(0).unwrap();
+    let pack = session.finish_pack().unwrap();
+    assert_eq!(pack.bump, bump);
+    q.store().scripthash.publish_packed_shard(0, pack).unwrap();
+    let mut cfg = NodeConfig::default();
+    cfg.shindex = true;
+    apply_startup_index_mode(&q, &cfg, 0).unwrap();
+    assert!(q.index_mode().unwrap().is_tip());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The tweak watermark is behind the tip and the keep file is gone.
+/// Startup has to say the repair failed. It must not advance prune height.
+#[test]
+fn startup_reports_a_tweak_repair_that_cannot_read_the_keep_file() {
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::testutil::FixtureChain;
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+    let dir = scratch_dir("tweak-repair-miss");
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    let mut script = rbitcoin_primitives::P2TR_PREFIX.to_vec();
+    script.extend_from_slice(&[0x11; 32]);
+    let mut txid = [0u8; 32];
+    txid[31] = 0xcb;
+    let ta = TxApply {
+        tx: TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord::coinbase(
+            u32::MAX,
+            vec![0x04, 1],
+            vec![vec![0x22]],
+        )],
+        outputs: vec![OutputRecord::unspent(50_0000_0000, script)],
+    };
+    let header = HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x207f_ffff,
+        nonce: 0,
+        merkle_root: txid,
+        hash: txid,
+        size: 0,
+        weight: 0,
+    };
+    q.connect_block(Height(0), &header, &[ta]).unwrap();
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    q.clear_seqsigwit_ram_window();
+    let spill = q.store().path().join("seqsigwit.window/0.bin");
+    assert!(spill.is_file());
+    std::fs::remove_file(&spill).unwrap();
+    let mut cfg = NodeConfig::default();
+    cfg.prune_seqsigwit = true;
+    cfg.sptweaks = true;
+    let err = apply_startup_index_mode(&q, &cfg, 0).unwrap_err();
+    assert!(
+        err.to_string().contains("index startup repair failed"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A pack-marked head whose inclusion floor is behind the tip must not open
 /// Electrum. Tip follow still starts so write-behind can catch up.
 #[test]
@@ -1666,6 +2046,79 @@ async fn proxy_seed_wait_ends_on_a_learned_reply_shutdown_or_deadline() {
     assert!(book.is_none(), "shutdown ends the wait with no book");
 }
 
+/// Core's `ThreadDNSAddressSeed`: an empty book asks the DNS seeds at
+/// once. A known book waits 11 s (5 min past 1,000 rows, rechecked every
+/// 11 s) and skips the seeds once two outbound full-relay peers are up.
+/// Short of that, the seeds are asked after the wait.
+///
+/// The clock is paused, so the waits are not wall time.
+#[tokio::test(start_paused = true)]
+async fn dns_seeds_wait_for_known_peers_first() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let seed: SocketAddr = "1.2.3.4:8333".parse().unwrap();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let resolver = |asked: &Arc<AtomicUsize>| {
+        let asked = Arc::clone(asked);
+        move || {
+            asked.fetch_add(1, Ordering::SeqCst);
+            vec![seed]
+        }
+    };
+    let sd = Shutdown::new();
+    assert_eq!(DNSSEEDS_DELAY_FEW_PEERS, Duration::from_secs(11));
+    assert_eq!(DNSSEEDS_DELAY_MANY_PEERS, Duration::from_secs(300));
+
+    // Empty book: no wait.
+    let t0 = tokio::time::Instant::now();
+    let got = dns_seeds_when_needed(0, || 0, &sd, resolver(&asked)).await;
+    assert_eq!(got, Some(vec![seed]));
+    assert_eq!(t0.elapsed(), Duration::ZERO);
+    assert_eq!(asked.swap(0, Ordering::SeqCst), 1);
+
+    // Known book with two outbound peers up: the seeds are not asked.
+    let t0 = tokio::time::Instant::now();
+    let got = dns_seeds_when_needed(50, || 2, &sd, resolver(&asked)).await;
+    assert_eq!(got, None);
+    assert_eq!(t0.elapsed(), DNSSEEDS_DELAY_FEW_PEERS);
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+
+    // Known book, one peer up: the seeds are asked after the wait.
+    let t0 = tokio::time::Instant::now();
+    let got = dns_seeds_when_needed(50, || 1, &sd, resolver(&asked)).await;
+    assert_eq!(got, Some(vec![seed]));
+    assert_eq!(t0.elapsed(), DNSSEEDS_DELAY_FEW_PEERS);
+    assert_eq!(asked.swap(0, Ordering::SeqCst), 1);
+
+    // A large book waits longer and stops at the first check with peers up.
+    let t0 = tokio::time::Instant::now();
+    let up_at = t0 + 2 * DNSSEEDS_DELAY_FEW_PEERS;
+    let outbound = move || usize::from(tokio::time::Instant::now() >= up_at) * 2;
+    let got = dns_seeds_when_needed(
+        DNSSEEDS_DELAY_PEER_THRESHOLD,
+        outbound,
+        &sd,
+        resolver(&asked),
+    )
+    .await;
+    assert_eq!(got, None);
+    assert_eq!(t0.elapsed(), 2 * DNSSEEDS_DELAY_FEW_PEERS);
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+
+    let t0 = tokio::time::Instant::now();
+    let got =
+        dns_seeds_when_needed(DNSSEEDS_DELAY_PEER_THRESHOLD, || 0, &sd, resolver(&asked)).await;
+    assert_eq!(got, Some(vec![seed]));
+    assert_eq!(t0.elapsed(), DNSSEEDS_DELAY_MANY_PEERS);
+    assert_eq!(asked.swap(0, Ordering::SeqCst), 1);
+
+    // Shutdown during the wait: nothing is asked.
+    sd.request();
+    let got = dns_seeds_when_needed(50, || 0, &sd, resolver(&asked)).await;
+    assert_eq!(got, None);
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+}
+
 /// `--esplora-max-inflight` reaches the listener: with a limit of one, a
 /// request whose body never arrives makes the next request wait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1809,6 +2262,146 @@ fn refill_skips_an_address_that_is_already_live() {
         got,
         vec![next],
         "the live inbound address must not be the only candidate for the open slot"
+    );
+}
+
+fn onion_book(
+    clearnet: &[SocketAddr],
+    onion: rbitcoin_net::NetAddr,
+) -> Arc<std::sync::Mutex<AddrMan>> {
+    let mut book = AddrMan::new();
+    book.set_onion_reachable(true);
+    for addr in clearnet {
+        book.add(*addr);
+    }
+    book.add_addr(onion);
+    Arc::new(std::sync::Mutex::new(book))
+}
+
+fn dial_strings(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<rbitcoin_net::DialRequest>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Ok(req) = rx.try_recv() {
+        assert_eq!(req.typ, PeerConnType::OutboundFullRelay);
+        out.push(req.target.to_string());
+    }
+    out
+}
+
+/// A one-slot refill with no live outbound onion or I2P peer dials the
+/// overlay row, so a lost onion peer is replaced (#1511).
+#[test]
+fn single_slot_refill_replaces_a_lost_onion_peer() {
+    let peers = rbitcoin_net::PeerHub::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    peers.set_dialer(tx);
+    let onion: rbitcoin_net::NetAddr =
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+            .parse()
+            .unwrap();
+    let a: SocketAddr = "45.6.0.1:8333".parse().unwrap();
+    let b: SocketAddr = "45.7.0.1:8333".parse().unwrap();
+    let shared = onion_book(&[a, b], onion);
+    refill_outbound_full_relay(&NodeConfig::default(), &peers, &shared, 1);
+    assert_eq!(
+        dial_strings(&mut rx),
+        vec![onion.to_string()],
+        "with no live overlay outbound, one open slot goes to the onion row"
+    );
+}
+
+/// With an outbound onion peer already live, a one-slot refill stays on
+/// clearnet.
+#[test]
+fn single_slot_refill_stays_clearnet_while_an_onion_peer_is_live() {
+    let peers = rbitcoin_net::PeerHub::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    peers.set_dialer(tx);
+    let live: rbitcoin_net::NetAddr =
+        "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion:8333"
+            .parse()
+            .unwrap();
+    let onion: rbitcoin_net::NetAddr =
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+            .parse()
+            .unwrap();
+    let placeholder: SocketAddr = "0.0.0.0:8333".parse().unwrap();
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: bitcoin::p2p::PROTOCOL_VERSION,
+        services: bitcoin::p2p::ServiceFlags::NONE,
+        timestamp: 0,
+        receiver: bitcoin::p2p::Address::new(&placeholder, bitcoin::p2p::ServiceFlags::NONE),
+        sender: bitcoin::p2p::Address::new(&placeholder, bitcoin::p2p::ServiceFlags::NONE),
+        nonce: 0,
+        user_agent: String::new(),
+        start_height: 0,
+        relay: false,
+    };
+    let _live = peers.register_net(
+        placeholder,
+        live,
+        placeholder,
+        &ver,
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    let a: SocketAddr = "45.6.0.1:8333".parse().unwrap();
+    let shared = onion_book(&[a], onion);
+    refill_outbound_full_relay(&NodeConfig::default(), &peers, &shared, 2);
+    assert_eq!(
+        dial_strings(&mut rx),
+        vec![a.to_string()],
+        "a live onion outbound keeps the single slot on clearnet"
+    );
+}
+
+/// Stale rotation picks its replacement before it disconnects the evicted
+/// peer. When that peer is the only onion session, the replacement may be
+/// an overlay row, and the evicted onion is not dialed again.
+#[test]
+fn stale_rotation_replaces_the_only_onion_peer_with_an_overlay() {
+    let peers = rbitcoin_net::PeerHub::new();
+    let live: rbitcoin_net::NetAddr =
+        "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion:8333"
+            .parse()
+            .unwrap();
+    let onion: rbitcoin_net::NetAddr =
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+            .parse()
+            .unwrap();
+    let placeholder: SocketAddr = "0.0.0.0:8333".parse().unwrap();
+    let clear: SocketAddr = "45.8.0.1:8333".parse().unwrap();
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: bitcoin::p2p::PROTOCOL_VERSION,
+        services: bitcoin::p2p::ServiceFlags::NONE,
+        timestamp: 0,
+        receiver: bitcoin::p2p::Address::new(&placeholder, bitcoin::p2p::ServiceFlags::NONE),
+        sender: bitcoin::p2p::Address::new(&placeholder, bitcoin::p2p::ServiceFlags::NONE),
+        nonce: 0,
+        user_agent: String::new(),
+        start_height: 0,
+        relay: false,
+    };
+    let evicted = peers.register_net(
+        placeholder,
+        live,
+        placeholder,
+        &ver,
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    let _clear = peers.register(clear, clear, &ver, false, PeerConnType::OutboundFullRelay);
+    let mut book = AddrMan::new();
+    book.set_onion_reachable(true);
+    book.add("45.9.0.1:8333".parse().unwrap());
+    book.add_addr(live);
+    book.add_addr(onion);
+    let shared = Arc::new(std::sync::Mutex::new(book));
+    assert_eq!(
+        stale_follow_replacement(&peers, &shared, evicted.id),
+        vec![onion],
+        "evicting the only onion peer frees the overlay slot, not its address"
     );
 }
 
@@ -1983,6 +2576,214 @@ async fn regtest_datadir_refuses_mainnet_before_peers_and_rpc() {
     assert!(
         std::net::TcpStream::connect_timeout(&rpc, Duration::from_millis(200)).is_err(),
         "rpc accepted a connection"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn tiny_signet(dir: &std::path::Path, challenge: Option<&str>) -> NodeConfig {
+    let mut cfg = NodeConfig::default()
+        .with_datadir(dir)
+        .with_network(rbitcoin_primitives::Network::Signet)
+        .with_tiny_heads();
+    cfg.signet_challenge =
+        challenge.map(|c| rbitcoin_node::config::parse_signet_challenge(c).unwrap());
+    cfg
+}
+
+fn open_and_close(cfg: NodeConfig) -> Result<(), rbitcoin_node::NodeError> {
+    run_node(cfg)?.shutdown()
+}
+
+/// Every signet shares one genesis, so only the recorded message start tells
+/// two signets' datadirs apart.
+#[test]
+fn datadir_reopens_under_the_signet_it_was_created_for() {
+    let dir = scratch_dir("net-same");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("same challenge reopens");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn datadir_refuses_a_different_signet_challenge() {
+    let dir = scratch_dir("net-other");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    let err = open_and_close(tiny_signet(&dir, Some("52"))).unwrap_err();
+    let started = rbitcoin_consensus::signet_magic(
+        rbitcoin_node::config::parse_signet_challenge("52")
+            .unwrap()
+            .as_script(),
+    );
+    let stored = rbitcoin_consensus::signet_magic(
+        rbitcoin_node::config::parse_signet_challenge("51")
+            .unwrap()
+            .as_script(),
+    );
+    let text = err.to_string();
+    assert!(text.contains("Wrong datadir for network?"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "stored network signet {}",
+            bitcoin::p2p::Magic::from_bytes(stored)
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "started network signet {}",
+            bitcoin::p2p::Magic::from_bytes(started)
+        )),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn datadir_refuses_a_custom_challenge_after_the_default_signet() {
+    let dir = scratch_dir("net-default");
+    open_and_close(tiny_signet(&dir, None)).expect("default signet opens");
+    let err = open_and_close(tiny_signet(&dir, Some("51"))).unwrap_err();
+    assert!(
+        err.to_string().contains("stored network signet 0a03cf40"),
+        "{err}"
+    );
+    let err = open_and_close(tiny_signet(&dir, Some(""))).unwrap_err();
+    assert!(
+        err.to_string().contains("Wrong datadir for network?"),
+        "{err}"
+    );
+    open_and_close(tiny_signet(&dir, None)).expect("default signet reopens");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A datadir from before the marker has no record of its network. The node
+/// adopts the started one, says so, and refuses a different one afterwards.
+#[test]
+fn datadir_without_a_marker_adopts_the_started_network() {
+    let dir = scratch_dir("net-legacy");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    std::fs::remove_file(dir.join(NETWORK_MARKER)).expect("marker written on create");
+    rbitcoin_log::capture_logs(true);
+    let reopened = open_and_close(tiny_signet(&dir, Some("51")));
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    reopened.expect("legacy datadir opens");
+    assert!(
+        lines
+            .iter()
+            .any(|(_, l)| l.contains("no network marker") && l.contains("adopting signet")),
+        "no adopt line in {lines:?}"
+    );
+    assert!(open_and_close(tiny_signet(&dir, Some("52"))).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A refused start leaves no marker, so the datadir still opens on its own
+/// network.
+#[test]
+fn foreign_genesis_refusal_does_not_adopt_the_started_network() {
+    let dir = scratch_dir("net-no-adopt");
+    plant_regtest_genesis(&dir);
+    let mainnet = tiny_regtest(&dir).with_network(rbitcoin_primitives::Network::Mainnet);
+    assert!(open_and_close(mainnet).is_err());
+    assert!(!dir.join(NETWORK_MARKER).exists());
+    open_and_close(tiny_regtest(&dir)).expect("regtest datadir still opens");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every signet shares one genesis, so a datadir from before the marker
+/// takes whichever challenge its first start passes. The other one is then
+/// refused, including the challenge the datadir was really made for.
+#[test]
+fn legacy_signet_datadir_adopts_the_first_challenge_it_is_started_with() {
+    let dir = scratch_dir("net-legacy-first");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    std::fs::remove_file(dir.join(NETWORK_MARKER)).expect("marker written on create");
+    open_and_close(tiny_signet(&dir, Some("52"))).expect("legacy datadir adopts 52");
+    let err = open_and_close(tiny_signet(&dir, Some("51"))).unwrap_err();
+    assert!(
+        err.to_string().contains("Wrong datadir for network?"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A torn marker write leaves an empty file. That adopts, like a missing
+/// marker, instead of locking the datadir out on every later start.
+#[test]
+fn empty_marker_adopts_the_started_network() {
+    let dir = scratch_dir("net-empty");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    std::fs::write(dir.join(NETWORK_MARKER), "").unwrap();
+    rbitcoin_log::capture_logs(true);
+    let reopened = open_and_close(tiny_signet(&dir, Some("51")));
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    reopened.expect("empty marker adopts");
+    assert!(
+        lines.iter().any(|(_, l)| l.contains("adopting signet")),
+        "no adopt line in {lines:?}"
+    );
+    assert!(open_and_close(tiny_signet(&dir, Some("52"))).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The marker write is synced: the datadir entry for the renamed file is
+/// fsynced before the store opens for work.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn marker_write_syncs_the_datadir() {
+    let dir = scratch_dir("net-sync");
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let opened = open_and_close(tiny_signet(&dir, Some("51")));
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    opened.expect("first open");
+    assert!(synced.contains(&dir), "datadir not fsynced: {synced:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A symlinked temp file is not followed: its target keeps its bytes.
+#[cfg(unix)]
+#[test]
+fn marker_write_does_not_follow_a_temp_symlink() {
+    let dir = scratch_dir("net-tmp-link");
+    let victim = dir.join("victim");
+    std::fs::write(&victim, "keep me\n").unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::os::unix::fs::symlink(&victim, dir.join(format!("{NETWORK_MARKER}.tmp"))).unwrap();
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me\n");
+    assert!(!std::fs::symlink_metadata(dir.join(NETWORK_MARKER))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A huge or symlinked marker is refused without loading it into the error.
+#[cfg(unix)]
+#[test]
+fn oversized_or_symlinked_marker_refuses_with_a_short_error() {
+    let dir = scratch_dir("net-huge");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    let huge = "x".repeat(1 << 20);
+    std::fs::write(dir.join(NETWORK_MARKER), &huge).unwrap();
+    let err = open_and_close(tiny_signet(&dir, Some("51"))).unwrap_err();
+    assert!(
+        err.to_string().len() < 512,
+        "error carries the file: {} bytes",
+        err.to_string().len()
+    );
+
+    let target = dir.join("elsewhere");
+    std::fs::write(&target, &huge).unwrap();
+    std::fs::remove_file(dir.join(NETWORK_MARKER)).unwrap();
+    std::os::unix::fs::symlink(&target, dir.join(NETWORK_MARKER)).unwrap();
+    let err = open_and_close(tiny_signet(&dir, Some("51"))).unwrap_err();
+    assert!(
+        err.to_string().len() < 512,
+        "error carries the file: {} bytes",
+        err.to_string().len()
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

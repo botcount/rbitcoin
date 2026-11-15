@@ -179,6 +179,23 @@ fn two_spills_fold_repeat_key_to_zero_without_sort() {
 }
 
 #[test]
+fn keys_spill_header_counts_select_the_key() {
+    let mut bytes = vec![0u8; KEYS_SPILL_HDR];
+    bytes[..8].copy_from_slice(KEYS_SPILL_MAGIC);
+    bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+    bytes[12..16].copy_from_slice(&0u32.to_le_bytes());
+    let key = std::array::from_fn(|i| (i as u8).wrapping_add(1));
+    bytes.extend_from_slice(&key);
+    let mut map = Key16PackMap::default();
+    fold_keys_spill_bytes(&mut map, &bytes).unwrap();
+    assert_eq!(map.get(&key).copied(), Some(0));
+    match fold_keys_spill_bytes(&mut map, &bytes[..15]) {
+        Err(StoreError::Corrupt(_)) => {}
+        other => panic!("short spill header must refuse, got {other:?}"),
+    }
+}
+
+#[test]
 fn keys_spill_magic_wrong_refuses() {
     let dir = rbitcoin_store::testutil::TempDir::labeled("sh-bad-magic").expect("temp");
     std::fs::create_dir_all(unsorted_keys_path(dir.path(), 0)).unwrap();
@@ -565,4 +582,79 @@ fn posts_spill_fallocate_padding_refuses() {
         }
         other => panic!("fallocate padding must refuse, got {other:?}"),
     }
+}
+
+#[test]
+fn fold_posts_spill_bytes_reads_key_count_and_refuses_short() {
+    let mut map = PostPackMap::default();
+    let k = prefix_key(12);
+    insert_post_fk(&mut map, k, 4);
+    insert_post_fk(&mut map, k, 9);
+    let bytes = encode_posts_spill(&map);
+    let mut round = PostPackMap::default();
+    fold_posts_spill_bytes(&mut round, &bytes).unwrap();
+    assert_eq!(
+        round.map.get(&k).map(|v| v.as_slice()),
+        Some(&[4u64, 9][..])
+    );
+    match fold_posts_spill_bytes(&mut PostPackMap::default(), &bytes[..POSTS_SPILL_HDR]) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("posts spill truncated"), "{m}");
+        }
+        other => panic!("header without keys must truncate, got {other:?}"),
+    }
+    match fold_posts_spill_bytes(&mut PostPackMap::default(), &bytes[..POSTS_SPILL_HDR - 1]) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("wipe store/scripthash.unsorted"), "{m}");
+        }
+        other => panic!("short spill must refuse, got {other:?}"),
+    }
+    let mut bad = bytes.clone();
+    bad[0] = b'X';
+    match fold_posts_spill_bytes(&mut PostPackMap::default(), &bad) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("wipe store/scripthash.unsorted"), "{m}");
+        }
+        other => panic!("bad magic must refuse, got {other:?}"),
+    }
+}
+
+#[test]
+fn key16_hasher_reads_sixteen_and_skips_short() {
+    let mut k = [0u8; KEY16_LEN];
+    k[0..8].copy_from_slice(&9u64.to_le_bytes());
+    k[8..16].copy_from_slice(&4u64.to_le_bytes());
+    let mut h = Key16IdentityHasher::default();
+    h.write(&k);
+    assert_eq!(h.finish(), 9 ^ 4);
+    h.write(&[1, 2, 3, 4]);
+    assert_eq!(h.finish(), 9 ^ 4);
+}
+
+#[test]
+fn phase_done_reads_the_last_fk_and_ignores_a_short_file() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-phase-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    write_phase_done(&dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, 42, &[3, 4]).unwrap();
+    assert_eq!(
+        read_phase_done(&dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, 2).map(|d| d.counts),
+        Some(vec![3, 4])
+    );
+    assert_eq!(unsorted_done_last_fk(&dir, 2), Some(42));
+    let path = dir.join(KEYS_DONE_NAME);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.truncate(20);
+    std::fs::write(&path, &bytes).unwrap();
+    assert_eq!(unsorted_done_last_fk(&dir, 2), None);
+    std::fs::write(&path, b"SHKEYS02").unwrap();
+    assert_eq!(unsorted_done_last_fk(&dir, 2), None);
+    let _ = std::fs::remove_dir_all(&dir);
 }

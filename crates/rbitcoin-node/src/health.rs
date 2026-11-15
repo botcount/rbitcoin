@@ -14,6 +14,10 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
+use rbitcoin_electrum::{LISTEN_DOWN, LISTEN_OFF};
 use rbitcoin_log::{info, progress, warn};
 use rbitcoin_net::{BlockingRegion, ChainHub, MempoolHub, PeerHub};
 use rbitcoin_primitives::Network;
@@ -30,9 +34,14 @@ use tower_http::timeout::TimeoutLayer;
 /// past this a probe answers 503 at once instead of queueing.
 #[doc(hidden)]
 pub const READYZ_IN_FLIGHT: usize = 4;
-/// Per-request wall. Probe timeouts are usually 1s.
+/// Per-request wall. Probe timeouts are usually 1s. Also the header read
+/// deadline for a connection that sends nothing.
 #[doc(hidden)]
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Accepted health connections. Not a knob. Idle TCP is closed at
+/// [`REQUEST_TIMEOUT`], so this is not only an in-flight request cap.
+#[doc(hidden)]
+pub const HEALTH_MAX_CONNECTIONS: usize = 64;
 /// Tip and scripthash index lag that `/readyz` still calls ready.
 pub const READY_LAG_BLOCKS: u32 = 6;
 
@@ -99,6 +108,8 @@ pub struct NodeStatus {
     pub peers: OnceLock<Arc<PeerHub>>,
     pub mempool: OnceLock<Arc<MempoolHub>>,
     pub sv2: OnceLock<Arc<rbitcoin_sv2::Sv2TpStats>>,
+    /// [`LISTEN_OFF`], [`rbitcoin_electrum::LISTEN_UP`], or [`LISTEN_DOWN`].
+    pub electrum_listen: Arc<AtomicU8>,
 }
 
 impl NodeStatus {
@@ -112,6 +123,7 @@ impl NodeStatus {
             peers: OnceLock::new(),
             mempool: OnceLock::new(),
             sv2: OnceLock::new(),
+            electrum_listen: Arc::new(AtomicU8::new(LISTEN_OFF)),
         })
     }
 
@@ -149,6 +161,7 @@ impl NodeStatus {
             tip_age_secs: None,
             max_tip_age_secs: 0,
             sh_lag: None,
+            electrum_listen: self.electrum_listen.load(Ordering::Acquire),
         };
         if phase != Phase::Following {
             return snap;
@@ -182,6 +195,8 @@ pub struct ReadySnapshot {
     pub max_tip_age_secs: u64,
     /// `None` without `--sh-index`.
     pub sh_lag: Option<u32>,
+    /// Electrum accept task: off, up, or down.
+    pub electrum_listen: u8,
 }
 
 /// `Ok` when ready; otherwise the first failing gate, in check order.
@@ -189,6 +204,9 @@ pub struct ReadySnapshot {
 pub fn readiness(s: &ReadySnapshot) -> Result<(), String> {
     if s.phase != Phase::Following {
         return Err(s.phase.as_str().to_string());
+    }
+    if s.electrum_listen == LISTEN_DOWN {
+        return Err("electrum listener down".into());
     }
     if s.in_ibd {
         return Err("initial block download".into());
@@ -243,8 +261,50 @@ pub async fn run_health(
     }
     let app = router(status, metrics);
     let task = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
-            warn!("health: serve ended: {e}");
+        let sem = Arc::new(Semaphore::new(HEALTH_MAX_CONNECTIONS));
+        struct StopConns(Vec<JoinHandle<()>>);
+        impl Drop for StopConns {
+            fn drop(&mut self) {
+                for task in self.0.drain(..) {
+                    task.abort();
+                }
+            }
+        }
+        let mut conns = StopConns(Vec::new());
+        loop {
+            match listener.accept().await {
+                Ok((io, peer)) => {
+                    conns.0.retain(|t| !t.is_finished());
+                    if !rbitcoin_net::listen::listener_fd_room() {
+                        warn!("health: reject {peer} (descriptor reserve)");
+                        drop(io);
+                        continue;
+                    }
+                    let Ok(permit) = sem.clone().try_acquire_owned() else {
+                        warn!(
+                            "health: reject {peer} (at max connections={HEALTH_MAX_CONNECTIONS})"
+                        );
+                        drop(io);
+                        continue;
+                    };
+                    let service = TowerToHyperService::new(app.clone());
+                    conns.0.push(tokio::spawn(async move {
+                        let _permit = permit;
+                        let mut http = http1::Builder::new();
+                        http.timer(TokioTimer::new())
+                            .header_read_timeout(REQUEST_TIMEOUT);
+                        let _ = http.serve_connection(TokioIo::new(io), service).await;
+                    }));
+                }
+                Err(e) => {
+                    if rbitcoin_net::service::accept_error_ends_listen(&e) {
+                        warn!("health: accept ended: {e}");
+                        break;
+                    }
+                    warn!("health: accept retry: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
         }
     });
     info!("health HTTP on {local_addr}");

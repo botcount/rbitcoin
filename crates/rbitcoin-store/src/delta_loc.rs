@@ -7,7 +7,7 @@ use crate::error::StoreError;
 use crate::file::{
     leading_header_bytes, write_synced_tmp_rename, GrowPolicy, TableFile, FILE_HEADER_LEN,
 };
-use rbitcoin_primitives::{Fk, TableKind, SCHEMA_VERSION};
+use rbitcoin_primitives::{le_u16, le_u32, le_u64, Fk, TableKind, SCHEMA_VERSION};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
@@ -83,7 +83,7 @@ pub(crate) fn unresolved_ovf_cut(
     if ovf.pread_all(ovf.logical_len(), &mut row[..width]).is_err() {
         return Ok(None);
     }
-    cut_for_ovf_row(loc, count, last_ovf_fk, &row[..width], pair)
+    cut_for_ovf_row(loc, count, last_ovf_fk, &row, pair)
 }
 
 /// Creates covered while the overflow header lags the RAM end.
@@ -111,7 +111,7 @@ pub(crate) fn withheld_ovf_limit(
     let last_ovf_fk = if durable_data >= width {
         let mut row = [0u8; 16];
         ovf.pread_all(durable_end - width, &mut row[..width as usize])?;
-        u64::from_le_bytes(row[0..8].try_into().unwrap())
+        le_u64!(row, 0)
     } else {
         0
     };
@@ -135,17 +135,17 @@ fn ovf_row_cut(
     let width = if pair { 16 } else { 12 };
     let mut row = [0u8; 16];
     ovf.pread_all(row_at, &mut row[..width])?;
-    cut_for_ovf_row(loc, count, last_ovf_fk, &row[..width], pair)
+    cut_for_ovf_row(loc, count, last_ovf_fk, &row, pair)
 }
 
 fn cut_for_ovf_row(
     loc: &TableFile,
     count: u64,
     last_ovf_fk: u64,
-    row: &[u8],
+    row: &[u8; 16],
     pair: bool,
 ) -> Result<Option<u64>, StoreError> {
-    let fk = u64::from_le_bytes(row[0..8].try_into().unwrap());
+    let fk = le_u64!(row, 0);
     if fk == 0 || fk <= last_ovf_fk || fk > count {
         return Ok(None);
     }
@@ -157,10 +157,10 @@ fn cut_for_ovf_row(
     Ok(Some(fk.saturating_sub(1)))
 }
 
-fn ovf_row_matches_slot(row: &[u8], slot: &[u8; 2], pair: bool) -> bool {
+fn ovf_row_matches_slot(row: &[u8; 16], slot: &[u8; 2], pair: bool) -> bool {
     if pair {
-        let strides = u32::from_le_bytes(row[8..12].try_into().unwrap());
-        let n_out = u32::from_le_bytes(row[12..16].try_into().unwrap());
+        let strides = le_u32!(row, 8);
+        let n_out = le_u32!(row, 12);
         if slot[0] != 0 && u32::from(slot[0]) != strides {
             return false;
         }
@@ -174,7 +174,7 @@ fn ovf_row_matches_slot(row: &[u8], slot: &[u8; 2], pair: bool) -> bool {
     if slot[0] != 0 || slot[1] != 0 {
         return false;
     }
-    u32::from_le_bytes(row[8..12].try_into().unwrap()) >= 65536
+    le_u32!(row, 8) >= 65536
 }
 
 #[doc(hidden)]
@@ -295,6 +295,10 @@ impl DeltaLoc {
     }
 
     pub fn open(dir: &Path, stem: &str) -> Result<Self, StoreError> {
+        Self::open_inner(dir, stem)
+    }
+
+    fn open_inner(dir: &Path, stem: &str) -> Result<Self, StoreError> {
         let loc = open_loc_file(&dir.join(format!("{stem}.loc")), TableKind::DeltaLoc)?;
         let ovf_path = dir.join(format!("{stem}.loc.ovf"));
         let ovf = if ovf_path.exists() {
@@ -316,8 +320,9 @@ impl DeltaLoc {
         if n_win > 0 {
             let mut bytes = vec![0u8; (n_win * 8) as usize];
             off.read_at(FILE_HEADER_LEN as u64, &mut bytes)?;
-            for (i, chunk) in bytes.chunks_exact(8).enumerate() {
-                checkpoints[i] = u64::from_le_bytes(chunk.try_into().unwrap());
+            let (rows, _) = bytes.as_chunks::<8>();
+            for (i, row) in rows.iter().enumerate() {
+                checkpoints[i] = le_u64!(row, 0);
             }
         }
         let ovf_rows = load_u16_ovf(&ovf)?;
@@ -334,6 +339,9 @@ impl DeltaLoc {
                 CREATE_OVF_MISSING
             },
         };
+        // A short checkpoint is an unpublished append tail, including when
+        // the prune sidecar already exists. The cut publishes locator length
+        // 0 before it shrinks the checkpoint, so that crash is count 0 here.
         opened.truncate_to_count(count)?;
         // A row past the overflow header belongs to a create this file does not name.
         let last_ovf = opened
@@ -355,12 +363,34 @@ impl DeltaLoc {
         self.count.load(Ordering::Acquire)
     }
 
+    /// Publish loc length 0 and sync it, then shrink the checkpoint files.
+    ///
+    /// [`Self::truncate_to_count`] shrinks the checkpoint first. A crash in
+    /// that window leaves a long locator and a header-only checkpoint, and
+    /// the next open keeps only 1023 creates. Length 0 is the finished prune
+    /// cut, so a crash after this sync keeps the chain.
+    pub fn truncate_to_zero_header_first(&self) -> Result<(), StoreError> {
+        let header = FILE_HEADER_LEN as u64;
+        if self.loc.logical_len() != header {
+            self.loc.set_logical_len(header)?;
+            self.loc.flush()?;
+        }
+        self.checkpoints
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.count.store(0, Ordering::Release);
+        self.fit_off_and_ovf(0)?;
+        Ok(())
+    }
+
     pub fn truncate_to_count(&self, new_count: u64) -> Result<(), StoreError> {
         let cur = self.count.load(Ordering::Acquire);
         if new_count > cur {
             return Err(StoreError::Corrupt("seqsigwit.loc truncate past count"));
         }
         // Off and the overflow file never outlive the loc header.
+        // Zero on the prune cut uses [`Self::truncate_to_zero_header_first`].
         self.fit_off_and_ovf(new_count)?;
         if new_count == cur {
             return Ok(());
@@ -594,14 +624,14 @@ impl DeltaLoc {
         let mut out = vec![None; plan.out_len];
         for win in &plan.windows {
             let (buf, n) = (&win.buf, win.n);
+            let (rows, _) = buf.as_chunks::<2>();
             let mut ps = vec![0u64; n + 1];
             ps[0] = win.win_start;
-            let any_ovf =
-                (0..n).any(|i| u16::from_le_bytes(buf[i * 2..i * 2 + 2].try_into().unwrap()) == 0);
+            let any_ovf = rows.iter().any(|row| le_u16!(row, 0) == 0);
             if any_ovf {
                 let ovf = self.ovf_rows.read().unwrap_or_else(|e| e.into_inner());
-                for i in 0..n {
-                    let disk = u16::from_le_bytes(buf[i * 2..i * 2 + 2].try_into().unwrap());
+                for (i, row) in rows.iter().enumerate() {
+                    let disk = le_u16!(row, 0);
                     let strides = if disk == 0 {
                         ovf_lookup_strides(&ovf, win.win_first + i as u64, self.missing)?
                     } else {
@@ -610,8 +640,8 @@ impl DeltaLoc {
                     ps[i + 1] = ps[i].saturating_add(u64::from(strides).saturating_mul(IDX_STRIDE));
                 }
             } else {
-                for i in 0..n {
-                    let disk = u16::from_le_bytes(buf[i * 2..i * 2 + 2].try_into().unwrap());
+                for (i, row) in rows.iter().enumerate() {
+                    let disk = le_u16!(row, 0);
                     ps[i + 1] = ps[i].saturating_add(u64::from(disk).saturating_mul(IDX_STRIDE));
                 }
             }
@@ -680,9 +710,10 @@ pub fn load_u16_ovf(ovf: &TableFile) -> Result<Vec<(u64, u32)>, StoreError> {
     ovf.read_at(FILE_HEADER_LEN as u64, &mut bytes)?;
     let mut rows = Vec::with_capacity(n);
     let mut prev = 0u64;
-    for chunk in bytes.chunks_exact(12) {
-        let fk = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
-        let strides = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+    let (raw, _) = bytes.as_chunks::<12>();
+    for row in raw {
+        let fk = le_u64!(row, 0);
+        let strides = le_u32!(row, 8);
         if fk == 0 || (prev != 0 && fk <= prev) {
             return Err(StoreError::Corrupt("invariant: loc ovf order"));
         }
@@ -750,10 +781,11 @@ pub fn load_create_ovf(ovf: &TableFile) -> Result<Vec<(u64, u32, u32)>, StoreErr
     ovf.read_at(FILE_HEADER_LEN as u64, &mut bytes)?;
     let mut rows = Vec::with_capacity(n);
     let mut prev = 0u64;
-    for chunk in bytes.chunks_exact(CREATE_OVF_SLOT as usize) {
-        let fk = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
-        let strides = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
-        let n_out = u32::from_le_bytes(chunk[12..16].try_into().unwrap());
+    let (raw, _) = bytes.as_chunks::<{ CREATE_OVF_SLOT as usize }>();
+    for row in raw {
+        let fk = le_u64!(row, 0);
+        let strides = le_u32!(row, 8);
+        let n_out = le_u32!(row, 12);
         if fk == 0 || (prev != 0 && fk <= prev) {
             return Err(StoreError::Corrupt("invariant: create.loc ovf order"));
         }
@@ -804,10 +836,11 @@ pub fn migrate_create_ovf_v22_if_needed(path: &Path) -> Result<(), StoreError> {
     let n = (data / CREATE_OVF_SLOT_V22) as usize;
     let mut payload = Vec::with_capacity(n * CREATE_OVF_SLOT as usize);
     let mut prev = 0u64;
-    for chunk in bytes.chunks_exact(CREATE_OVF_SLOT_V22 as usize) {
-        let fk = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
-        let strides = u16::from_le_bytes(chunk[8..10].try_into().unwrap());
-        let n_out = u16::from_le_bytes(chunk[10..12].try_into().unwrap());
+    let (raw, _) = bytes.as_chunks::<{ CREATE_OVF_SLOT_V22 as usize }>();
+    for row in raw {
+        let fk = le_u64!(row, 0);
+        let strides = le_u16!(row, 8);
+        let n_out = le_u16!(row, 10);
         if fk == 0 || (prev != 0 && fk <= prev) {
             return Err(StoreError::Corrupt("invariant: create.loc ovf order"));
         }

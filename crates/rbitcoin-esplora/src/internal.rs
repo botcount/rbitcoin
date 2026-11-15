@@ -1,11 +1,14 @@
 //! mempool/electrs `/internal/*` bulk REST and `/mempool/txids/page`.
 
-use crate::handlers::{outspend_json, spawn_join};
+use crate::handlers::{confirmed_output_count, spawn_join, write_outspends};
 #[cfg(unix)]
-use crate::server::not_found;
+use crate::handlers::{outspend_json, resolve_address_sh, sh_info_reply};
 use crate::server::{
-    block_hash_hex, json_reply_here, parse_hash32, pin_or_reject, store_err, AppState,
+    block_hash_hex, json_bytes_reply, json_reply_here, parse_hash32, pin_or_reject, store_err,
+    AppState,
 };
+#[cfg(unix)]
+use crate::server::{not_found, AsOf};
 #[cfg(unix)]
 use crate::tx_json::{
     build_tx_json, build_tx_json_from_tx, build_tx_json_from_tx_with_status, tx_status_json,
@@ -23,6 +26,7 @@ use rbitcoin_query::ChainViewKind;
 #[cfg(unix)]
 use rbitcoin_store::StoreError;
 use serde::Deserialize;
+#[cfg(unix)]
 use serde_json::{json, Value};
 
 #[doc(hidden)]
@@ -129,7 +133,7 @@ pub fn entry_json(st: &AppState, mp: &MempoolHub, e: &MempoolTxSnapEntry) -> Opt
 #[cfg(unix)]
 #[doc(hidden)]
 pub fn confirmed_or_mempool_tx(st: &AppState, id: &[u8; 32]) -> Option<Value> {
-    if let Ok(Some((fk, _))) = st.query.get_tx_by_txid(id) {
+    if let Ok(Some(fk)) = st.query.tx_fk_by_txid(id) {
         return build_tx_json(&st.query, fk, st.network, None).ok();
     }
     mempool_tx_json(st, id)
@@ -313,41 +317,95 @@ pub async fn get_internal_block_txs(
     .await
 }
 
+/// `GET /address/:a` totals without `--max-sh-creates`, for the socket's
+/// trusted caller: an explorer seeding its own running totals for a large
+/// script once, pinned with `?asof=`. `--heavy-sh-creates` still takes turns.
+/// No join client: the lifted join never lands in a slot a public route
+/// could reuse.
+#[cfg(unix)]
+pub async fn get_internal_address(
+    State(st): State<AppState>,
+    Path(addr_s): Path<String>,
+    AsOf(asof): AsOf,
+) -> Response {
+    let Ok(sh) = resolve_address_sh(&addr_s, st.network) else {
+        return not_found();
+    };
+    spawn_join(move || {
+        let _lift = rbitcoin_query::scripthash::lift_max_sh_creates();
+        sh_info_reply(&st, &sh, Some(&addr_s), None, asof, None)
+    })
+    .await
+}
+
+/// `GET /scripthash/:h` totals without `--max-sh-creates`. See
+/// [`get_internal_address`].
+#[cfg(unix)]
+pub async fn get_internal_scripthash(
+    State(st): State<AppState>,
+    Path(sh_hex): Path<String>,
+    AsOf(asof): AsOf,
+) -> Response {
+    let Ok(sh) = parse_hash32(&sh_hex) else {
+        return not_found();
+    };
+    spawn_join(move || {
+        let _lift = rbitcoin_query::scripthash::lift_max_sh_creates();
+        sh_info_reply(&st, &sh, None, Some(&sh_hex), asof, None)
+    })
+    .await
+}
+
+/// Most txids one `POST /internal/txs/outspends/by-txid` may name.
+pub const MAX_OUTSPENDS_TXIDS: usize = 1_000;
+
+/// Most outspend slots one bulk outspends request may produce, summed over
+/// every txid (repeats included). Over it the request is a 400.
+pub const MAX_OUTSPENDS_ENTRIES: u64 = 250_000;
+
+/// One slot array per id, encoded slot by slot into the body. Output counts
+/// are summed first, and the request is refused as soon as the sum passes
+/// [`MAX_OUTSPENDS_ENTRIES`], before any slot is built.
 pub fn outspends_for_txid_opts(st: &AppState, ids: Vec<Option<[u8; 32]>>) -> Response {
+    let mp = st.mempool.as_deref();
+    let mut nouts = Vec::with_capacity(ids.len());
+    let mut total = 0u64;
+    for id in &ids {
+        let nout = match id {
+            None => 0,
+            Some(id) => match st.query.tx_fk_by_txid(id) {
+                Ok(Some(fk)) => match confirmed_output_count(&st.query, fk) {
+                    Ok(n) => n,
+                    Err(e) => return store_err(e),
+                },
+                _ => mp
+                    .and_then(|mp| mp.get_tx(&Txid::from_byte_array(*id)))
+                    .map_or(0, |tx| tx.output.len() as u32),
+            },
+        };
+        total += u64::from(nout);
+        if total > MAX_OUTSPENDS_ENTRIES {
+            return bad_request("Too many outputs requested");
+        }
+        nouts.push(nout);
+    }
     let view = match pin_or_reject(&st.query, ChainViewKind::Tip, None) {
         Ok(v) => v,
         Err(r) => return r,
     };
-    let mp = st.mempool.as_deref();
-    let mut out = Vec::with_capacity(ids.len());
-    for id in ids {
-        let Some(id) = id else {
-            out.push(json!([]));
-            continue;
-        };
-        let nout = if let Ok(Some(fk)) = st.query.tx_fk_by_txid(&id) {
-            match st.query.store().get_tx_meta_and_outputs(fk) {
-                Ok((meta, _)) => meta.output_count,
-                Err(e) => return store_err(e),
-            }
-        } else if let Some(mp) = mp {
-            let tid = Txid::from_byte_array(id);
-            mp.get_tx(&tid)
-                .map(|tx| tx.output.len() as u32)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let mut slots = Vec::with_capacity(nout as usize);
-        for vout in 0..nout {
-            match outspend_json(&st.query, mp, &id, vout, view.as_ref()) {
-                Ok(v) => slots.push(v),
-                Err(e) => return store_err(e),
-            }
+    let mut body = vec![b'['];
+    for (i, (id, nout)) in ids.iter().zip(nouts).enumerate() {
+        if i > 0 {
+            body.push(b',');
         }
-        out.push(Value::Array(slots));
+        // An unparseable id has `nout == 0`, so it writes `[]`.
+        let id = id.as_ref().unwrap_or(&[0; 32]);
+        if let Err(e) = write_outspends(&mut body, &st.query, mp, id, nout, view.as_ref()) {
+            return store_err(e);
+        }
     }
-    json_reply_here(out)
+    body.push(b']');
+    json_bytes_reply(body)
 }
 
 #[cfg(unix)]
@@ -365,6 +423,9 @@ pub async fn post_outspends_by_txid(State(st): State<AppState>, body: Bytes) -> 
             Ok(v) => v,
             Err(r) => return r,
         };
+        if ids.len() > MAX_OUTSPENDS_TXIDS {
+            return bad_request("Too many txids requested");
+        }
         outspends_for_txids(&st, ids)
     })
     .await

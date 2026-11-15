@@ -15,7 +15,7 @@
 use crate::error::MempoolError;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, Wtxid};
-use rbitcoin_primitives::{read_compact_size, write_compact_size, Fk};
+use rbitcoin_primitives::{le_u64, read_compact_size, write_compact_size, Fk};
 use rbitcoin_store::OutputRecord;
 
 #[doc(hidden)]
@@ -122,10 +122,14 @@ pub fn decode_packed(
     if buf.len() < ids + 32 + 32 + 8 {
         return Err(MempoolError::Corrupt("packed live short"));
     }
-    let fee_sat = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let weight = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    let mut head = [0u8; 16];
+    head.copy_from_slice(&buf[..16]);
+    let fee_sat = le_u64!(head, 0);
+    let weight = le_u64!(head, 8);
     let sigop_cost = if has_sigops {
-        let v = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&buf[16..24]);
+        let v = u64::from_le_bytes(word);
         // Above the block limit is unknown: covers SIGOP_COST_UNKNOWN and a
         // torn in-place write-back (0xFF.. partly overwritten, see
         // `Mempool::set_sigop_cost`), which always overestimates.
@@ -134,12 +138,18 @@ pub fn decode_packed(
         None
     };
     let accept_secs = if has_accept {
-        u64::from_le_bytes(buf[ids - 8..ids].try_into().unwrap())
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&buf[ids - 8..ids]);
+        u64::from_le_bytes(word)
     } else {
         0
     };
-    let txid = Txid::from_byte_array(buf[ids..ids + 32].try_into().unwrap());
-    let wtxid = Wtxid::from_byte_array(buf[ids + 32..ids + 64].try_into().unwrap());
+    let mut txid_bytes = [0u8; 32];
+    txid_bytes.copy_from_slice(&buf[ids..ids + 32]);
+    let mut wtxid_bytes = [0u8; 32];
+    wtxid_bytes.copy_from_slice(&buf[ids + 32..ids + 64]);
+    let txid = Txid::from_byte_array(txid_bytes);
+    let wtxid = Wtxid::from_byte_array(wtxid_bytes);
     let mut off = ids + 64;
     let version = i32::from_le_bytes(take_arr(buf, &mut off)?);
     let lock_time = u32::from_le_bytes(take_arr(buf, &mut off)?);
@@ -329,7 +339,8 @@ pub fn take_arr<const N: usize>(buf: &[u8], off: &mut usize) -> Result<[u8; N], 
     if end > buf.len() {
         return Err(MempoolError::Corrupt("packed short"));
     }
-    let arr = buf[*off..end].try_into().unwrap();
+    let mut arr = [0u8; N];
+    arr.copy_from_slice(&buf[*off..end]);
     *off = end;
     Ok(arr)
 }

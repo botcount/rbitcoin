@@ -8,6 +8,35 @@ use super::*;
 use rbitcoin_store::{output_flags, script_hash, spent_abs, IdxBodyMode, SpendSlotRun};
 use std::sync::Arc;
 
+thread_local! {
+    static MAX_SH_CREATES_LIFTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While held, an unpaged join on this thread skips `--max-sh-creates`.
+/// `--heavy-sh-creates` still applies. The Esplora unix socket's
+/// `/internal/{address,scripthash}` totals hold one for the request: the
+/// operator chose who can open that socket. Electrum, Esplora TCP, and the
+/// public routes on the socket never take one, so they keep the cap. Not
+/// `Send`: it stays on the blocking thread that runs the request.
+#[must_use]
+pub struct MaxShCreatesLifted {
+    was: bool,
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+pub fn lift_max_sh_creates() -> MaxShCreatesLifted {
+    MaxShCreatesLifted {
+        was: MAX_SH_CREATES_LIFTED.with(|c| c.replace(true)),
+        _thread: std::marker::PhantomData,
+    }
+}
+
+impl Drop for MaxShCreatesLifted {
+    fn drop(&mut self) {
+        MAX_SH_CREATES_LIFTED.with(|c| c.set(self.was));
+    }
+}
+
 /// Class A expand / spend-join wave. Bounds decoded `txout` pages in RAM.
 #[doc(hidden)]
 pub const SH_JOIN_WAVE: usize = 4096;
@@ -729,8 +758,9 @@ impl Query {
         Ok(out)
     }
 
-    /// Refuse an unpaged join above `--max-sh-creates`, then hand back the
-    /// heavy-join guard when the create count is above `--heavy-sh-creates`.
+    /// Refuse an unpaged join above `--max-sh-creates` unless this thread
+    /// holds [`MaxShCreatesLifted`], then hand back the heavy-join guard when
+    /// the create count is above `--heavy-sh-creates`.
     /// The guard is a blocking lock taken on the blocking pool. Its holder
     /// only reads the store and never waits on a client, so a waiter (even
     /// one in the same connection's batch window) always gets it once that
@@ -740,7 +770,11 @@ impl Query {
             heavy: false,
             _turn: None,
         };
-        let cap = self.max_sh_creates();
+        let cap = if MAX_SH_CREATES_LIFTED.with(std::cell::Cell::get) {
+            0
+        } else {
+            self.max_sh_creates()
+        };
         let heavy = self.heavy_sh_creates();
         if cap == 0 && heavy == 0 {
             return Ok(light);

@@ -10,7 +10,7 @@ is the newer compiler the `rust-forward` job checks. It is not the compiler
 you develop with. Later pulls move that channel forward.
 
 Operator Linux binaries stay the musl path in [`README.md`](./README.md) /
-[`OPERATOR.md`](./OPERATOR.md). This section is **developing the tree**.
+[`docs/operator/setup.md`](./docs/operator/setup.md). This section is **developing the tree**.
 
 ### Prerequisites
 
@@ -78,7 +78,7 @@ IO on Windows and Darwin.
 
 **macOS Intel vs Apple Silicon:** rustup installs a native toolchain. CI `macos` is
 `macos-26` (aarch64). You can develop on either; Release Darwin zips are **aarch64
-only** and ad-hoc signed ([`OPERATOR.md`](./OPERATOR.md)).
+only** and ad-hoc signed ([`docs/operator/setup.md`](./docs/operator/setup.md)).
 
 **WSL2:** treat it as Linux. Install rustup *inside* the distro (not the Windows
 one), clone on the Linux filesystem (`~/…`, not `/mnt/c/…`) so IO and line
@@ -90,7 +90,7 @@ An editor with **rust-analyzer** at the repo root picks up `rust-toolchain.toml`
 
 ### Core JSON (consensus tests)
 
-`cargo test` for consensus Core vectors stages Bitcoin Core **v32.1**
+`cargo test` for consensus Core vectors stages Bitcoin Core **master `d206226b`**
 `src/test/data/*.json` from `third_party/bitcoin`. If that tree is missing,
 tests run [`scripts/core-functional/init-submodule.sh`](./scripts/core-functional/init-submodule.sh)
 (sparse clone, ~16 MiB). The script needs **git**, **bash**, and **`flock`**:
@@ -312,7 +312,7 @@ Do **not** treat host or nix-shell `cargo build --release` as the operator
 binary. Musl pin, `repro-build.sh` / `repro-check.sh`, and the tag/branch
 scripts: [`docs/reproducible-builds.md`](./docs/reproducible-builds.md),
 [`docs/releases.md`](./docs/releases.md). Operator install:
-[`OPERATOR.md`](./OPERATOR.md). PR `windows` / `macos` jobs smoke native store
+[`docs/operator/setup.md`](./docs/operator/setup.md). PR `windows` / `macos` jobs smoke native store
 IO; they do not package zips. GitHub Releases:
 [`.github/workflows/release.yml`](./.github/workflows/release.yml).
 

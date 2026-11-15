@@ -85,6 +85,31 @@ pub const CTRL_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(5);
 #[doc(hidden)]
 pub const BODY_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(40);
 
+/// Body drain stops once `elapsed` reaches [`BODY_DRAIN_TIME_BUDGET`].
+#[doc(hidden)]
+pub fn body_drain_budget_spent(elapsed: Duration) -> bool {
+    elapsed >= BODY_DRAIN_TIME_BUDGET
+}
+
+/// Control drain keeps going while both the event cap and the time cap remain.
+#[doc(hidden)]
+pub fn ctrl_drain_continues(ctrl_n: u64, elapsed: Duration) -> bool {
+    ctrl_n < CTRL_DRAIN_EVENT_BUDGET && elapsed < CTRL_DRAIN_TIME_BUDGET
+}
+
+/// Another header still fits on the ordered path, including past the soft cap
+/// when the body window needs headroom.
+#[doc(hidden)]
+pub fn ordered_live_has_header_room(live: usize, need_ready_headroom: bool) -> bool {
+    live < MAX_ORDERED_HEADERS && (live < ORDERED_HEADERS_SOFT_CAP || need_ready_headroom)
+}
+
+// Perf meter only. `drain_events` is not a session result; the drain returns `Ok(true)` either way.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn count_drain_event(events: &mut u64) {
+    *events += 1;
+}
+
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 /// Non-blocking drain of archive results + peer events.
 ///
@@ -109,12 +134,12 @@ pub fn drain_ready_peer_and_body_events(
 
     let body_t0 = Instant::now();
     loop {
-        if body_t0.elapsed() >= BODY_DRAIN_TIME_BUDGET {
+        if body_drain_budget_spent(body_t0.elapsed()) {
             break;
         }
         match body_rx.try_recv() {
             Ok(ev) => {
-                events += 1;
+                count_drain_event(&mut events);
                 apply_peer_event(
                     st,
                     hub,
@@ -131,13 +156,13 @@ pub fn drain_ready_peer_and_body_events(
 
     let ctrl_t0 = Instant::now();
     let mut ctrl_n = 0u64;
-    while ctrl_n < CTRL_DRAIN_EVENT_BUDGET && ctrl_t0.elapsed() < CTRL_DRAIN_TIME_BUDGET {
+    while ctrl_drain_continues(ctrl_n, ctrl_t0.elapsed()) {
         if st.header_cmd.as_ref().is_some_and(|tx| tx.capacity() == 0) {
             break;
         }
         match ctrl_rx.try_recv() {
             Ok(ev) => {
-                events += 1;
+                count_drain_event(&mut events);
                 ctrl_n += 1;
                 apply_peer_event(
                     st,
@@ -358,7 +383,7 @@ pub fn on_headers_batch(
         }
         stored.push(hdr);
     }
-    super::header_walk::note_stored_candidate(st, hub, &stored);
+    super::header_walk::note_stored_candidate(st, hub, peer, &stored, headers.len());
     added
 }
 
@@ -421,8 +446,7 @@ pub fn on_known_headers_batch(
         4096,
     );
     let lag = header_lag_behind_peers(st, hub.tip_height().unwrap_or(0));
-    if live < MAX_ORDERED_HEADERS
-        && (live < ORDERED_HEADERS_SOFT_CAP || need_ready_headroom)
+    if ordered_live_has_header_room(live, need_ready_headroom)
         && should_advance_locator_after_known_batch(
             live,
             lag,
@@ -677,8 +701,15 @@ pub fn plan_header_batch(
             mark.outer_len,
         );
     }
+    let clock_refused = st.header_walk.clock_refused;
+    // Failed proof disconnects in `plan_header_reply`. This mark is the
+    // low-work miss, so a proof failure must not take it. Headers that do
+    // not connect still have a target, and those are stored.
+    let bad_pow = headers
+        .iter()
+        .any(|hdr| hdr.validate_pow(hdr.target()).is_err());
     let plan = plan_header_reply(st, hub, peer, headers);
-    if matches!(plan, HeaderPlan::Done) {
+    if matches!(plan, HeaderPlan::Done) && !clock_refused && !bad_pow {
         finish_mark(st, hub, peer, &mark);
     }
     (mark, plan)
@@ -691,6 +722,23 @@ pub fn plan_header_reply(
     peer: usize,
     headers: Vec<bitcoin::block::Header>,
 ) -> HeaderPlan {
+    // Failed proof is not a low-work miss. Drop the sender and the ask so
+    // the next live peer can walk. Leaving the ask in flight blocks that peer.
+    if headers
+        .iter()
+        .any(|hdr| hdr.validate_pow(hdr.target()).is_err())
+    {
+        let _ = super::header_walk::take_header_ask(st, peer);
+        super::header_walk::forget_walk_peer(st, peer);
+        super::header_walk::punish_header_peer(st, peer);
+        return HeaderPlan::Done;
+    }
+    if st.header_walk.clock_refused {
+        if st.header_walk.probe_open != Some(peer) {
+            let _ = super::header_walk::take_header_ask(st, peer);
+        }
+        return HeaderPlan::Done;
+    }
     // A batch that crossed this peer's open probe leaves that ask in flight.
     let ask = if st.header_walk.probe_open == Some(peer) {
         super::header_walk::HeaderAsk::Unsolicited
@@ -709,22 +757,34 @@ pub fn plan_header_reply(
             HeaderPlan::Done
         };
     }
-    if super::header_walk::refuse_invalid_batch(st, peer, &headers) {
+    if super::header_walk::short_below_floor(st, hub, &headers) {
         return HeaderPlan::Done;
     }
-    let class = super::header_walk::classify(st, hub, ask, &headers);
+    let linked = super::header_walk::pow_linked(&headers);
+    super::header_walk::note_header_witness(st, hub, peer, ask, &headers, linked);
+    if super::header_walk::refuse_invalid_linked(st, peer, &headers, linked) {
+        return HeaderPlan::Done;
+    }
+    let class = super::header_walk::classify_linked(st, hub, ask, &headers, linked);
     let mut headers = headers;
     let keep = match class {
         super::header_walk::HeaderClass::WalkAbsorb => {
             let before = super::header_walk::candidate_tip(st);
-            if super::header_walk::absorb_lookahead(st, hub, peer, ask, &headers)
-                && super::header_walk::candidate_tip(st) == before
-            {
+            let absorbed = super::header_walk::absorb_lookahead(st, hub, peer, ask, &headers);
+            let extended = super::header_walk::candidate_tip(st) != before;
+            // At the soft cap the checkpoint is the record. Under it, the
+            // confirm window still stores the headers.
+            if absorbed && (!extended || st.ordered.len() >= ORDERED_HEADERS_SOFT_CAP) {
                 return HeaderPlan::Done;
             }
             headers.len()
         }
-        super::header_walk::HeaderClass::WalkStore => headers.len(),
+        super::header_walk::HeaderClass::WalkStore => {
+            if super::header_walk::store_would_pass_length(st, headers.len()) {
+                return HeaderPlan::Done;
+            }
+            headers.len()
+        }
         super::header_walk::HeaderClass::Stray => {
             let before = super::header_walk::candidate_tip(st);
             if super::header_walk::suppress_competing_chain(st, hub, peer, &headers)
@@ -785,8 +845,7 @@ pub fn complete_stored_headers(
             4096,
         );
         return batch_len >= MAX_HEADERS_RESULTS
-            && live < MAX_ORDERED_HEADERS
-            && (live < ORDERED_HEADERS_SOFT_CAP || need_ready_headroom);
+            && ordered_live_has_header_room(live, need_ready_headroom);
     }
     // A stored plan has at least one header. An empty batch never reaches here.
     on_known_headers_batch(st, hub, 0, batch_len);
@@ -961,6 +1020,15 @@ fn answer_probe(
     if st.header_walk.probe_open != Some(peer) {
         return false;
     }
+    // A failed target is not this peer's chain. Consuming it would leave
+    // them connected and queue them as the next challenge. The reply path
+    // drops that peer.
+    if headers
+        .iter()
+        .any(|hdr| hdr.validate_pow(hdr.target()).is_err())
+    {
+        return false;
+    }
     let tip = hub.tip_height().unwrap_or(0);
     let top = st.header_walk.probe_top;
     if let Some(first) = headers.first() {
@@ -992,6 +1060,17 @@ fn answer_probe(
     if !headers.is_empty() {
         note_announcement(st, peer);
         note_peer_headers(st, hub, peer, headers);
+        if !st.header_walk.proven {
+            let linked = super::header_walk::pow_linked(headers);
+            super::header_walk::note_header_witness(
+                st,
+                hub,
+                peer,
+                super::header_walk::HeaderAsk::InWindow,
+                headers,
+                linked,
+            );
+        }
         // A header this node has not seen: the peer's chain leaves this one
         // or runs past the path. The walk asks it, as after a block inv.
         let last = headers[headers.len() - 1].block_hash();
@@ -1139,14 +1218,23 @@ pub fn inject_learned_addrs(
             _ => {}
         }
         if book.add_learned_addr(a, MAX_PEER_POOL) {
-            added += 1;
+            tally_learned_addr(&mut added);
         }
     }
+    log_learned_addrs(from_peer, added, book.len());
+}
+
+// Learned-address tally only feeds the debug line. The book insert is the session result.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn tally_learned_addr(added: &mut usize) {
+    *added += 1;
+}
+
+// The total only chooses whether the debug line is emitted.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn log_learned_addrs(from_peer: usize, added: usize, book_len: usize) {
     if added > 0 {
-        rbitcoin_log::debug!(
-            "ibd: peer[{from_peer}] taught {added} addr(s); book={}",
-            book.len()
-        );
+        rbitcoin_log::debug!("ibd: peer[{from_peer}] taught {added} addr(s); book={book_len}");
     }
 }
 
@@ -1199,12 +1287,27 @@ pub fn take_confirm_events(
     let mut deferred = Vec::new();
     while let Ok(ev) = rx.try_recv() {
         match ev {
-            super::confirm::ConfirmEvent::Accepted { hash } => {
+            super::confirm::ConfirmEvent::Accepted {
+                hash,
+                height,
+                wire_bytes,
+            } => {
                 *last_progress = Instant::now();
                 st.confirm_stuck_since = None;
                 remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
                 st.body.mark_archived(hash);
                 let tip = hub.tip_height().unwrap_or(0);
+                // The write recorded this height. Do not look it up: a fork
+                // promotion can drop `hash_height` first, and a header read
+                // here runs while the coordinator holds `shared`. A rewind
+                // already marked this drain stale, so a height above the new
+                // tip is the chain that was left and must not be charged.
+                if st.confirm_quiesce == super::state::ConfirmQuiesce::Live || height <= tip {
+                    super::header_walk::note_unproven_class_a(st, height, wire_bytes);
+                    if let Some(f) = feed {
+                        f.release_lead_reserve(height);
+                    }
+                }
                 archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
                 st.max_ready_height = st.max_ready_height.max(tip);
                 max_ready_shared.store(st.max_ready_height, Ordering::Relaxed);
@@ -1239,11 +1342,13 @@ pub fn take_confirm_events(
             }
         }
     }
-    if st.confirm_quiesce {
-        if let Some(f) = feed {
-            f.clear();
+    let quiesce = std::mem::replace(&mut st.confirm_quiesce, super::state::ConfirmQuiesce::Live);
+    if let Some(f) = feed {
+        match quiesce {
+            super::state::ConfirmQuiesce::Refund => f.clear(hub.tip_height().unwrap_or(0)),
+            super::state::ConfirmQuiesce::Plan => f.drop_plan(),
+            super::state::ConfirmQuiesce::Live => {}
         }
-        st.confirm_quiesce = false;
     }
     deferred
 }
@@ -1446,7 +1551,7 @@ pub(crate) fn finish_deferred_archived_clear(
 }
 
 #[doc(hidden)]
-pub(crate) fn apply_soft_wire_reject(
+pub fn apply_soft_wire_reject(
     st: &mut IbdWorkState,
     height: u32,
     hash: BlockHash,
@@ -1639,6 +1744,16 @@ fn apply_tip_child_bad_prev(
     note_confirm_stuck(st);
 }
 
+// Clock-wait log rate only. The halt reads `cascade_at`, not this sample.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn log_time_too_new_wait(height: u32, hash: BlockHash, err: &str) {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 3 || n.is_multiple_of(60) {
+        warn!("ibd: confirm waits @{height} {hash}: {err} (n={n})");
+    }
+}
+
 #[doc(hidden)]
 pub fn apply_cascade_reject(
     st: &mut IbdWorkState,
@@ -1654,11 +1769,7 @@ pub fn apply_cascade_reject(
     // waits before it tries again, and it connects once the clock catches up.
     if super::confirm::is_time_too_new(err) {
         note_confirm_stuck(st);
-        static N: AtomicU32 = AtomicU32::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 3 || n.is_multiple_of(60) {
-            warn!("ibd: confirm waits @{height} {hash}: {err} (n={n})");
-        }
+        log_time_too_new_wait(height, hash, err);
         return;
     }
     const CASCADE_HALT_AFTER: u8 = 3;
@@ -1719,6 +1830,16 @@ pub fn apply_engine_fault_reject(
     );
 }
 
+// Consensus-invalid log rate only. Stuck, rewind, and the height map do not read it.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn log_consensus_invalid(height: u32, hash: BlockHash, err: &str) {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_multiple_of(50) {
+        warn!("ibd: confirm reject applied {hash} @{height}: {err} (consensus-invalid, count={n})");
+    }
+}
+
 #[doc(hidden)]
 pub fn apply_consensus_invalid_reject(
     st: &mut IbdWorkState,
@@ -1746,11 +1867,7 @@ pub fn apply_consensus_invalid_reject(
     }
     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
     clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-    if n <= 8 || n.is_multiple_of(50) {
-        warn!("ibd: confirm reject applied {hash} @{height}: {err} (consensus-invalid, count={n})");
-    }
+    log_consensus_invalid(height, hash, err);
     if let Some(h) = hub {
         for t in super::reorg::competing_valid_header_tips(st, h) {
             st.reorg

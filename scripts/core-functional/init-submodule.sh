@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Shallow, sparse checkout of bitcoin/bitcoin @ the inventory pin (v32.1).
+# Shallow, sparse checkout of bitcoin/bitcoin @ the inventory core_commit
+# (master at bitcoin/bitcoin#36458, after v32.1).
 # cargo test stages script_tests.json / tx_*.json from src/test/data each run.
 #
 # A git checkout already at PIN_SHA, with the corpus files and the functional
@@ -16,7 +17,7 @@ fi
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DEST="${1:-${ROOT}/third_party/bitcoin}"
-PIN_SHA="f0de87f040621468b956f01f526a43a010310501"
+PIN_SHA="d206226b4993f0330d809ca81851fb6976574ee7"
 URL="https://github.com/bitcoin/bitcoin.git"
 
 # Corpus names stage_core_json reads, plus the functional runner core-functional
@@ -49,7 +50,7 @@ if [[ -e "${DEST}/.git" || -f "${DEST}/.git" ]]; then
   if git -C "$DEST" checkout -f -q "$PIN_SHA" 2>/dev/null && have_files; then
     got="$(git -C "$DEST" rev-parse HEAD)"
     if [[ "$got" == "$PIN_SHA" ]]; then
-      echo "init-submodule: ok $got (v32.1) at $DEST"
+      echo "init-submodule: ok $got (pin) at $DEST"
       exit 0
     fi
   fi
@@ -57,11 +58,11 @@ fi
 
 if [[ ! -e "${DEST}/.git" && ! -f "${DEST}/.git" ]]; then
   git clone --filter=blob:none --sparse --depth 1 --no-checkout "$URL" "$DEST"
-  git -C "$DEST" fetch --depth 1 origin tag v32.1
+  git -C "$DEST" fetch --depth 1 origin "$PIN_SHA"
   git -C "$DEST" sparse-checkout set src/test/data test
   git -C "$DEST" checkout "$PIN_SHA"
 else
-  git -C "$DEST" fetch --depth 1 origin tag v32.1
+  git -C "$DEST" fetch --depth 1 origin "$PIN_SHA"
   git -C "$DEST" sparse-checkout set src/test/data test 2>/dev/null || true
   git -C "$DEST" checkout "$PIN_SHA"
 fi
@@ -71,4 +72,4 @@ if [[ "$got" != "$PIN_SHA" ]]; then
   echo "init-submodule: expected $PIN_SHA got $got" >&2
   exit 1
 fi
-echo "init-submodule: ok $got (v32.1) at $DEST"
+echo "init-submodule: ok $got (pin) at $DEST"

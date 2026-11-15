@@ -23,6 +23,38 @@ fn prune(m: &mut WriteCreateLocRam, written_hi: u32) {
 }
 
 #[test]
+fn cover_height_keeps_the_lower_pack_on_overlap() {
+    let mut m = WriteCreateLocRam::default();
+    m.note(2, 9, &fks(&[10, 11, 12]), &loc(&[10, 11, 12]));
+    m.note(1, 9, &fks(&[11, 12, 13]), &loc(&[21, 22, 23]));
+    assert_eq!(m.cover_height(Fk(10)), Some(2));
+    assert_eq!(m.get(Fk(10)).unwrap().txout, pair(10).txout);
+    assert_eq!(m.cover_height(Fk(11)), Some(1));
+    assert_eq!(m.get(Fk(11)).unwrap().txout, pair(21).txout);
+    assert_eq!(m.cover_height(Fk(13)), Some(1));
+    assert_eq!(m.cover_height(Fk(9)), None);
+    m.note(1, 9, &fks(&[30]), &loc(&[30]));
+    assert_eq!(m.cover_height(Fk(11)), Some(2));
+    assert_eq!(m.get(Fk(11)).unwrap().txout, pair(11).txout);
+    assert_eq!(m.cover_height(Fk(30)), Some(1));
+}
+
+#[test]
+fn cover_keeps_the_lower_pack_at_the_last_id() {
+    let mut m = WriteCreateLocRam::default();
+    m.note(2, 9, &fks(&[u64::MAX]), &loc(&[2]));
+    m.note(1, 9, &fks(&[u64::MAX - 1, u64::MAX]), &loc(&[11, 12]));
+    assert_eq!(m.cover_height(Fk(u64::MAX - 1)), Some(1));
+    assert_eq!(m.get(Fk(u64::MAX - 1)).unwrap().txout, pair(11).txout);
+    assert_eq!(m.cover_height(Fk(u64::MAX)), Some(1));
+    assert_eq!(m.get(Fk(u64::MAX)).unwrap().txout, pair(12).txout);
+    m.note(1, 9, &fks(&[u64::MAX]), &loc(&[7]));
+    assert_eq!(m.cover_height(Fk(u64::MAX)), Some(1));
+    assert_eq!(m.get(Fk(u64::MAX)).unwrap().txout, pair(7).txout);
+    assert_eq!(m.cover_height(Fk(u64::MAX - 1)), None);
+}
+
+#[test]
 fn note_get_by_fk() {
     let mut m = WriteCreateLocRam::default();
     m.note(1, 4, &fks(&[10, 11]), &loc(&[10, 11]));

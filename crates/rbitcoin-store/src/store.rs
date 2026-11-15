@@ -345,6 +345,8 @@ pub struct Store {
     /// Even while confirmed spentness is stable. Odd while a confirm annotate
     /// or a disconnect is publishing a change.
     pub utxo_view: crate::sync::atomic::AtomicU64,
+    /// One publisher at a time. Overlapping holds would make the stamp look even.
+    utxo_publish: std::sync::Mutex<()>,
     /// Confirm readers wait here while a `--datadir-hdd` write holds the spindle.
     /// Flag off never locks, so [`Self::spindle_wait`] returns immediately.
     pub spindle: Spindle,
@@ -387,6 +389,25 @@ impl Drop for SpindleHold<'_> {
 /// Holds [`Store::utxo_view`] odd until drop.
 pub struct UtxoViewGuard<'a> {
     pub view: &'a crate::sync::atomic::AtomicU64,
+    _exclusive: std::sync::MutexGuard<'a, ()>,
+}
+
+fn hold_view<'a>(
+    publish: &'a std::sync::Mutex<()>,
+    view: &'a crate::sync::atomic::AtomicU64,
+) -> UtxoViewGuard<'a> {
+    use crate::sync::atomic::Ordering;
+    let exclusive = publish.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = view.fetch_add(1, Ordering::AcqRel);
+    debug_assert_eq!(
+        prev & 1,
+        0,
+        "utxo view guards must not overlap; the counter would look stable"
+    );
+    UtxoViewGuard {
+        view,
+        _exclusive: exclusive,
+    }
 }
 
 impl Drop for UtxoViewGuard<'_> {
@@ -429,6 +450,20 @@ pub fn keep_unspent_vout_subsequence<T>(
     });
 }
 
+#[cfg(debug_assertions)]
+type SpendFreezeProbe = fn(&SpenderTable, &crate::spend_page_log::SpendPageLog);
+
+#[cfg(debug_assertions)]
+type SpendFoldProbe = fn();
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static SPEND_FREEZE_PROBE: std::cell::Cell<Option<SpendFreezeProbe>> =
+        const { std::cell::Cell::new(None) };
+    static SPEND_FOLD_PROBE: std::cell::Cell<Option<SpendFoldProbe>> =
+        const { std::cell::Cell::new(None) };
+}
+
 impl Store {
     pub fn create(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         Self::create_layout(StoreLayout::single(path.into()))
@@ -457,7 +492,6 @@ impl Store {
         } else {
             std::fs::create_dir_all(&path).map_err(|e| StoreError::io(&path, e))?;
         }
-        write_meta(&path)?;
         let seqsigwit_dir = resolve_seqsigwit_dir(&layout)?;
         let opts = layout.open_opts();
         let txs = TxTable::create_with_head_layout_seqsigwit(&path, &seqsigwit_dir, head, opts)?;
@@ -465,7 +499,7 @@ impl Store {
             write_seqsigwit_reloc(&path)?;
         }
         let cold_path = layout.is_split().then_some(seqsigwit_dir);
-        Ok(Self {
+        let store = Self {
             headers: HeaderTable::create_with_scale(&path, layout.head_scale)?,
             txs,
             spenders: SpenderTable::create(&path)?,
@@ -479,13 +513,17 @@ impl Store {
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
             spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
             utxo_view: crate::sync::atomic::AtomicU64::new(0),
+            utxo_publish: std::sync::Mutex::new(()),
             spend_marker: std::sync::Mutex::new(()),
             spindle: Spindle::new(),
             datadir_bytes_cache: std::sync::Mutex::new(None),
-            path,
+            path: path.clone(),
             cold_path,
             head_scale: layout.head_scale,
-        })
+        };
+        // Commit point. A kill before this rename-less write leaves no meta.
+        write_meta(&path)?;
+        Ok(store)
     }
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
@@ -543,6 +581,7 @@ impl Store {
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
             spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
             utxo_view: crate::sync::atomic::AtomicU64::new(0),
+            utxo_publish: std::sync::Mutex::new(()),
             spend_marker: std::sync::Mutex::new(()),
             spindle: Spindle::new(),
             datadir_bytes_cache: std::sync::Mutex::new(None),
@@ -568,10 +607,33 @@ impl Store {
     }
 
     pub fn open_or_create_layout(layout: StoreLayout) -> Result<Self, StoreError> {
-        if layout.dir.join("meta").exists() {
-            Self::open_layout(layout)
-        } else {
-            Self::create_layout(layout)
+        let dir = layout.dir.clone();
+        if !dir.join("meta").exists() {
+            if creation_has_chain(&layout) {
+                return Err(StoreError::Corrupt("store meta missing"));
+            }
+            if incomplete_creation_files(&layout) {
+                rbitcoin_log::warn!(
+                    "store: replacing incomplete first creation at {} (no meta)",
+                    dir.display()
+                );
+                clear_incomplete_creation(&layout)?;
+            }
+            return Self::create_layout(layout);
+        }
+        match Self::open_layout(layout.clone()) {
+            Ok(store) => Ok(store),
+            Err(err)
+                if !creation_has_chain(&layout) && replaces_incomplete_first_creation(&err) =>
+            {
+                rbitcoin_log::warn!(
+                    "store: replacing incomplete first creation at {} ({err})",
+                    dir.display()
+                );
+                clear_incomplete_creation(&layout)?;
+                Self::create_layout(layout)
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -890,6 +952,19 @@ impl Store {
         self.txs.for_each_script_hashes_in_fk_span(first, last, f)
     }
 
+    /// Output value sum per create for create_fks `first..=last` (coalesced span).
+    pub fn output_value_sums_in_fk_span(
+        &self,
+        first: u64,
+        last: u64,
+    ) -> Result<Vec<u64>, StoreError> {
+        self.txs.output_value_sums_in_fk_span(
+            first,
+            last,
+            crate::tx_table::SCRIPT_HASH_COLLECT_SPAN,
+        )
+    }
+
     /// Load: meta + input prevouts only (no script/output allocation).
     pub fn get_tx_meta_and_prevouts(
         &self,
@@ -1075,16 +1150,14 @@ impl Store {
 
     /// Append Class A rows from shared pin Arc + inputs (no outs reclone).
     ///
-    /// `pin` is `(TxRecord, outs)`. `spent_overlay` is per-item `(vout, spend_fk, vin)`
-    /// (empty = all zeros).
+    /// `pin` is `(TxRecord, outs)`. `spent` is the exact `spent.body` image.
     pub fn put_tx_full_batch_from_pins<P: crate::tx_table::PackedCreate>(
         &self,
         items: &[(P, Vec<crate::InputRecord>)],
         index: bool,
-        spent_overlay: &[Vec<(u32, Fk, u32)>],
+        spent: crate::tx_table::SpentBodyImage,
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
-        self.txs
-            .put_full_batch_from_pins(items, index, spent_overlay)
+        self.txs.put_full_batch_from_pins(items, index, spent)
     }
 
     #[allow(clippy::too_many_arguments)] // same wave as append_stems_one_wave
@@ -1094,7 +1167,7 @@ impl Store {
         &self,
         pins: &[&P],
         index: bool,
-        spent_overlay: &[Vec<(u32, Fk, u32)>],
+        spent: crate::tx_table::SpentBodyImage,
         txstat: &[crate::txstat::TxStatRow],
         header_ranges: &[(Fk, Fk, u32)],
         input_edges: &[Vec<crate::input::InputEdge>],
@@ -1104,7 +1177,7 @@ impl Store {
         self.txs.put_pins_encoded(
             pins,
             index,
-            spent_overlay,
+            spent,
             txstat,
             header_ranges,
             input_edges,
@@ -1206,15 +1279,24 @@ impl Store {
     /// Annotate spends using absolute 8-byte spender-meta offsets (pin layout).
     ///
     /// Tuple: `(abs_off, create_tx_fk, vout, spending_tx_fk, spending_vin)`.
-    /// Prefer io_uring RMW (read → sole/multi/promote → write); multi-list nodes
-    /// go to `spent.ovf` inline on read completion. Returns edges that still
-    /// need a full cold path (OOB abs).
+    /// One read of the current slot, then a page-log insert. A slot past the
+    /// published body is cold and is not written. Multi-list nodes go to
+    /// `spent.ovf` while the slot is decided. Returns those cold edges.
     pub fn put_spend_batch_by_abs_meta(
         &self,
         abs_edges: &[(u64, Fk, u32, Fk, u32)],
     ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
         self.txs
             .put_spend_batch_by_abs_meta(&self.spenders, abs_edges)
+    }
+
+    /// Record already-encoded spend slots in the open directory.
+    #[doc(hidden)]
+    pub fn note_open_spend_slots(
+        &self,
+        slots: &[(u64, [u8; crate::tx_table::OutputRecord::SPENT_SLOT_LEN])],
+    ) -> Result<(), StoreError> {
+        self.txs.note_historical_spend_slots(slots)
     }
 
     /// Resolve txid → Class A fk without full body decode (head probe + body txid).
@@ -1401,18 +1483,19 @@ impl Store {
             .get_spender_meta_at_abs_batch_backend(abs_offs, backend)
     }
 
-    /// Page-RMW annotate with structural-known meta.
+    /// Directory annotate with structural-known meta.
     ///
     /// `abs_edges`: `(abs_off, create_tx_fk, vout, spending_tx_fk, spending_vin)`.
     /// `known`: parallel `(field, flags, vin)` from structural spentness.
+    /// A published slot is inserted into the spend directory. This does not
+    /// read or write a `spent.body` page.
     pub fn put_spend_batch_by_abs_meta_known(
         &self,
         abs_edges: &[(u64, Fk, u32, Fk, u32)],
         known: &[(Fk, u8, u32)],
-        backend: crate::io_backend::WriteIoBackend,
     ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
         self.txs
-            .put_spend_batch_by_abs_meta_known(&self.spenders, abs_edges, known, backend)
+            .put_spend_batch_by_abs_meta_known(&self.spenders, abs_edges, known)
     }
 
     /// Spentness by create fk (no `tx.head`). Prefer known body range when available.
@@ -1530,6 +1613,17 @@ impl Store {
     /// Multi-list node count only (sole spends do not allocate body rows).
     pub fn spender_list_count(&self) -> u64 {
         self.spenders.count()
+    }
+
+    /// A sole-spender slot stays in the page log only while that spender is
+    /// still best-chain. Multi-list slots stay; `is_confirmed_strong` filters
+    /// each list member at read time.
+    fn spend_slot_still_live(&self, meta: &[u8; 8]) -> Result<bool, StoreError> {
+        let (flags, field, _) = crate::tx_table::decode_spent_slot(meta)?;
+        if field.is_null() || flags & crate::compact::output_flags::MULTI_SPENDER != 0 {
+            return Ok(true);
+        }
+        self.is_confirmed_strong(field)
     }
 
     /// True if `tx_fk` is strong **and** sits on the confirmed tip chain.
@@ -1810,9 +1904,11 @@ impl Store {
         let gen = self
             .spend_reorg_gen
             .load(std::sync::atomic::Ordering::Acquire);
-        self.txs.sync_replay_data()?;
         self.spenders.sync_data_only()?;
+        self.publish_open_spend_pages(tip, |meta| self.spend_slot_still_live(meta))?;
+        self.txs.sync_replay_data()?;
         self.store_spend_marker(tip, tip, gen)?;
+        self.fold_sealed_spend_pages()?;
         Ok(t.elapsed().as_nanos() as u64)
     }
 
@@ -1872,16 +1968,148 @@ impl Store {
     /// Odd for the guard's life. Callers who sample an even stamp and read
     /// coins can trust that read only when the stamp is unchanged afterward.
     pub fn hold_utxo_view(&self) -> UtxoViewGuard<'_> {
-        use crate::sync::atomic::Ordering;
-        let prev = self.utxo_view.fetch_add(1, Ordering::AcqRel);
-        debug_assert_eq!(
-            prev & 1,
-            0,
-            "utxo view guards must not overlap; the counter would look stable"
-        );
-        UtxoViewGuard {
-            view: &self.utxo_view,
+        hold_view(&self.utxo_publish, &self.utxo_view)
+    }
+
+    /// Block a confirm insert while the open spend directory is still at the edge cap.
+    pub fn wait_spend_edge_room(&self) {
+        self.txs.wait_spend_edge_room();
+    }
+
+    /// Directory answer for one absolute spend slot, when the log serves it.
+    #[doc(hidden)]
+    pub fn spend_directory_slot(&self, abs: u64) -> Option<[u8; 8]> {
+        self.txs.spend_log_slot(abs)
+    }
+
+    pub fn bind_spend_sync_wake(&self, wake: crate::spend_page_log::SpendSyncWake) {
+        self.txs.bind_spend_sync_wake(wake);
+    }
+
+    pub fn spend_checkpoint_early(&self) -> bool {
+        self.txs.spend_checkpoint_early()
+    }
+
+    /// The page-log commit or its freeze tip names a height above `tip`.
+    ///
+    /// Open uses this when the spend marker is not above the tip. The marker
+    /// can lag the commit, and the freeze tip can sit above the snapshot height.
+    pub fn spend_log_above(&self, tip: u32) -> bool {
+        self.txs.spend_log_above(tip)
+    }
+
+    pub fn relax_spend_pace(&self) {
+        self.txs.relax_spend_pace();
+    }
+
+    /// Run once inside the spend freeze, after the early `spent.ovf` sync.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn arm_spend_freeze_probe(probe: SpendFreezeProbe) {
+        SPEND_FREEZE_PROBE.with(|slot| slot.set(Some(probe)));
+    }
+
+    /// Drop a probe [`arm_spend_freeze_probe`] has not consumed.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn disarm_spend_freeze_probe() {
+        SPEND_FREEZE_PROBE.with(|slot| slot.set(None));
+    }
+
+    #[cfg(debug_assertions)]
+    fn take_spend_freeze_probe() -> Option<SpendFreezeProbe> {
+        SPEND_FREEZE_PROBE.with(|slot| slot.take())
+    }
+
+    /// Run once inside the cooled-page body copy, while the spindle is held.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn arm_spend_fold_probe(probe: SpendFoldProbe) {
+        SPEND_FOLD_PROBE.with(|slot| slot.set(Some(probe)));
+    }
+
+    /// Drop a probe [`arm_spend_fold_probe`] has not consumed.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn disarm_spend_fold_probe() {
+        SPEND_FOLD_PROBE.with(|slot| slot.set(None));
+    }
+
+    #[cfg(debug_assertions)]
+    fn take_spend_fold_probe() -> Option<SpendFoldProbe> {
+        SPEND_FOLD_PROBE.with(|slot| slot.take())
+    }
+
+    fn publish_open_spend_pages(
+        &self,
+        height: u32,
+        keep: impl FnMut(&[u8; 8]) -> Result<bool, StoreError>,
+    ) -> Result<(), StoreError> {
+        // Swap the open pages into `frozen`, and wake an edge-cap waiter,
+        // before the cooled-page copy. Do not stamp the tip here: a disconnect
+        // below this checkpoint, and at or above the sealed generation, must
+        // still fold. Do not clone a snapshot. The callback freeze records the
+        // one compose publishes, after the copy. That freeze is a reuse, and
+        // does not notify, when this swap moved pages. An empty swap leaves
+        // `frozen` empty, so the callback freeze is a fresh swap: it resets
+        // the edge count and notifies.
+        self.txs.widen_for_checkpoint(height);
+        let publish = &self.utxo_publish;
+        let view = &self.utxo_view;
+        let confirmed = &self.confirmed;
+        let spenders = &self.spenders;
+        {
+            let _g = hold_view(publish, view);
+            self.txs.freeze_open_spend_pages();
         }
+        self.fold_sealed_spend_pages()?;
+        self.txs.prepare_open_spend_pages(
+            height,
+            keep,
+            |log, len| {
+                {
+                    let _g = hold_view(publish, view);
+                    #[cfg(debug_assertions)]
+                    if let Some(probe) = Self::take_spend_freeze_probe() {
+                        probe(spenders, log);
+                    }
+                    let tip = confirmed.tip_height().map(|h| h.0).unwrap_or(height);
+                    log.cover_confirmed_tip(tip);
+                    log.freeze_open();
+                    log.cover_published_len(len());
+                }
+                spenders.sync_data_only()?;
+                Ok(())
+            },
+            |_log| {
+                let _g = hold_view(publish, view);
+                Ok(confirmed.tip_height().map(|h| h.0).unwrap_or(height))
+            },
+        )?;
+        self.install_prepared_spend_pages()
+    }
+
+    fn install_prepared_spend_pages(&self) -> Result<(), StoreError> {
+        let _g = hold_view(&self.utxo_publish, &self.utxo_view);
+        self.txs.install_open_spend_pages()
+    }
+
+    fn fold_sealed_spend_pages(&self) -> Result<(), StoreError> {
+        // Readers still see the committed image, so the copy does not take
+        // the utxo view. Drop the spindle before that view: disconnect takes
+        // the view and must not wait on this lock.
+        {
+            let _spindle = self.spindle_hold();
+            #[cfg(debug_assertions)]
+            if let Some(probe) = Self::take_spend_fold_probe() {
+                probe();
+            }
+            self.txs.copy_cooled_spend_pages()?;
+        }
+        // Disconnect holds this view and then sets the fold hold. Take it only
+        // to drop directory entries after the copy is durable.
+        let _g = hold_view(&self.utxo_publish, &self.utxo_view);
+        self.txs.finish_cooled_spend_pages()
     }
 
     /// `Some` even generation, or `None` while [`Self::hold_utxo_view`] is held.
@@ -1997,6 +2225,10 @@ impl Store {
         let gen = self.spend_reorg_gen.load(Ordering::Acquire);
         after_first_read(self);
         let Some(height) = self.spend_snapshot_height() else {
+            let tip = self.confirmed.tip_height().map(|h| h.0).unwrap_or(0);
+            self.spenders.sync_data_only()?;
+            self.publish_open_spend_pages(tip, |meta| self.spend_slot_still_live(meta))?;
+            self.fold_sealed_spend_pages()?;
             return Ok(());
         };
         self.sync_spend_checkpoint(height, gen, during_sync)
@@ -2024,8 +2256,9 @@ impl Store {
         during_sync: impl FnOnce(&Self),
     ) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
-        self.txs.sync_replay_data()?;
         self.spenders.sync_data_only()?;
+        self.publish_open_spend_pages(height, |meta| self.spend_slot_still_live(meta))?;
+        self.txs.sync_replay_data()?;
         during_sync(self);
         if self.spend_reorg_gen.load(Ordering::Acquire) != gen {
             return Ok(());
@@ -2046,7 +2279,8 @@ impl Store {
         let Some(height) = self.spend_height_within_class_a(height)? else {
             return Ok(());
         };
-        self.store_spend_marker(height, height, gen)
+        self.store_spend_marker(height, height, gen)?;
+        self.fold_sealed_spend_pages()
     }
 
     /// [`Self::checkpoint_observed_spend`] with hooks around the two reads
@@ -2077,9 +2311,13 @@ impl Store {
     /// annotated until its write finishes, so the checkpoint must not publish
     /// the old snapshot over it. The generation bump is what the in-flight
     /// checkpoint observes, including when this datadir has no marker file yet.
+    /// A failed commit patch still lowers both. The tip is already durable,
+    /// and the patch error is returned after that.
     pub fn clamp_spend_durable(&self) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
         self.spend_reorg_gen.fetch_add(1, Ordering::AcqRel);
+        let tip_now = self.confirmed.tip_height().map(|h| h.0).unwrap_or(0);
+        let hold = self.txs.hold_spend_fold_above(tip_now);
         let _ = self
             .spend_snapshot
             .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
@@ -2089,6 +2327,15 @@ impl Store {
                     .map_or(0, |h| cur.min(u64::from(h.0) + 1));
                 (low != cur).then_some(low)
             });
+        self.clamp_spend_marker()?;
+        hold
+    }
+
+    /// Write the spend marker down to the confirmed tip.
+    ///
+    /// No marker file means nothing has been device-flushed. Heights already
+    /// at the tip are left as they are.
+    fn clamp_spend_marker(&self) -> Result<(), StoreError> {
         let _g = self.spend_marker.lock().unwrap_or_else(|e| e.into_inner());
         let Some(marker) = crate::spend_durable::SpendDurable::load(self.path())? else {
             return Ok(());
@@ -2169,6 +2416,130 @@ impl Store {
     }
 }
 
+fn incomplete_creation_files(layout: &StoreLayout) -> bool {
+    store_dir_has_child(&layout.dir)
+        || (layout.is_split() && store_dir_has_child(layout.seqsigwit_dir()))
+}
+
+fn clear_incomplete_creation(layout: &StoreLayout) -> Result<(), StoreError> {
+    clear_store_children(&layout.dir)?;
+    if layout.is_split() {
+        clear_store_children(layout.seqsigwit_dir())?;
+    }
+    Ok(())
+}
+
+fn store_dir_has_child(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .ok()
+        .and_then(|mut rd| rd.next())
+        .is_some()
+}
+
+fn clear_store_children(dir: &Path) -> Result<(), StoreError> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(StoreError::io(dir, e)),
+    };
+    for ent in rd {
+        let ent = ent.map_err(|e| StoreError::io(dir, e))?;
+        let path = ent.path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path).map_err(|e| StoreError::io(&path, e))?;
+        } else {
+            std::fs::remove_file(&path).map_err(|e| StoreError::io(&path, e))?;
+        }
+    }
+    Ok(())
+}
+
+fn file_has_payload(path: &Path, kind: rbitcoin_primitives::TableKind, header: u64) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    match crate::file::TableFile::open(path, kind) {
+        Ok(file) => file.logical_len() > header,
+        Err(_) => unreadable_body_has_payload(path, header),
+    }
+}
+
+/// A file this open cannot parse. Zeros past `header` are empty-create slack.
+/// Any other byte, a file past one page, or a body we cannot read is payload.
+fn unreadable_body_has_payload(path: &Path, header: u64) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return true;
+    };
+    if meta.len() > 4096 {
+        return true;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return true;
+    };
+    let start = usize::try_from(header).unwrap_or(usize::MAX);
+    bytes
+        .get(start..)
+        .is_some_and(|tail| tail.iter().any(|b| *b != 0))
+}
+
+fn dir_has_chain_payload(dir: &Path) -> bool {
+    let header = crate::file::FILE_HEADER_LEN as u64;
+    file_has_payload(
+        &dir.join("txid.body"),
+        rbitcoin_primitives::TableKind::TxidBody,
+        crate::txid_body::TXID_BODY_HEADER,
+    ) || file_has_payload(
+        &dir.join("txout.body"),
+        rbitcoin_primitives::TableKind::TxOut,
+        header,
+    ) || file_has_payload(
+        &dir.join("header.body"),
+        rbitcoin_primitives::TableKind::Header,
+        header,
+    ) || file_has_payload(
+        &dir.join("confirmed.body"),
+        rbitcoin_primitives::TableKind::Confirmed,
+        header,
+    ) || file_has_payload(
+        &dir.join("seqsigwit.body"),
+        rbitcoin_primitives::TableKind::SeqSigWit,
+        header,
+    ) || file_has_payload(
+        &dir.join("spent.body"),
+        rbitcoin_primitives::TableKind::Spent,
+        header,
+    ) || file_has_payload(
+        &dir.join("input.body"),
+        rbitcoin_primitives::TableKind::Input,
+        header,
+    )
+}
+
+fn creation_has_chain(layout: &StoreLayout) -> bool {
+    dir_has_chain_payload(&layout.dir)
+        || (layout.is_split() && dir_has_chain_payload(layout.seqsigwit_dir()))
+}
+
+fn incomplete_create_corrupt(msg: &str) -> bool {
+    !(msg.starts_with("index refuses")
+        || msg.contains("store.secret")
+        || msg == PRE22_WIPE
+        || msg.contains("pre-schema-15"))
+}
+
+fn replaces_incomplete_first_creation(err: &StoreError) -> bool {
+    match err {
+        StoreError::Io { source, .. } => matches!(
+            source.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof
+        ),
+        StoreError::BadMagic | StoreError::BadKind { .. } => true,
+        StoreError::Layout(msg) => msg.contains("scripthash body layout mixed or incomplete"),
+        StoreError::Corrupt(msg) => incomplete_create_corrupt(msg),
+        _ => false,
+    }
+}
+
 #[doc(hidden)]
 pub fn write_meta(dir: &Path) -> Result<(), StoreError> {
     let path = dir.join("meta");
@@ -2201,9 +2572,12 @@ pub fn rewrite_meta_current(dir: &Path) -> Result<(), StoreError> {
             .map_err(|e| StoreError::io(&tmp, e))?;
         f.write_all(&SCHEMA_VERSION.to_le_bytes())
             .map_err(|e| StoreError::io(&tmp, e))?;
-        f.flush().map_err(|e| StoreError::io(&tmp, e))?;
+        f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
     }
     std::fs::rename(&tmp, &path).map_err(|e| StoreError::io(&path, e))?;
+    // The rename has to survive a crash before a witness cut. A 26 `meta`
+    // next to an empty witness locator is what an older binary truncates.
+    crate::file::fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e))?;
     Ok(())
 }
 

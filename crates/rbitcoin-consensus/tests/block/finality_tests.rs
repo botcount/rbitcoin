@@ -4,7 +4,8 @@ use bitcoin::{Amount, Transaction, TxOut, Witness};
 
 use bitcoin::absolute::LockTime;
 use rbitcoin_consensus::block::{
-    bip68_active_for_tx, is_final_tx, sequence_locks_satisfied, LOCKTIME_THRESHOLD,
+    bip68_active_for_tx, is_final_tx, sequence_locks_satisfied, tx_has_relative_lock,
+    LOCKTIME_THRESHOLD, SEQUENCE_LOCKTIME_TYPE_FLAG,
 };
 
 use bitcoin::{OutPoint, Sequence, TxIn};
@@ -53,6 +54,21 @@ fn bip68_height_relative_lock() {
 fn bip68_disabled_by_version_1() {
     let tx = bare_tx(1, LockTime::ZERO, Sequence::from_consensus(10));
     assert!(sequence_locks_satisfied(&tx, &[100], &[0], 50, 0));
+}
+
+#[test]
+fn sequence_locktime_type_flag_is_the_bip68_time_bit() {
+    assert_eq!(SEQUENCE_LOCKTIME_TYPE_FLAG, 1 << 22);
+}
+
+#[test]
+fn tx_has_relative_lock_follows_the_disable_bit() {
+    let lock = bare_tx(2, LockTime::ZERO, Sequence::from_consensus(10));
+    assert!(tx_has_relative_lock(&lock));
+    let off = bare_tx(2, LockTime::ZERO, Sequence::from_consensus(1 << 31));
+    assert!(!tx_has_relative_lock(&off));
+    let v1 = bare_tx(1, LockTime::ZERO, Sequence::from_consensus(10));
+    assert!(!tx_has_relative_lock(&v1));
 }
 
 /// Core treats nVersion as unsigned: 0xFFFFFFFF ≥ 2 → BIP68 enforced

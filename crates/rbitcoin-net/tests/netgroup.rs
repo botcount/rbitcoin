@@ -114,3 +114,35 @@ fn select_diverse_four_groups_max_eight() {
         .collect();
     assert_eq!(first4, vec![1, 2, 3, 4]);
 }
+
+/// Onion and I2P get their own groups, keyed by network and the first four
+/// address bits as Core does. Neither shares the `0.0.0.0` placeholder group.
+#[test]
+fn netgroup_net_keys_overlay_by_network() {
+    use rbitcoin_net::NetAddr;
+    let onion = |b: u8| NetAddr::Onion {
+        pk: [b; 32],
+        port: 8333,
+    };
+    let i2p = NetAddr::I2p {
+        dest: [0x10; 32],
+        port: 8333,
+    };
+    let placeholder = netgroup(SocketAddr::from(([0, 0, 0, 0], 8333)), None);
+    assert_eq!(
+        netgroup_net(onion(0x10), None),
+        netgroup_net(onion(0x1f), None),
+        "same first four bits share a group"
+    );
+    assert_ne!(
+        netgroup_net(onion(0x10), None),
+        netgroup_net(onion(0x20), None)
+    );
+    assert_ne!(netgroup_net(onion(0x10), None), netgroup_net(i2p, None));
+    assert_ne!(netgroup_net(onion(0x00), None), placeholder);
+    assert_ne!(netgroup_net(i2p, None), placeholder);
+    assert_eq!(
+        netgroup_net(NetAddr::Ip(v4(1, 2, 3, 4)), None),
+        netgroup(v4(1, 2, 3, 4), None)
+    );
+}

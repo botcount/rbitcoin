@@ -1,15 +1,3 @@
-fn frame_for(msg: NetworkMessage) -> FramedMessage {
-    let magic = Magic::from(Network::Regtest);
-    let raw = RawNetworkMessage::new(magic, msg);
-    let full = serialize(&raw);
-    let command: [u8; 12] = full[4..16].try_into().unwrap();
-    FramedMessage {
-        magic,
-        command,
-        payload: full[24..].to_vec(),
-    }
-}
-
 fn take_msgs(rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> Vec<NetworkMessage> {
     let mut out = Vec::new();
     while let Ok(item) = rx.try_recv() {
@@ -65,7 +53,7 @@ async fn peer_catchup_compact_reorg() {
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
     let (src_dir, src) = rbitcoin_net::chain::tiny_regtest_hub_labeled("catchup-journey-src");
     src.ensure_genesis().unwrap();
-    src.generate_to_script(160, op_true.clone(), vec![]).unwrap();
+    src.confirm_empty_regtest(160).unwrap();
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("catchup-journey-dst");
     hub.ensure_genesis().unwrap();

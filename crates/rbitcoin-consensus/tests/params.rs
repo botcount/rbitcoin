@@ -261,6 +261,50 @@ fn regtest_pow_bits_overlay_is_regtest_only_and_bounded() {
     for bad in ["", "0x", "zz", "0x123456789", "-1"] {
         assert!(ChainParams::parse_regtest_pow_bits(bad).is_err(), "{bad}");
     }
+    assert_eq!(ChainParams::parse_regtest_pow_bits("0x1"), Ok(1));
+}
+
+/// SetCompact's overflow and sign checks are not the same reject as "easier
+/// than the pow limit". The boundary values sit on one side of each compare.
+#[test]
+fn regtest_pow_bits_names_overflow_separately_from_the_pow_limit() {
+    let err = |bits: u32| {
+        let mut p = ChainParams::regtest();
+        p.apply_regtest_pow_bits(bits).unwrap_err().to_string()
+    };
+    let not_harder = "regtest_pow_bits is not harder than the regtest pow limit";
+    let overflows = "regtest_pow_bits is negative or overflows";
+    let ok = |bits: u32| {
+        let mut p = ChainParams::regtest();
+        p.apply_regtest_pow_bits(bits)
+            .expect("harder than the pow limit");
+    };
+    // Exponent 34, mantissa 1: 2^248, under the regtest limit. `exp > 34`
+    // becoming `>=` calls this an overflow.
+    ok(0x2200_0001);
+    // Exponent 33, mantissa 256: still under the limit. `exp > 33` becoming
+    // `==` or `>=` calls this an overflow.
+    ok(0x2100_0100);
+    // Exponent 33, mantissa 0xffff is above the regtest limit and is not an
+    // overflow. `mantissa > u16::MAX` becoming `>=` calls it an overflow.
+    assert_eq!(err(0x2100_ffff), not_harder);
+    assert_eq!(err(0x2300_0001), overflows);
+    assert_eq!(err(0x2200_00ff), not_harder);
+    assert_eq!(err(0x2101_0000), overflows);
+    assert_eq!(err(0x2200_0100), overflows);
+    assert_eq!(err(0x2080_0000), "regtest_pow_bits target is zero");
+}
+
+#[test]
+fn regtest_retarget_ceiling_is_all_ones_over_four_timespans() {
+    let mut params = ChainParams::regtest();
+    params.apply_regtest_retarget(1, 4).unwrap();
+    let mut ceiling = [0xffu8; 32];
+    ceiling[0] = 0x0f;
+    assert_eq!(
+        params.regtest_retarget.unwrap().ceiling.to_be_bytes(),
+        ceiling
+    );
 }
 
 /// Core `CTestNet4Params`: genesis, buried heights at 1, BIP30 on at every
@@ -306,6 +350,76 @@ fn testnet4_matches_core_chainparams() {
     ] {
         assert!(!other.enforce_bip94, "{:?}", other.network);
     }
+}
+
+/// BIP 95: the genesis block mined at mainnet height 975,744.
+#[test]
+fn testnet5_genesis_block_matches_bip95() {
+    let p = ChainParams::for_network(rbitcoin_primitives::Network::Testnet5);
+    assert_eq!(
+        p.genesis_hash,
+        block_hash_from_display_hex(
+            "00000000000008c1637e7d3252dc1c333d4546fd6fff6a474b200d674a91d497",
+        )
+    );
+    let genesis = genesis_block(&p);
+    assert_eq!(genesis.block_hash(), p.genesis_hash);
+    assert_eq!(genesis.header.version.to_consensus(), 0x2230_c000);
+    assert_eq!(genesis.header.time, 1_794_632_593);
+    assert_eq!(genesis.header.nonce, 0x653d_9131);
+    assert_eq!(genesis.header.bits.to_consensus(), 0x1a0f_ffff);
+    assert_eq!(
+        genesis.header.merkle_root.to_string(),
+        "8c5899b65c5b0834adb17af314e22a9bf067e7ed8144c37967b5ec56b5a6e28d"
+    );
+    assert!(genesis.check_merkle_root());
+    let coinbase = &genesis.txdata[0];
+    assert_eq!(
+        p.genesis_coinbase_txid,
+        bitcoin::hashes::Hash::to_byte_array(coinbase.compute_txid())
+    );
+    assert!(coinbase.input[0].script_sig.as_bytes().ends_with(
+        b"2026-11-14 975744 0000000000000000000123e2681e2f82acdcb9430a15eec24cc85b400691d479"
+    ));
+    assert_eq!(
+        rbitcoin_primitives::hex_encode(coinbase.output[0].script_pubkey.as_bytes()),
+        "6a0895ebf76a02000000"
+    );
+    assert_eq!(coinbase.output[0].value.to_sat(), 50 * 100_000_000);
+}
+
+/// BIP 95 and Core `CTestNet5Params`: a pow limit of `0x1a0fffff`, buried
+/// heights at 1, and BIP30 on at every height. No minimum-difficulty
+/// blocks, no BIP94, and no default milestone or minimum chain work yet.
+#[test]
+fn testnet5_params_match_core() {
+    let t5 = rbitcoin_primitives::Network::Testnet5;
+    let p = ChainParams::for_network(t5);
+    assert_eq!(p.pow_limit.to_compact_lossy().to_consensus(), 0x1a0f_ffff);
+    assert_eq!(
+        rbitcoin_primitives::hex_encode(p.pow_limit.to_be_bytes()),
+        "0000000000000fffff0000000000000000000000000000000000000000000000"
+    );
+    assert_eq!(p.btc.bip34_height, 1);
+    assert_eq!(p.btc.bip65_height, 1);
+    assert_eq!(p.btc.bip66_height, 1);
+    assert_eq!(p.csv_height(), 1);
+    assert_eq!(p.segwit_height(), 1);
+    assert_eq!(p.taproot_height(), 1);
+    assert!(p.bip34_hash.is_none());
+    assert!(!p.bip30_skipped_for_bip34_ancestry(2, None));
+    assert!(p.testdummy.is_none());
+    assert!(p.signet_challenge.is_none());
+    assert!(!p.allow_min_difficulty_blocks());
+    assert!(!p.no_pow_retargeting());
+    assert!(!p.enforce_bip94);
+    assert_eq!(p.difficulty_adjustment_interval(), 2016);
+    assert_eq!(p.btc.pow_target_spacing, 10 * 60);
+    assert_eq!(p.subsidy_halving_interval(), 210_000);
+
+    assert_eq!(default_milestone_height(t5), 0);
+    assert!(default_milestone_anchor(t5).is_none());
+    assert!(default_min_chain_work_be(t5).is_none());
 }
 
 /// Testnet4 runs every script by default (like signet) but ships Core's

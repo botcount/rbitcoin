@@ -115,6 +115,10 @@ impl FixtureChain for Query {
     ) -> Result<Fk, QueryError> {
         let fk = self.ensure_header(header)?;
         if self.store().header_txs.has_body(fk)? {
+            if self.prune_seqsigwit() && !txs.is_empty() {
+                let (block, _) = block_from_applies(txs);
+                self.note_pruned_archived_seqsigwit(fk, &block)?;
+            }
             return Ok(fk);
         }
         if txs.is_empty() {

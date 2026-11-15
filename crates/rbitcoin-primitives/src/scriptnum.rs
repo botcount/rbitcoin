@@ -67,14 +67,14 @@ pub fn scriptnum_decode_width(
     if require_minimal && !scriptnum_is_minimal(v) {
         return Err(ScriptNumError::NonMinimal);
     }
-    if v.is_empty() {
+    let Some((&sign, _)) = v.split_last() else {
         return Ok(0);
-    }
+    };
     let mut result: i64 = 0;
     for (i, &b) in v.iter().enumerate() {
         result |= (b as i64) << (8 * i);
     }
-    if v.last().unwrap() & 0x80 != 0 {
+    if sign & 0x80 != 0 {
         result &= !(0x80i64 << (8 * (v.len() - 1)));
         result = -result;
     }

@@ -38,10 +38,13 @@ bitcoin = { workspace = true }
 bitcoin_hashes = { workspace = true }
 serde_json = { workspace = true }
 axum = { workspace = true }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tower-http = { workspace = true }
 tokio = { workspace = true }
 mimalloc = { workspace = true }
 getrandom = "0.4"
+base64 = "0.23"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

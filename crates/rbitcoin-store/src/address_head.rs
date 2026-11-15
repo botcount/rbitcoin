@@ -43,7 +43,7 @@ use crate::error::StoreError;
 use crate::file::{TableFile, TRAILING_FOOTER_LEN};
 use crate::hashhead::HeadScale;
 use crate::readonly_map::ReadonlyMap;
-use rbitcoin_primitives::{Fk, TableKind};
+use rbitcoin_primitives::{le_u16, le_u64, Fk, TableKind};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -170,7 +170,7 @@ pub fn fingerprint(mixed: &[u8; 32], bits: u32) -> u32 {
         return 0;
     }
     let mask = (1u32 << (32 - bits)) - 1;
-    let w = u64::from_le_bytes(mixed[16..24].try_into().unwrap());
+    let w = le_u64!(mixed, 16);
     (w % u64::from(mask)) as u32 + 1
 }
 
@@ -267,7 +267,9 @@ pub fn entry_file_off(slot: u64) -> u64 {
 pub fn entry_from_page_buf(buf: &[u8], local: u64) -> Option<u64> {
     let off = (local as usize).checked_mul(ENTRY_BYTES as usize)?;
     let bytes = buf.get(off..off + ENTRY_BYTES as usize)?;
-    Some(u64::from(u32::from_le_bytes(bytes.try_into().ok()?)))
+    let mut word = [0u8; ENTRY_BYTES as usize];
+    word.copy_from_slice(bytes);
+    Some(u64::from(u32::from_le_bytes(word)))
 }
 
 /// One key's hop plus its page's occupancy (leftover-miss dump).
@@ -540,7 +542,7 @@ pub fn decode_layout_ext(ext: &[u8; 16]) -> Result<(HeadLayout, u64), StoreError
             "tx.head footer layout magic (rebuild tx.head)",
         ));
     }
-    let ver = u16::from_le_bytes([ext[4], ext[5]]);
+    let ver = le_u16!(ext, 4);
     if ver != META_VERSION {
         return Err(StoreError::Corrupt(
             "tx.head footer layout version (footer-embedded meta; rebuild tx.head)",
@@ -552,7 +554,7 @@ pub fn decode_layout_ext(ext: &[u8; 16]) -> Result<(HeadLayout, u64), StoreError
         ));
     }
     let bits = u32::from(ext[6]);
-    let generation = u64::from_le_bytes(ext[8..16].try_into().unwrap());
+    let generation = le_u64!(ext, 8);
     Ok((HeadLayout::new(bits)?, generation))
 }
 

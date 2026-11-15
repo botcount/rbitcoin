@@ -1,6 +1,7 @@
 use rbitcoin_primitives::Fk;
 use rbitcoin_query::confirm_parent_cache::*;
 use rbitcoin_store::HeaderRecord;
+use std::sync::Arc;
 
 fn header_rec(hash: [u8; 32]) -> HeaderRecord {
     HeaderRecord {
@@ -61,6 +62,20 @@ fn put_header_plan_always_stores_for_mtp() {
         .expect("header plan required for multi-block MTP");
     assert_eq!(p.header_rec.hash, [9u8; 32]);
     assert_eq!(c.header_plan_count(), 1);
+}
+
+/// Two reads of one height are the cached plan, not a copy of its tx ids.
+#[test]
+fn header_plan_read_shares_the_cached_tx_list() {
+    let c = ConfirmParentCache::new();
+    c.put_header_plan(4, Fk(4), header_rec([4u8; 32]), vec![Fk(9); 64], [0u8; 32]);
+    let a = c.get_header_plan(4).expect("plan");
+    let b = c.get_header_plan(4).expect("plan");
+    assert!(Arc::ptr_eq(&a, &b));
+    assert_eq!(a.header_rec.hash, [4u8; 32]);
+    assert_eq!(a.header_rec.timestamp, 1);
+    assert_eq!(a.header_rec.bits, 0x1d00ffff);
+    assert_eq!(a.tx_fks.len(), 64);
 }
 
 /// At/below tip must not re-enter the header map (process-owned RSS).

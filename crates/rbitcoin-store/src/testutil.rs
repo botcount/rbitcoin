@@ -13,6 +13,38 @@ use crate::Store;
 #[doc(hidden)]
 pub static SEQ: AtomicU64 = AtomicU64::new(0);
 
+fn sanitize_label(label: &str) -> String {
+    label
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn clock_tick() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// Path no other call in this process shares, including two calls in one clock tick.
+fn unique_path(label: &str, tick: u128) -> PathBuf {
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let safe = sanitize_label(label);
+    std::env::temp_dir().join(format!("rbitcoin-{safe}-{}-{tick}-{n}", std::process::id(),))
+}
+
+/// Unique path. The file or directory is not created.
+pub fn fresh_path(label: &str) -> PathBuf {
+    unique_path(label, clock_tick())
+}
+
 /// Unique directory removed on drop.
 pub struct TempDir {
     pub path: PathBuf,
@@ -24,27 +56,13 @@ impl TempDir {
     }
 
     pub fn labeled(label: &str) -> std::io::Result<Self> {
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let safe: String = label
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        let path = std::env::temp_dir().join(format!(
-            "rbitcoin-{safe}-{}-{}-{}",
-            std::process::id(),
-            nanos,
-            n
-        ));
+        Self::labeled_at(label, clock_tick())
+    }
+
+    /// `tick` is the clock sample. Two calls with the same sample still differ.
+    #[doc(hidden)]
+    pub fn labeled_at(label: &str, tick: u128) -> std::io::Result<Self> {
+        let path = unique_path(label, tick);
         std::fs::create_dir_all(&path)?;
         Ok(Self { path })
     }

@@ -322,10 +322,18 @@ async fn untrusted_header_is_ignored(q: Arc<Query>, sh1: [u8; 32]) {
 async fn template_cached_until_tip_moves(q: Arc<Query>, prev: Fk, parent: [u8; 32]) {
     let calls = Arc::new(AtomicU64::new(0));
     let c = Arc::clone(&calls);
+    let qh = Arc::clone(&q);
     let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
     cfg.block_template = Some(BlockTemplateFn(Arc::new(move || {
-        c.fetch_add(1, Ordering::Relaxed);
-        Ok(json!({"height": 1, "rules": ["segwit"]}))
+        let n = c.fetch_add(1, Ordering::Relaxed);
+        let tip = qh.tip_height().expect("tip");
+        let hash = qh.header_at_height(tip).unwrap().unwrap().1.hash;
+        Ok(json!({
+            "height": 1,
+            "rules": ["segwit"],
+            "previousblockhash": block_hash_hex(&hash),
+            "gen": n,
+        }))
     })));
     let handle = run_esplora(cfg, Arc::clone(&q), None)
         .await
@@ -338,8 +346,11 @@ async fn template_cached_until_tip_moves(q: Arc<Query>, prev: Fk, parent: [u8; 3
     );
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["height"], 1);
-    let (st, _) = http_get(handle.local_addr, "/block-template").await;
-    assert_eq!(st, 200);
+    assert_eq!(v["gen"], 0);
+    let (st, again) = http_get(handle.local_addr, "/block-template").await;
+    assert_eq!(st, 200, "{again}");
+    let again: Value = serde_json::from_str(&again).unwrap();
+    assert_eq!(again["gen"], 0, "cached body stays the first template");
     assert_eq!(calls.load(Ordering::Relaxed), 1, "15s cache");
     let (h3, t3) = coinbase(3, prev, Some(parent));
     q.connect_block(Height(3), &h3, &[t3]).unwrap();

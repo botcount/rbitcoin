@@ -1459,6 +1459,52 @@ fn pick_stale_follow_evict_prefers_duplicate_group() {
     }
 }
 
+/// An outbound onion or I2P session keys `addr` as `0.0.0.0:<port>`. Stale
+/// rotation groups by net, so two overlay peers are not one duplicate group
+/// that it evicts ahead of every clearnet peer (#1511).
+#[test]
+fn stale_follow_groups_overlay_peers_apart() {
+    use rbitcoin_net::{netgroup_net, NetAddr};
+    let hub = PeerHub::new();
+    let placeholder: SocketAddr = "0.0.0.0:8333".parse().unwrap();
+    let mut live = Vec::new();
+    for onion in [
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333",
+        "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion:8333",
+    ] {
+        let net: NetAddr = onion.parse().unwrap();
+        live.push(hub.register_net(
+            placeholder,
+            net,
+            placeholder,
+            &ver("/rbitcoin:0.1.0/"),
+            false,
+            PeerConnType::OutboundFullRelay,
+        ));
+    }
+    let clear: SocketAddr = "45.1.0.1:8333".parse().unwrap();
+    let clear = hub.register(
+        clear,
+        clear,
+        &ver("/rbitcoin:0.1.0/"),
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    let rows = hub.outbound_full_relay_rows();
+    let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
+    let groups: Vec<u64> = rows
+        .iter()
+        .map(|(_, net)| netgroup_net(*net, None))
+        .collect();
+    let picked: HashSet<u64> = (0..16u64)
+        .filter_map(|salt| pick_stale_follow_evict(&ids, salt, &groups))
+        .collect();
+    assert!(
+        picked.contains(&clear.id),
+        "two onion peers must not share one group: groups={groups:?}"
+    );
+}
+
 #[test]
 fn outbound_full_relay_ids_skips_inbound_and_noban() {
     let hub = PeerHub::new();
@@ -1487,6 +1533,54 @@ fn outbound_full_relay_ids_skips_inbound_and_noban() {
         hub.outbound_full_relay_ids().is_empty(),
         "noban hub must not offer rotate victims"
     );
+}
+
+/// Core's `GetFullOutboundConnCount` counts every outbound full-relay
+/// session. Catch-up sessions are not hub rows, so catch-up reports its
+/// count and the hub adds it. Inbound, block-relay, and `noban` do not
+/// change that sum.
+#[test]
+fn full_outbound_count_adds_catch_up_sessions() {
+    let hub = PeerHub::new();
+    let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+    let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
+    let c = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3);
+    assert_eq!(hub.full_outbound_count(), 0);
+    let _in = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
+    let _out = hub.register(
+        b,
+        b,
+        &ver("/rbitcoin:0.1.0/"),
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    let _br = hub.register(
+        c,
+        c,
+        &ver("/rbitcoin:0.1.0/"),
+        false,
+        PeerConnType::BlockRelay,
+    );
+    // Core `GetFullOutboundConnCount` counts only `fSuccessfullyConnected`.
+    let d = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4);
+    let _connecting = hub.register_connecting_net(
+        d,
+        rbitcoin_net::NetAddr::from_socket(d),
+        d,
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    assert_eq!(
+        hub.full_outbound_count(),
+        1,
+        "VERSION not done: not counted"
+    );
+    hub.set_catch_up_full_outbound(2);
+    assert_eq!(hub.full_outbound_count(), 3);
+    hub.set_noban(true);
+    assert_eq!(hub.full_outbound_count(), 3, "noban sessions still count");
+    hub.set_catch_up_full_outbound(0);
+    assert_eq!(hub.full_outbound_count(), 1);
 }
 
 fn fill_addrman(n: usize) -> rbitcoin_net::seeds::AddrMan {
@@ -1636,4 +1730,374 @@ fn concurrent_tx_relay_newcomers_keep_the_inbound_share() {
             "round {round}: tx-relaying inbounds after the checks"
         );
     }
+}
+
+#[test]
+fn second_dial_of_the_same_target_stacks() {
+    let hub = PeerHub::new();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
+    let target = DialTarget::Socket(addr);
+    let first = hub.dial_in_flight(&target);
+    let second = hub.dial_in_flight(&target);
+    let n = first
+        .counts
+        .lock()
+        .unwrap()
+        .get(&first.key)
+        .expect("in flight")
+        .n;
+    assert_eq!(n, 2, "two guards on one target count two dials");
+    drop((first, second));
+}
+
+#[test]
+fn try_evict_inbound_disconnects_one_peer() {
+    let hub = PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    for i in 0..30u8 {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(i + 1, 1, 0, 1)), 8333);
+        hub.register_connecting(addr, bind, true, PeerConnType::Inbound);
+    }
+    let before = hub.snapshot().len();
+    assert!(hub.try_evict_inbound(), "an inbound peer is evicted");
+    assert_eq!(
+        hub.snapshot().len(),
+        before - 1,
+        "eviction disconnects that peer"
+    );
+}
+
+#[test]
+fn tx_relay_room_ignores_outbound_and_non_relay() {
+    let hub = PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let newcomer = hub.register(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)), 8333),
+        bind,
+        &ver("/new/"),
+        true,
+        PeerConnType::Inbound,
+    );
+    hub.register(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(2, 0, 0, 1)), 8333),
+        bind,
+        &ver("/out/"),
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    let mut quiet = ver("/quiet/");
+    quiet.relay = false;
+    hub.register(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(3, 0, 0, 1)), 8333),
+        bind,
+        &quiet,
+        true,
+        PeerConnType::Inbound,
+    );
+    assert!(
+        hub.make_room_for_tx_relay_inbound(&newcomer, 2),
+        "outbound relay and a non-relaying inbound are outside the tx-relay cap"
+    );
+}
+
+/// A `--proxy --connect name` session carries the proxy link like a proxied IP
+/// does, so the peer is told the onion address we listen on.
+#[test]
+fn a_proxied_name_session_is_told_the_onion_we_listen_on() {
+    let (hub, _rx) = proxied_hub();
+    hub.set_discover(true);
+    hub.set_p2p_onion(
+        "24yjwaf2ni6wz44pmqpw3jyjhksoko7wxzelp6uyep2pdlgb5epbnoqd.onion".into(),
+        8333,
+    );
+    let target = hub.host_dial_target("peer.invalid:8333").unwrap();
+    let session = hub.register_connecting_net(
+        target.version_socket(),
+        target.net_addr(),
+        target.version_socket(),
+        false,
+        PeerConnType::Manual,
+    );
+    session.set_wants_addrv2();
+    match session.take_self_announce_msg() {
+        Some(NetworkMessage::AddrV2(v)) => {
+            assert!(
+                v.iter()
+                    .any(|m| matches!(m.addr, bitcoin::p2p::address::AddrV2::TorV3(_))),
+                "{v:?}"
+            );
+        }
+        other => panic!("expected the onion in an AddrV2, got {other:?}"),
+    }
+}
+
+/// With 1024 names interned, a new name has no key of its own. The dial is
+/// refused, not keyed `0.0.0.0:port` where it would share a key with every
+/// other overflow name. Runs in its own process: the interner is global.
+#[test]
+fn a_full_interner_refuses_a_name_dial_instead_of_sharing_one_key() {
+    const CHILD: &str = "RBTC_NAME_CAP_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().expect("test exe"))
+            .args([
+                "--exact",
+                "peers::a_full_interner_refuses_a_name_dial_instead_of_sharing_one_key",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("spawn");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        return;
+    }
+    for i in 0..1024 {
+        assert!(rbitcoin_net::NetAddr::name(&format!("fill-{i}.example"), 1).is_some());
+    }
+    assert!(rbitcoin_net::NetAddr::name("over.example", 8333).is_none());
+    let (hub, _rx) = proxied_hub();
+    let target = DialTarget::Domain {
+        host: "over.example".into(),
+        port: 8333,
+    };
+    let err = hub.dial_manual_target(target).unwrap_err();
+    assert!(err.contains("too many distinct"), "{err}");
+}
+
+/// Asking about a name nobody added (a live check, `addnode remove`) must not
+/// spend one of the interner's slots, or a flood of removes fills it for good.
+#[test]
+fn asking_about_unknown_names_leaves_the_interner_alone() {
+    let hub = PeerHub::new();
+    for i in 0..2000 {
+        let target = DialTarget::Domain {
+            host: format!("never-added-{i}.example"),
+            port: 8333,
+        };
+        assert!(!hub.is_target_live(&target));
+        assert!(!hub.disconnect_target(&target));
+    }
+    assert!(rbitcoin_net::NetAddr::name("added-after.example", 8333).is_some());
+}
+
+/// With `--proxy`, a `--connect` or `addnode` name goes to the proxy as a
+/// domain (SOCKS address type 3). The node never asks the OS resolver, so
+/// the unresolvable `.invalid` name still produces a dial.
+#[test]
+fn proxy_dials_connect_host_by_name() {
+    let hub = PeerHub::new();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    hub.set_dialer(tx);
+    hub.set_proxies(rbitcoin_net::NetProxies {
+        dialer: rbitcoin_net::Dialer::socks("127.0.0.1:9050".parse().unwrap(), true),
+        i2p_sam: None,
+    });
+    hub.set_connect_hosts(vec!["peer.invalid:8333".into()], 8333);
+    hub.redial_remembered();
+    hub.addnode_host("other.invalid", "onetry", 8333).unwrap();
+    let got = take_dials(&mut rx);
+    let names: Vec<_> = got
+        .iter()
+        .map(|d| match &d.target {
+            DialTarget::Domain { host, port } => format!("{host}:{port}"),
+            DialTarget::Socket(a) => panic!("resolved locally to {a}"),
+        })
+        .collect();
+    assert_eq!(names, ["peer.invalid:8333", "other.invalid:8333"]);
+}
+
+/// An IPv6 literal needs no lookup. Under `--proxy` it stays a socket target,
+/// not a domain cut at its last colon.
+#[test]
+fn proxy_keeps_ipv6_literals_as_sockets() {
+    let hub = PeerHub::new();
+    hub.set_proxies(rbitcoin_net::NetProxies {
+        dialer: rbitcoin_net::Dialer::socks("127.0.0.1:9050".parse().unwrap(), true),
+        i2p_sam: None,
+    });
+    hub.note_default_port(8333);
+    for literal in ["::1", "2001:db8::1"] {
+        match hub.host_dial_target(literal).unwrap() {
+            DialTarget::Socket(addr) => assert_eq!(addr.port(), 8333),
+            DialTarget::Domain { host, .. } => panic!("{literal} became domain {host}"),
+        }
+    }
+}
+
+fn proxied_hub() -> (
+    std::sync::Arc<PeerHub>,
+    mpsc::UnboundedReceiver<DialRequest>,
+) {
+    let hub = PeerHub::new();
+    let (tx, rx) = mpsc::unbounded_channel();
+    hub.set_dialer(tx);
+    hub.set_proxies(rbitcoin_net::NetProxies {
+        dialer: rbitcoin_net::Dialer::socks("127.0.0.1:9050".parse().unwrap(), true),
+        i2p_sam: None,
+    });
+    (hub, rx)
+}
+
+/// A `--proxy` name is the live key of its session. A redial pass while the
+/// session is up opens no second one, and two names on one port stay apart.
+#[test]
+fn proxy_names_are_the_live_key_of_their_sessions() {
+    let (hub, mut rx) = proxied_hub();
+    hub.set_connect_hosts(vec!["a.invalid:8333".into(), "b.invalid:8333".into()], 8333);
+    hub.redial_remembered();
+    let first = take_dials(&mut rx);
+    assert_eq!(first.len(), 2);
+    let a = first
+        .iter()
+        .find(|d| matches!(&d.target, DialTarget::Domain { host, .. } if host == "a.invalid"))
+        .unwrap();
+    let _session = hub.register_connecting_net(
+        a.target.version_socket(),
+        a.target.net_addr(),
+        a.target.version_socket(),
+        false,
+        PeerConnType::Manual,
+    );
+    drop(first);
+    hub.redial_remembered();
+    let again: Vec<_> = take_dials(&mut rx)
+        .into_iter()
+        .map(|d| match d.target {
+            DialTarget::Domain { host, .. } => host,
+            DialTarget::Socket(a) => panic!("resolved locally to {a}"),
+        })
+        .collect();
+    assert_eq!(
+        again,
+        ["b.invalid"],
+        "a.invalid is live; only b.invalid is dialed"
+    );
+}
+
+/// The session of the `--trust-peer` hostname is the trusted session, so the
+/// block and tx waiver applies to it.
+#[test]
+fn proxied_trust_peer_hostname_is_the_trusted_session() {
+    let (hub, _rx) = proxied_hub();
+    hub.set_trust_peer(None, Some("trusted.invalid".into()));
+    let target = hub.host_dial_target("trusted.invalid:8333").unwrap();
+    let trusted = hub.register_connecting_net(
+        target.version_socket(),
+        target.net_addr(),
+        target.version_socket(),
+        false,
+        PeerConnType::Manual,
+    );
+    assert!(hub.session_is_trusted_peer(&trusted));
+    let other = hub.host_dial_target("other.invalid:8333").unwrap();
+    let stranger = hub.register_connecting_net(
+        other.version_socket(),
+        other.net_addr(),
+        other.version_socket(),
+        false,
+        PeerConnType::Manual,
+    );
+    assert!(!hub.session_is_trusted_peer(&stranger));
+}
+
+/// Filter replies and a served compact block take their consensus payload
+/// on the send budget. A 2,000-hash `cfheaders` is far past the 64-byte
+/// fallback, and a prefilled transaction past 1 KiB is not the compact-block stub.
+#[test]
+fn filter_and_compact_block_replies_charge_their_consensus_payload() {
+    use bitcoin::bip152::HeaderAndShortIds;
+    use bitcoin::bip158::{FilterHash, FilterHeader};
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::p2p::message_compact_blocks::CmpctBlock;
+    use bitcoin::p2p::message_filter::{CFCheckpt, CFHeaders, CFilter};
+
+    let zero = [0u8; 32];
+    let block_hash = BlockHash::from_byte_array(zero);
+    let cfilter = CFilter {
+        filter_type: 0,
+        block_hash,
+        filter: vec![0x11; 200],
+    };
+    let cfilter_n = serialize(&cfilter).len();
+    assert!(cfilter_n > 64, "a filter body is not the fallback size");
+    assert_eq!(
+        outbound_msg_bytes(&NetworkMessage::CFilter(cfilter)),
+        cfilter_n
+    );
+
+    let cfheaders = CFHeaders {
+        filter_type: 0,
+        stop_hash: block_hash,
+        previous_filter_header: FilterHeader::from_byte_array(zero),
+        filter_hashes: vec![FilterHash::from_byte_array(zero); 2_000],
+    };
+    let cfheaders_n = serialize(&cfheaders).len();
+    assert!(
+        cfheaders_n >= 64_000,
+        "two thousand filter hashes are not the fallback size"
+    );
+    assert_eq!(
+        outbound_msg_bytes(&NetworkMessage::CFHeaders(cfheaders)),
+        cfheaders_n
+    );
+
+    let checkpoints = 3;
+    let cfcheckpt = CFCheckpt {
+        filter_type: 0,
+        stop_hash: block_hash,
+        filter_headers: vec![FilterHeader::from_byte_array(zero); checkpoints],
+    };
+    let cfcheckpt_n = serialize(&cfcheckpt).len();
+    assert!(cfcheckpt_n >= 32 * checkpoints);
+    assert_eq!(
+        outbound_msg_bytes(&NetworkMessage::CFCheckpt(cfcheckpt)),
+        cfcheckpt_n
+    );
+
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let fat = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::ONE,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![bitcoin::TxOut {
+            value: bitcoin::Amount::ZERO,
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x6a; 1_500]),
+        }],
+    };
+    let block = bitcoin::Block {
+        header: genesis.header,
+        txdata: vec![fat],
+    };
+    let hsi = HeaderAndShortIds::from_block(&block, 1, 1, &[0]).expect("prefilled coinbase");
+    let compact_n = serialize(&hsi).len();
+    assert!(
+        compact_n > 1_024,
+        "a prefilled fat transaction is not the compact-block stub"
+    );
+    let served = NetworkMessage::CmpctBlock(CmpctBlock { compact_block: hsi });
+    assert_eq!(outbound_msg_bytes(&served), compact_n);
+    assert_eq!(
+        outbound_queued_bytes(&PeerOut::Served(served)),
+        compact_n,
+        "a served compact block uses the same payload charge"
+    );
+}
+
+#[test]
+fn pong_reads_eight_byte_nonce_and_rejects_short() {
+    let hub = PeerHub::new();
+    let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+    let p = hub.register(a, a, &ver("/rbitcoin:test/"), false, PeerConnType::Inbound);
+    let nonce = p.take_ping_send(10_000).expect("ping due");
+    assert!(p.on_pong(&nonce.to_le_bytes(), 10_001).is_none());
+    let short = p.on_pong(&[1, 2, 3], 10_002).expect("short pong");
+    assert!(short.contains("Short payload"), "{short}");
+    let nonce = p.take_ping_send(10_200).expect("next ping");
+    let mut wrong = nonce.to_le_bytes();
+    wrong[0] ^= 0xff;
+    let mismatch = p.on_pong(&wrong, 10_201).expect("mismatched pong");
+    assert!(mismatch.contains("Nonce mismatch"), "{mismatch}");
 }

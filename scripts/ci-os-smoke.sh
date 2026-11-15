@@ -14,7 +14,7 @@ STORE_PLATFORM_FILTERS=(
   file::advise_tests
   sorted_run::workers_for_free_ram
   sorted_run::mem_available
-  sorted_run::host_mem
+  sorted_run::cgroup_
   sorted_run::darwin_vm
   io_backend::
   bulk_io::unset_io_env_opens_a_session

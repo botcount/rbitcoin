@@ -432,7 +432,13 @@ pub fn assemble_non_cb_inputs(
             ))
         };
     let edges = spend_fk.and_then(|fk| fk.get().and_then(|id| spend_edges.get(&id)));
+    let sigop_rules = rbitcoin_consensus::block::SpendSigopRules {
+        bip16: bip16_active,
+        witness: flags.witness_active,
+        bip54: params.enforce_bip54,
+    };
     let mut tx_in_sigops = 0u64;
+    let mut tx_bip54_sigops = 0u64;
     for (ii, input) in tx.input.iter().enumerate() {
         let op = input.previous_output;
         let key = (op.txid.to_byte_array(), op.vout);
@@ -469,14 +475,15 @@ pub fn assemble_non_cb_inputs(
             prev_fk,
             same_block,
             batch_parents,
-            bip16_active,
-            flags.witness_active,
+            sigop_rules,
             build_script_jobs,
             wire,
             acc,
         )?;
         let create_fk = prev_out.create_fk;
-        tx_in_sigops = tx_in_sigops.saturating_add(prev_out.input_sigops);
+        tx_in_sigops = tx_in_sigops.saturating_add(prev_out.sigops.block_cost);
+        tx_bip54_sigops =
+            rbitcoin_consensus::block::add_bip54_sigops(tx_bip54_sigops, prev_out.sigops.bip54)?;
         spends.push((
             key.0,
             key.1,
@@ -638,6 +645,18 @@ pub struct StructuralScratch {
     pub batch_creates: TxidMap<(u32, u32, u32)>,
     pub batch_vouts: Vec<u32>,
     pub slots: AnnotateSlots,
+    /// Spender meta for this write, read once before the block loop.
+    /// `meta_at` is the next unused index. `None` means this scratch has no
+    /// prefetch and the block reads its own offsets.
+    pub meta_prefetch: Vec<Option<(rbitcoin_primitives::Fk, u8, u32)>>,
+    /// Offsets `meta_prefetch` was read for. Each block's disk offsets must match its slice.
+    pub meta_offs: Vec<u64>,
+    /// One bit per abs job in write order. Set when that job is in `meta_offs`.
+    /// A block copies its slice instead of rebuilding the skip map.
+    pub meta_keep: Vec<bool>,
+    /// Next unused index in [`Self::meta_keep`].
+    pub meta_job_at: usize,
+    pub meta_at: Option<usize>,
 }
 
 impl Default for StructuralScratch {
@@ -658,6 +677,11 @@ impl Default for StructuralScratch {
             batch_creates: TxidMap::default(),
             batch_vouts: Vec::new(),
             slots: AnnotateSlots::default(),
+            meta_prefetch: Vec::new(),
+            meta_offs: Vec::new(),
+            meta_keep: Vec::new(),
+            meta_job_at: 0,
+            meta_at: None,
         }
     }
 }
@@ -670,6 +694,11 @@ impl StructuralScratch {
         self.slots.known.clear();
         self.batch_creates.clear();
         self.batch_vouts.clear();
+        self.meta_prefetch.clear();
+        self.meta_offs.clear();
+        self.meta_keep.clear();
+        self.meta_job_at = 0;
+        self.meta_at = None;
     }
 
     #[doc(hidden)]
@@ -739,7 +768,9 @@ pub fn structural_validate_spends(
     let mut spent_strong_ns = 0u64;
     let mut multi_list_ns = 0u64;
     if !scratch.abs_jobs.is_empty() {
-        fill_overlay_skip(spends, class_a_wave, scratch);
+        if scratch.meta_at.is_none() {
+            fill_overlay_skip(spends, class_a_wave, &mut scratch.skip);
+        }
         let loaded = structural_load_durable_spent(query, tip, scratch)?;
         multi_list_ns = loaded.0;
         spent_strong_ns = loaded.1;
@@ -910,7 +941,7 @@ pub fn fill_overlay_skip(
         u32,
     )],
     class_a_wave: &ClassAWave,
-    scratch: &mut StructuralScratch,
+    skip: &mut OverlayMetaSkip,
 ) {
     use std::collections::hash_map::Entry;
     for &(_, vout, sfk, cfk, vin) in spends {
@@ -921,7 +952,7 @@ pub fn fill_overlay_skip(
             continue;
         };
         // None stays. Dropping the key would make a later sight look like the first.
-        match scratch.skip.entry((id, vout)) {
+        match skip.entry((id, vout)) {
             Entry::Vacant(slot) => {
                 slot.insert(Some((sfk, vin)));
             }
@@ -941,6 +972,44 @@ pub fn overlay_meta_is_skip(
     skip: &OverlayMetaSkip,
 ) -> bool {
     skip.get(&(id, vout)).copied().flatten() == Some((sfk, vin))
+}
+
+/// Disk offsets for this write, and one keep bit per abs job.
+///
+/// A block copies its bits. It does not rebuild the skip map.
+#[doc(hidden)]
+pub fn write_meta_abs_offs<'a>(
+    blocks: impl IntoIterator<
+        Item = (
+            &'a [(
+                [u8; 32],
+                u32,
+                rbitcoin_primitives::Fk,
+                rbitcoin_primitives::Fk,
+                u32,
+            )],
+            &'a [StructuralAbsJob],
+        ),
+    >,
+    class_a_wave: &ClassAWave,
+) -> (Vec<u64>, Vec<bool>) {
+    let mut offs = Vec::new();
+    let mut keep = Vec::new();
+    let mut skip = OverlayMetaSkip::with_hasher(Default::default());
+    for (spends, jobs) in blocks {
+        skip.clear();
+        fill_overlay_skip(spends, class_a_wave, &mut skip);
+        for &job in jobs {
+            let (id, vout, abs, sfk, vin) = job;
+            if overlay_meta_is_skip(id, vout, sfk, vin, &skip) {
+                keep.push(false);
+                continue;
+            }
+            keep.push(true);
+            offs.push(abs);
+        }
+    }
+    (offs, keep)
 }
 
 #[doc(hidden)]
@@ -975,6 +1044,32 @@ pub fn structural_abs_heights(
     Ok(())
 }
 
+/// True when `planned[at..at + abs_offs.len()]` equals `abs_offs`.
+///
+/// A shorter plan, a wrap, or a different offset is a miss. The load uses
+/// this so a block cannot apply another block's spender meta.
+#[doc(hidden)]
+pub fn meta_prefetch_slice_matches(planned: &[u64], at: usize, abs_offs: &[u64]) -> bool {
+    let Some(end) = at.checked_add(abs_offs.len()) else {
+        return false;
+    };
+    end <= planned.len() && planned[at..end] == *abs_offs
+}
+
+type StructuralMeta = Option<(rbitcoin_primitives::Fk, u8, u32)>;
+
+fn structural_meta_row(
+    prefetch: &[StructuralMeta],
+    read: Option<&[StructuralMeta]>,
+    at: usize,
+    i: usize,
+) -> StructuralMeta {
+    match read {
+        Some(rows) => rows[i],
+        None => prefetch[at + i],
+    }
+}
+
 #[doc(hidden)]
 pub fn structural_load_durable_spent(
     query: &Query,
@@ -983,39 +1078,77 @@ pub fn structural_load_durable_spent(
 ) -> Result<(u64, u64), ConfirmError> {
     use std::time::Instant;
     let mut ovl_n = 0u64;
-    for &job in &scratch.abs_jobs {
-        let (id, vout, abs, sfk, vin) = job;
-        if overlay_meta_is_skip(id, vout, sfk, vin, &scratch.skip) {
-            ovl_n = ovl_n.saturating_add(1);
-            continue;
+    if scratch.meta_at.is_some() {
+        let start = scratch.meta_job_at;
+        let n = scratch.abs_jobs.len();
+        let end = start.saturating_add(n);
+        if end > scratch.meta_keep.len() {
+            return Err(ConfirmError::Store(rbitcoin_store::StoreError::Corrupt(
+                "invariant: structural meta prefetch short",
+            )));
         }
-        scratch.disk_jobs.push(job);
-        scratch.abs_offs.push(abs);
+        for i in 0..n {
+            let job = scratch.abs_jobs[i];
+            if !scratch.meta_keep[start + i] {
+                ovl_n = ovl_n.saturating_add(1);
+                continue;
+            }
+            let (_, _, abs, _, _) = job;
+            scratch.disk_jobs.push(job);
+            scratch.abs_offs.push(abs);
+        }
+        scratch.meta_job_at = end;
+    } else {
+        for &job in &scratch.abs_jobs {
+            let (id, vout, abs, sfk, vin) = job;
+            if overlay_meta_is_skip(id, vout, sfk, vin, &scratch.skip) {
+                ovl_n = ovl_n.saturating_add(1);
+                continue;
+            }
+            scratch.disk_jobs.push(job);
+            scratch.abs_offs.push(abs);
+        }
     }
     crate::note_confirm(&query.confirm_stats().spend_overlay_skip_n, ovl_n);
     if scratch.abs_offs.is_empty() {
         return Ok((0, 0));
     }
-    let meta_backend = rbitcoin_store::spend_meta_backend();
-    let t_meta = Instant::now();
-    let metas = query
-        .store()
-        .get_spender_meta_at_abs_batch_backend(&scratch.abs_offs, meta_backend)
-        .map_err(ConfirmError::from)?;
-    let meta_ns = t_meta.elapsed().as_nanos() as u64;
-    crate::note_confirm(&query.confirm_stats().spend_meta_ns, meta_ns);
-    crate::note_confirm(
-        &query.confirm_stats().spend_meta_n,
-        scratch.abs_offs.len() as u64,
-    );
-    let _ = meta_backend;
-    if metas.len() != scratch.disk_jobs.len() {
+    let (prefetch_at, read) = if let Some(at) = scratch.meta_at {
+        let end = at.saturating_add(scratch.abs_offs.len());
+        if end > scratch.meta_prefetch.len()
+            || !meta_prefetch_slice_matches(&scratch.meta_offs, at, &scratch.abs_offs)
+        {
+            return Err(ConfirmError::Store(rbitcoin_store::StoreError::Corrupt(
+                "invariant: structural meta prefetch short",
+            )));
+        }
+        scratch.meta_at = Some(end);
+        (at, None)
+    } else {
+        let meta_backend = rbitcoin_store::spend_meta_backend();
+        let t_meta = Instant::now();
+        let metas = query
+            .store()
+            .get_spender_meta_at_abs_batch_backend(&scratch.abs_offs, meta_backend)
+            .map_err(ConfirmError::from)?;
+        let meta_ns = t_meta.elapsed().as_nanos() as u64;
+        crate::note_confirm(&query.confirm_stats().spend_meta_ns, meta_ns);
+        crate::note_confirm(
+            &query.confirm_stats().spend_meta_n,
+            scratch.abs_offs.len() as u64,
+        );
+        let _ = meta_backend;
+        (0, Some(metas))
+    };
+    let n = scratch.disk_jobs.len();
+    if read.as_ref().is_some_and(|rows| rows.len() != n) {
         return Err(ConfirmError::Store(rbitcoin_store::StoreError::Corrupt(
             "invariant: structural meta batch length",
         )));
     }
     let t_strong = Instant::now();
-    for row in &metas {
+    for i in 0..n {
+        let row = structural_meta_row(&scratch.meta_prefetch, read.as_deref(), prefetch_at, i);
         let Some((field, _, _)) = row else {
             continue;
         };
@@ -1024,7 +1157,7 @@ pub fn structural_load_durable_spent(
         }
         if let Some(fid) = field.get() {
             if scratch.field_seen.insert(fid) {
-                scratch.field_fks.push(*field);
+                scratch.field_fks.push(field);
             }
         }
     }
@@ -1038,15 +1171,12 @@ pub fn structural_load_durable_spent(
         }
     }
     let jobs = std::mem::take(&mut scratch.disk_jobs);
-    let applied = jobs
-        .iter()
-        .copied()
-        .zip(metas)
-        .try_fold(0u64, |acc, (job, meta)| {
-            let (id, vout, abs, sfk, vin) = job;
-            let ns = structural_apply_one_meta(query, meta, id, vout, abs, sfk, vin, tip, scratch)?;
-            Ok::<u64, ConfirmError>(acc.saturating_add(ns))
-        });
+    let applied = (0..n).try_fold(0u64, |acc, i| {
+        let meta = structural_meta_row(&scratch.meta_prefetch, read.as_deref(), prefetch_at, i);
+        let (id, vout, abs, sfk, vin) = jobs[i];
+        let ns = structural_apply_one_meta(query, meta, id, vout, abs, sfk, vin, tip, scratch)?;
+        Ok::<u64, ConfirmError>(acc.saturating_add(ns))
+    });
     scratch.disk_jobs = jobs;
     let multi_list_ns = applied?;
     let spent_strong_ns = t_strong
@@ -1235,8 +1365,6 @@ pub fn structural_bip68(
     if !ctx.params.csv_active_at(ctx.height.0) {
         return Ok(());
     }
-    const DISABLE: u32 = 1 << 31;
-    const TYPE_FLAG: u32 = 1 << 22;
     // Median time is only needed when some input enforces a relative lock.
     let mut prev_mtp_slot: Option<u32> = None;
     let mut si = 0usize;
@@ -1247,14 +1375,7 @@ pub fn structural_bip68(
         rbitcoin_consensus::block::reject_spend_cursor(si + n_in <= spends.len())?;
         let tx_spends = &spends[si..si + n_in];
         si += n_in;
-        if !rbitcoin_consensus::block::bip68_active_for_tx(tx) {
-            continue;
-        }
-        if tx
-            .input
-            .iter()
-            .all(|inp| inp.sequence.to_consensus_u32() & DISABLE != 0)
-        {
+        if !rbitcoin_consensus::tx_has_relative_lock(tx) {
             continue;
         }
         let prev_mtp = if let Some(t) = prev_mtp_slot {
@@ -1282,7 +1403,8 @@ pub fn structural_bip68(
             };
             prev_heights.push(ch);
             let seq = inp.sequence.to_consensus_u32();
-            let need_mtp = seq & DISABLE == 0 && seq & TYPE_FLAG != 0;
+            let need_mtp = seq & rbitcoin_consensus::SEQUENCE_LOCKTIME_DISABLE_FLAG == 0
+                && seq & rbitcoin_consensus::SEQUENCE_LOCKTIME_TYPE_FLAG != 0;
             // Height 0 is the genesis coin: one median lookup of block 0.
             // A missing create height is not height 0.
             let mtp = if !need_mtp {
@@ -1498,8 +1620,9 @@ pub struct ResolvedPrevout {
     pub txout: TxOut,
     /// Set when the script bytes stay in a block or pin `Arc`.
     pub shared: Option<rbitcoin_consensus::block::SharedPrevout>,
-    /// P2SH+witness sigop cost for this input's prevout script (not legacy).
-    pub input_sigops: u64,
+    /// What this input's prevout script adds to the block's sigop cost (P2SH
+    /// and witness, not legacy) and to its transaction's BIP 54 count.
+    pub sigops: rbitcoin_consensus::block::SpendSigops,
     /// Class A create fk for this prevout (or `NULL` for same-block). Load pin
     /// denserels must carry identity matching wire `prev_txid` for this fk.
     pub create_fk: rbitcoin_primitives::Fk,
@@ -1513,8 +1636,7 @@ pub fn resolve_prevout(
     prev_fk_hint: Option<rbitcoin_primitives::Fk>,
     same_block: Option<EarlierIndex>,
     batch_parents: &crate::BatchParents,
-    bip16: bool,
-    witness: bool,
+    sigop_rules: rbitcoin_consensus::block::SpendSigopRules,
     need_script_buf: bool,
     wire: Option<&Arc<Block>>,
     acc: &mut AsmPrevoutAcc,
@@ -1550,12 +1672,7 @@ pub fn resolve_prevout(
                 o.clone()
             },
             shared,
-            input_sigops: rbitcoin_consensus::block::prevout_spk_sigops(
-                inp,
-                o.script_pubkey.as_bytes(),
-                bip16,
-                witness,
-            ),
+            sigops: sigop_rules.count(inp, o.script_pubkey.as_bytes()),
             create_fk: rbitcoin_primitives::Fk::NULL,
         });
     }
@@ -1584,8 +1701,7 @@ pub fn resolve_prevout(
             rbitcoin_consensus::block::reject_unspendable_prevout(
                 rbitcoin_consensus::policy::is_unspendable(script),
             )?;
-            let input_sigops =
-                rbitcoin_consensus::block::prevout_spk_sigops(inp, script, bip16, witness);
+            let sigops = sigop_rules.count(inp, script);
             acc.in_n = acc.in_n.saturating_add(1);
             acc.batch_n = acc.batch_n.saturating_add(1);
             #[cfg(debug_assertions)]
@@ -1596,7 +1712,7 @@ pub fn resolve_prevout(
                     script_pubkey: ScriptBuf::new(),
                 },
                 shared: need_script_buf.then(|| pinned.into_shared_prevout()),
-                input_sigops,
+                sigops,
                 create_fk: prev_fk,
             });
         } else if batch_parents.contains(prev_fk) {

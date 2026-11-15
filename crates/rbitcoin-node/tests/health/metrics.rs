@@ -243,7 +243,19 @@ async fn ibd_header_height_survives_resume() {
         let _blocking = rbitcoin_net::reactor::BlockingRegion::enter();
         hub.reconsider_block(connected).unwrap();
         assert!(header_walk::restore_adopt(&mut st, &hub));
-        assert_rpc_headers(&hub, 1, 7);
+        // Short look-ahead after the proving batch is not rewritten into
+        // `header.adopt`. Resume returns that saved checkpoint. The header
+        // row stored later is still the best header height.
+        assert_eq!(st.header_walk.tip_height(), 4);
+        assert_eq!(
+            st.header_walk
+                .checkpoints
+                .iter()
+                .map(|c| c.height)
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
+        assert_rpc_headers(&hub, 1, 5);
         header_walk::rewind_above(&mut st, &hub, 1);
         assert_eq!(
             hub.best_header_height(),

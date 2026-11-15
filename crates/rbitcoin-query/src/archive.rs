@@ -718,14 +718,24 @@ impl ArchiveWritePlan {
         }
     }
 
-    /// Per-packed-row `(vout, spend_fk)` for creates in this plan (Class A overlay).
+    /// Exact `spent.body` bytes for creates in this plan (Class A overlay).
     ///
-    /// Coinbase / external parents are omitted — those slots stay zero until
-    /// annotate after tip.
-    pub fn same_batch_spent_overlay(&self) -> Vec<Vec<(u32, Fk, u32)>> {
-        let mut overlay: Vec<Vec<(u32, Fk, u32)>> = vec![Vec::new(); self.packed.len()];
-        if overlay.is_empty() {
-            return overlay;
+    /// Coinbase / external parents stay zero until annotate after tip.
+    /// One slot per vout: the lowest `spend_fk`, which is the first spender
+    /// in chain order (plans append in height order). A later spender of the
+    /// same output is a double spend that structural rejects, and the
+    /// rejected write keeps this Class A. The slot must still name the first.
+    pub fn same_batch_spent_overlay(
+        &self,
+    ) -> Result<rbitcoin_store::tx_table::SpentBodyImage, StoreError> {
+        let n_outs: Vec<u32> = self
+            .packed
+            .iter()
+            .map(|(pin, _)| pin.packed_n_out())
+            .collect();
+        let mut image = rbitcoin_store::tx_table::SpentBodyImage::zeros(&n_outs);
+        if image.create_count() == 0 {
+            return Ok(image);
         }
         let mut idx: crate::U64Map<usize> = crate::U64Map::default();
         for (i, fk) in self.planned_fks.iter().enumerate() {
@@ -741,10 +751,10 @@ impl ArchiveWritePlan {
                 let Some(&i) = idx.get(&cid) else {
                     continue;
                 };
-                overlay[i].push((e.vout, e.spend_fk, e.vin));
+                image.place(i, e.vout, e.spend_fk, e.vin)?;
             }
         }
-        overlay
+        Ok(image)
     }
 
     /// Drop stamp staging (ranges + txid reverse) after pin.
@@ -1449,6 +1459,56 @@ pub fn seqsigwit_rows_for_prune(
 pub type ArchiveHeadParents = (bool, Vec<rbitcoin_store::CreateLocPair>, Vec<(Fk, Fk, u32)>);
 
 impl Query {
+    /// The body is already archived, so commit will not note scriptSig and
+    /// witness again. Prune mode has no stem to fall back on. Take them from
+    /// the block being connected and the input edges already stored.
+    pub fn note_pruned_archived_seqsigwit(
+        &self,
+        header_fk: Fk,
+        block: &bitcoin::Block,
+    ) -> Result<(), QueryError> {
+        if !self.prune_seqsigwit() || !self.store.header_txs.has_body(header_fk)? {
+            return Ok(());
+        }
+        let Some(fks) = self.store.header_txs.get_list(header_fk)? else {
+            return Err(StoreError::Corrupt("seqsigwit window miss"));
+        };
+        if fks.len() != block.txdata.len() {
+            return Err(StoreError::Corrupt(
+                "invariant: archived seqsigwit tx count",
+            ));
+        }
+        let mut rows = Vec::with_capacity(fks.len());
+        for (fk, tx) in fks.iter().copied().zip(block.txdata.iter()) {
+            let stored = self.store.input_edges(fk)?.ok_or(StoreError::Corrupt(
+                "invariant: archived seqsigwit missing input edges",
+            ))?;
+            if stored.len() != tx.input.len() {
+                return Err(StoreError::Corrupt(
+                    "invariant: archived seqsigwit input count",
+                ));
+            }
+            let wire_txid = tx.compute_txid().to_byte_array();
+            if self.store.txs.body_txid(fk)? != wire_txid {
+                return Err(StoreError::Corrupt("invariant: archived seqsigwit txid"));
+            }
+            let edges: Vec<crate::SpendEdge> = stored
+                .iter()
+                .enumerate()
+                .map(|(vin, edge)| crate::SpendEdge {
+                    prev_txid: tx.input[vin].previous_output.txid.to_byte_array(),
+                    vout: edge.vout,
+                    spend_fk: fk,
+                    create_fk: edge.parent,
+                    vin: vin as u32,
+                })
+                .collect();
+            rows.push(input_records_from_wire(tx, fk, &edges)?);
+        }
+        self.note_appended_seqsigwit_inputs(&fks, rows);
+        Ok(())
+    }
+
     /// Class A plan + commit from wire blocks. Does not set tip.
     pub fn archive_class_a_from_wire(&self, items: &[WirePlanNeed<'_>]) -> Result<(), QueryError> {
         if items.is_empty() {
@@ -1835,7 +1895,7 @@ impl Query {
         let reserve_ns = t.elapsed().as_nanos() as u64;
 
         let t = Instant::now();
-        let overlay = plan.same_batch_spent_overlay();
+        let overlay = plan.same_batch_spent_overlay()?;
         let txstat = stamp_txstat_rows(&plan)?;
         let txstat_ns = t.elapsed().as_nanos() as u64;
         self.confirm_stats().note_write_txstat(txstat_ns);
@@ -1846,7 +1906,7 @@ impl Query {
         let (got_tx_fks, loc) = self.store.put_tx_pins_encoded(
             &pins,
             /*index=*/ false,
-            &overlay,
+            overlay,
             &txstat,
             &plan.per_header_ranges,
             &edge_rows,

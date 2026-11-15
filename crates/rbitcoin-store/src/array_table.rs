@@ -13,7 +13,7 @@
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-use rbitcoin_primitives::TableKind;
+use rbitcoin_primitives::{le_u64, TableKind};
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::path::Path;
@@ -643,8 +643,9 @@ impl ArrayTable {
             if n > 0 {
                 let mut bytes = vec![0u8; body as usize];
                 file.read_at(FILE_HEADER_LEN as u64, &mut bytes)?;
-                for (i, chunk) in bytes.chunks_exact(8).enumerate() {
-                    v[i] = u64::from_le_bytes(chunk.try_into().unwrap());
+                let (rows, _) = bytes.as_chunks::<8>();
+                for (i, row) in rows.iter().enumerate() {
+                    v[i] = le_u64!(row, 0);
                 }
             }
             Some(v)

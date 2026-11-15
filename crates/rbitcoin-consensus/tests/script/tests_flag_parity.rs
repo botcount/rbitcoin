@@ -161,6 +161,16 @@ fn discourage_skips_native_p2a_and_pre_taproot_v1() {
     let anchor = job(p2a, tx.clone(), |f| f.discourage_upgradable_witness = true);
     script::verify_job_all_inputs(&anchor).expect("P2A is not discouraged");
 
+    let other = vec![0x51, 0x02, 0x00, 0x01];
+    let discouraged = job(other, tx.clone(), |f| {
+        f.discourage_upgradable_witness = true
+    });
+    let err = script::verify_job_all_inputs(&discouraged).expect_err("not an anchor");
+    assert!(
+        format!("{err}").contains("DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"),
+        "{err}"
+    );
+
     let mut v1 = vec![0x51, 0x20];
     v1.extend_from_slice(&[0x11; 32]);
     let pre_taproot = job(v1, tx, |f| {

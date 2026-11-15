@@ -92,6 +92,7 @@ let
             noSeeds = true;
             externalIp = [ "203.0.113.5" ];
             peerTimeout = 60;
+            discoverFromPeers = true;
           };
           rpc = {
             enable = true;
@@ -105,12 +106,15 @@ let
             enable = true;
             openFirewall = true;
             hiddenService = true;
+            i2p = true;
             maxSubs = 25000;
+            maxSpSubs = 100;
           };
           esplora = {
             enable = true;
             openFirewall = true;
             hiddenService = true;
+            i2p = true;
             maxInflight = 1024;
             blockTemplate = true;
           };
@@ -153,6 +157,7 @@ let
           enable = true;
           package = fakePackage;
           electrum.maxSubs = 25000;
+          electrum.maxSpSubs = 100;
           heavyShCreates = 0;
           esplora.maxInflight = 1024;
           p2p = {
@@ -352,6 +357,7 @@ let
   bindNeedsListenMsg = "services.rbitcoin.netPermissionBind requires p2p.listen";
   bindTrustMsg = "services.rbitcoin.netPermissionBind cannot be combined with trustPeer";
   esploraSockNeedsEnableMsg = "services.rbitcoin.esplora.socketPath requires esplora.enable";
+  esploraOverlayNeedsTcpMsg = "services.rbitcoin.esplora.hiddenService and esplora.i2p need a TCP listener; unset esplora.socketPath";
   tokenNeedsRpcMsg = "services.rbitcoin.rpc.tokenFile requires an RPC listener";
   workQueueNeedsRpcMsg = "services.rbitcoin.rpc.workQueue requires an RPC listener";
   esploraHsNeedsEnableMsg = "services.rbitcoin.esplora.hiddenService requires esplora.enable";
@@ -561,6 +567,7 @@ assert defaultCfg.esplora.blockTemplate == false;
 assert defaultCfg.esplora.socketPath == null;
 assert defaultCfg.sv2.tp.idleTimeout == 0;
 assert defaultCfg.p2p.discover == true;
+assert defaultCfg.p2p.discoverFromPeers == false;
 assert defaultCfg.p2p.listenOnion == false;
 assert defaultCfg.rpc.port == 8332;
 assert defaultCfg.rpc.socketPath == null;
@@ -573,10 +580,13 @@ assert defaultCfg.onlyNet == [ ];
 assert defaultCfg.tor.control == null;
 assert defaultCfg.tor.controlCookie == null;
 assert defaultCfg.electrum.hiddenService == false;
+assert defaultCfg.electrum.i2p == false;
 assert defaultCfg.electrum.maxSubs == null;
+assert defaultCfg.electrum.maxSpSubs == null;
 assert defaultCfg.heavyShCreates == null;
 assert defaultCfg.storeReadBudget == null;
 assert defaultCfg.esplora.hiddenService == false;
+assert defaultCfg.esplora.i2p == false;
 assert defaultCfg.esplora.maxInflight == null;
 assert defaultCfg.rpc.clientVersion == null;
 assert defaultCfg.i2p.sam == null;
@@ -686,6 +696,8 @@ assert cfg.systemd.tmpfiles.settings."10-rbitcoin"."/run/rbitcoin".d.mode == "07
 assert builtins.match ".*--electrum-listen 127.0.0.1:50001.*" execStart != null;
 assert builtins.match ".*--electrum-max-subs 25000.*" execStart != null;
 assert builtins.match ".*--electrum-max-subs.*" listenOffExec == null;
+assert builtins.match ".*--electrum-max-sp-subs 100.*" execStart != null;
+assert builtins.match ".*--electrum-max-sp-subs.*" listenOffExec == null;
 assert builtins.match ".*--heavy-sh-creates 20000.*" execStart != null;
 assert builtins.match ".*--heavy-sh-creates 0.*" listenOffExec != null;
 assert builtins.match ".*--heavy-sh-creates.*" (
@@ -697,6 +709,12 @@ assert builtins.match ".*--store-read-budget.*" (
 ) == null;
 assert builtins.match ".*--esplora-listen 127.0.0.1:3000.*" execStart != null;
 assert builtins.match ".*--esplora-onion.*" execStart != null;
+assert builtins.match ".*--electrum-onion.*" execStart != null;
+assert builtins.match ".*--electrum-i2p.*" execStart != null;
+assert builtins.match ".*--esplora-i2p.*" execStart != null;
+assert builtins.match ".*--(electrum|esplora)-(onion|i2p).*" (
+  defaultSystem.config.systemd.services.rbitcoin.serviceConfig.ExecStart
+) == null;
 assert builtins.match ".*--esplora-max-inflight 1024.*" execStart != null;
 assert builtins.match ".*--esplora-max-inflight.*" listenOffExec == null;
 assert builtins.match ".*--sh-index.*" execStart != null;
@@ -816,6 +834,10 @@ assert cookieDataDirMode == "0700";
 assert builtins.match ".*--listen .*" listenOffExec == null;
 assert builtins.match ".*--max-inbound 0.*" listenOffExec != null;
 assert builtins.match ".*--no-discover.*" listenOffExec != null;
+assert builtins.match ".*--discover-from-peers.*" execStart != null;
+assert builtins.match ".*--discover-from-peers.*" (
+  defaultSystem.config.systemd.services.rbitcoin.serviceConfig.ExecStart
+) == null;
 assert builtins.match ".*--sv2-tp.*" listenOffExec == null;
 assert listenOffSystem.config.networking.firewall.allowedTCPPorts == [ ];
 assert builtins.match ".*--sp-tweaks .*" spExec != null;
@@ -833,7 +855,7 @@ assert rbitcoinFailures (badSystem { apiLog = "/api.jsonl"; }) == rbitcoinFailur
 assert unixSystem.config.networking.firewall.allowedTCPPorts == [ ];
 assert unixSystem.config.systemd.tmpfiles.settings."10-rbitcoin"."/run/rbitcoin".d.mode == "0750";
 assert builtins.elem "/run/rbitcoin" unixSystem.config.systemd.services.rbitcoin.serviceConfig.ReadWritePaths;
-assert builtins.match ".*--esplora-onion=0.*" onionOffExec != null;
+assert builtins.match ".*--esplora-onion.*" onionOffExec == null;
 assert builtins.match ".*--network signet.*" signetExec != null;
 assert builtins.match ".*--signet-challenge 51.*" signetExec != null;
 assert builtins.match ".*--signet-block-time 120.*" signetExec != null;
@@ -947,6 +969,22 @@ assert builtins.match ".*--rpc-work-queue 8.*" (execOf {
 assert builtins.elem esploraHsNeedsEnableMsg (failedAssertions (badSystem {
   esplora.hiddenService = true;
 }));
+assert builtins.elem esploraOverlayNeedsTcpMsg (failedAssertions (badSystem {
+  esplora = {
+    enable = true;
+    socketPath = "/run/rbitcoin/esplora.sock";
+    hiddenService = true;
+  };
+}));
+assert builtins.elem esploraOverlayNeedsTcpMsg (failedAssertions (badSystem {
+  esplora = {
+    enable = true;
+    socketPath = "/run/rbitcoin/esplora.sock";
+    i2p = true;
+  };
+  i2p.sam = "127.0.0.1:7656";
+}));
+assert !builtins.elem esploraOverlayNeedsTcpMsg (failedAssertions system);
 assert builtins.match ".*--tor-control.*" (execOf {
   esplora.hiddenService = true;
 }) == null;

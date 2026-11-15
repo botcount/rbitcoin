@@ -135,6 +135,24 @@ fn sh_history_caps() {
             "{err}"
         );
     }
+    {
+        let _lift = rbitcoin_query::scripthash::lift_max_sh_creates();
+        let stats = q.scripthash_chain_stats(&sh).expect("lifted on this thread");
+        assert_eq!((stats.funded_txo_count, stats.spent_txo_count), (7, 1));
+        let other = std::thread::scope(|s| {
+            s.spawn(|| q.scripthash_chain_stats(&sh).map(|_| ()).unwrap_err().to_string())
+                .join()
+                .unwrap()
+        });
+        assert_eq!(
+            other, "scripthash join exceeds --max-sh-creates (7 creates, cap 2)",
+            "another thread keeps the cap"
+        );
+    }
+    assert!(
+        q.scripthash_chain_stats(&sh).is_err(),
+        "the cap is back once the guard drops"
+    );
     assert_eq!(
         sh_page(&q, &sh, HeightAsc, None).unwrap(),
         [cb_txids[0]],

@@ -32,19 +32,36 @@ connected; n−1 is held in in-flight until after the child pin.
 Do not grow these maps to `Vec<Fk>` unless a mainnet miss is shown to
 be this case.
 
+## A block that looks commitment-free is served unverified
+
+Reconstruction checks a rebuilt block against the witness commitment in its
+coinbase ([`reconstruct.rs`](../crates/rbitcoin-query/src/reconstruct.rs)). The
+check runs only when the coinbase carries a commitment **and** a reserved value
+of exactly one 32-byte witness item. Without both there is nothing to compare:
+every pre-segwit block is in that state, and a block stored before segwit
+activation can carry a commitment with no coinbase witness at all.
+
+Corruption in the six magic bytes (`6a24aa21a9ed`) of the commitment script,
+or one that leaves the coinbase with no reserved value or the wrong size,
+therefore leaves a block unverified. A flipped byte anywhere else in the
+witness table, or in the commitment digest, is refused on the rebuilt block and
+on the encoded bytes full-block `getdata` returns. Not checked: `getblock`
+verbosity 1, whose only witness bytes are the coinbase's reserved value and
+whose body read would be reachable unauthenticated through REST
+`block/notxdetails`; `getrawtransaction`; and Electrum. A refused block still
+needs a reindex: the check stops bad data being served, it does not repair it
+([106](./external_findings/106-historical-bitrot.md)).
+
+Closing this needs the height, so a commitment can be required at or above
+segwit activation. Do not key the check on witness presence instead: storage
+tests store witness-carrying blocks that were never valid, and those must keep
+reconstructing.
+
 ## Retired confirm dual paths
 
-These names are gone. A missed fact the pipeline promised is still
+A missed fact the pipeline promised is
 `StoreError::Corrupt("invariant: …")` ([`invariants.md`](./invariants.md)).
-Do not treat the list as a set of identifiers to police:
+The old dual-path names are gone.
 
-- Soft spentness recovery for a wrong or missing pin identity.
-- Unpinned wire-corrected `create_fk` spentness.
-- Load-stage `txid.body` identity fill after lookup promised the stamp.
-- `ColdPinMode` Allow/Forbid cold denserels on load (load is range outs only).
-- Denserels-as-spender-abs (schema 22 abs is `spent` loc off + `8×vout` only).
-- `AssembleMode::Full` / `validate_block_connect` (confirm is optimistic
-  assemble, then `structural_validate_spends`).
-- `archive_plan_batch_from_store` and production `Query` turning TxApply into
-  a dummy `Block`. `tx_apply_to_tx`, `connect_block`, and
-  `commit_class_a_only` are `rbitcoin_query::testutil::FixtureChain` only.
+`tx_apply_to_tx`, `connect_block`, and `commit_class_a_only` exist only on
+`rbitcoin_query::testutil::FixtureChain`.

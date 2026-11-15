@@ -148,6 +148,20 @@ impl Sv2TpHandle {
     }
 }
 
+/// Log the end of one session. A client causes any socket error by closing
+/// or resetting, so those log at DEBUG. A task this side spawned that panicked
+/// or was cancelled logs at WARN.
+#[doc(hidden)]
+pub fn log_disconnect(peer: SocketAddr, how: &io::Result<()>) {
+    match how {
+        Ok(()) => rbitcoin_log::debug!("sv2: disconnect {peer}"),
+        Err(e) if rbitcoin_net::is_join_error(e) => {
+            rbitcoin_log::warn!("sv2: disconnect {peer} (task join: {e})")
+        }
+        Err(e) => rbitcoin_log::debug!("sv2: disconnect {peer} ({e})"),
+    }
+}
+
 /// Bind the listener and serve TDP sessions until [`Sv2TpHandle::shutdown`].
 ///
 /// At `MAX_SESSIONS` the next connection is closed before the handshake;
@@ -243,13 +257,13 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
                     continue;
                 }
             };
-            rbitcoin_log::info!("sv2: connect {peer}");
+            rbitcoin_log::debug!("sv2: connect {peer}");
             let chain = Arc::clone(&chain);
             let stats = Arc::clone(&stats_c);
             let flight = Arc::clone(&flight);
             let h = tokio::spawn(async move {
                 let _slot = slot;
-                match session::serve(
+                let how = session::serve(
                     stream,
                     responder,
                     chain,
@@ -262,11 +276,8 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
                     stats,
                     flight,
                 )
-                .await
-                {
-                    Ok(()) => rbitcoin_log::info!("sv2: disconnect {peer}"),
-                    Err(e) => rbitcoin_log::info!("sv2: disconnect {peer} ({e})"),
-                }
+                .await;
+                log_disconnect(peer, &how);
             });
             let mut g = sessions_c.lock().unwrap_or_else(|e| e.into_inner());
             g.retain(|t| !t.is_finished());

@@ -175,6 +175,15 @@ fn trust_reason_class() {
     assert!(!reason_is_warn_and_apply("bad-txnmrklroot"));
     assert!(!reason_is_warn_and_apply("bad-diffbits"));
     let guard = rbitcoin_consensus::TrustCollect::enter();
+    rbitcoin_consensus::note_block_height(7);
+    rbitcoin_consensus::soften(ConsensusError::BadTx("not final")).unwrap();
+    let warned = rbitcoin_consensus::drain_warnings();
+    assert_eq!(warned.len(), 1);
+    assert_eq!(warned[0].0, Some(7));
+    rbitcoin_consensus::soften(ConsensusError::BadTx("not final")).unwrap();
+    drop(guard);
+    assert!(rbitcoin_consensus::drain_warnings().is_empty());
+    let guard = rbitcoin_consensus::TrustCollect::enter();
     let encode = soften_signet_encode();
     drop(guard);
     assert!(

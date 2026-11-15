@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Core JSON corpora live only in the v32.1 submodule. cargo test stages them
+# Core JSON corpora live only in the pinned submodule. cargo test stages them
 # from third_party/bitcoin/src/test/data each run (see core_fixture.rs).
 #
 # --check: submodule files exist AND fixtures/ has no copies of those names.

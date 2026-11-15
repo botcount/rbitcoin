@@ -288,9 +288,14 @@ fn block_queue_unresolved_heights_via_query() {
     q.block_queue_mark_resolve_complete(10).unwrap();
     q.block_queue_mark_resolve_complete(11).unwrap();
     let skip: HashSet<u32> = [12].into_iter().collect();
-    let got = q.block_queue_unresolved_heights(10, &skip, 8);
+    let mut lens = Vec::new();
+    let got = q.block_queue_unresolved_heights(10, &skip, 8, Some(&mut lens));
     assert_eq!(got, vec![13, 14, 15, 16, 17]);
-    assert_eq!(q.block_queue_unresolved_heights(10, &skip, 2), vec![13, 14]);
+    assert_eq!(lens, vec![1, 1, 1, 1, 1]);
+    assert_eq!(
+        q.block_queue_unresolved_heights(10, &skip, 2, None),
+        vec![13, 14]
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -307,13 +312,16 @@ fn unresolved_heights_walks_past_taken_bq_hole() {
     q.set_lookup_taken_hi(Some(12));
     let none = HashSet::new();
     assert_eq!(
-        q.block_queue_unresolved_heights(10, &none, 8),
+        q.block_queue_unresolved_heights(10, &none, 8, None),
         vec![13, 14, 15, 16, 17, 18, 19]
     );
     assert!(q.block_queue_take_raw(15).is_some());
-    assert_eq!(q.block_queue_unresolved_heights(10, &none, 8), vec![13, 14]);
     assert_eq!(
-        q.block_queue_unresolved_heights(16, &none, 8),
+        q.block_queue_unresolved_heights(10, &none, 8, None),
+        vec![13, 14]
+    );
+    assert_eq!(
+        q.block_queue_unresolved_heights(16, &none, 8, None),
         vec![16, 17, 18, 19]
     );
     let _ = std::fs::remove_dir_all(dir);

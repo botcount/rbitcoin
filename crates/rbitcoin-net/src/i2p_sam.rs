@@ -397,6 +397,8 @@ impl I2pDialer {
 
 // Ed25519 (7), not the SAM DSA_SHA1 default. leaseSetEncType 6 is ML-KEM-768
 // hybrid and 4 is ECIES-X25519, as in Core. Java I2P rejects a third type (6,4,0).
+// No tunnel length: the router's setting applies (three hops by default), as
+// in Core. A one-hop tunnel lets a single relay link our IP to a destination.
 #[doc(hidden)]
 pub fn session_create_line(session_id: &str, dest_arg: &str) -> String {
     let sig = if dest_arg.eq_ignore_ascii_case("TRANSIENT") {
@@ -406,8 +408,7 @@ pub fn session_create_line(session_id: &str, dest_arg: &str) -> String {
     };
     format!(
         "SESSION CREATE STYLE=STREAM ID={session_id} DESTINATION={dest_arg}{sig} \
-         i2cp.leaseSetEncType=6,4 inbound.length=1 outbound.length=1 \
-         inbound.quantity=1 outbound.quantity=1"
+         i2cp.leaseSetEncType=6,4 inbound.quantity=1 outbound.quantity=1"
     )
 }
 
@@ -488,9 +489,10 @@ pub fn i2p_b64_encode(raw: &[u8]) -> String {
         let b1 = if i + 1 < raw.len() { raw[i + 1] } else { 0 };
         let b2 = if i + 2 < raw.len() { raw[i + 2] } else { 0 };
         out.push(ALPH[(b0 >> 2) as usize] as char);
-        out.push(ALPH[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
+        // The two pieces occupy different bits of the index.
+        out.push(ALPH[(((b0 & 3) << 4) + (b1 >> 4)) as usize] as char);
         if i + 1 < raw.len() {
-            out.push(ALPH[(((b1 & 15) << 2) | (b2 >> 6)) as usize] as char);
+            out.push(ALPH[(((b1 & 15) << 2) + (b2 >> 6)) as usize] as char);
         }
         if i + 2 < raw.len() {
             out.push(ALPH[(b2 & 63) as usize] as char);
@@ -504,11 +506,9 @@ pub fn i2p_b64_encode(raw: &[u8]) -> String {
 pub fn sam_kv<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let prefix = format!("{key}=");
     line.split_whitespace().find_map(|tok| {
-        if tok.len() >= prefix.len() && tok[..prefix.len()].eq_ignore_ascii_case(&prefix) {
-            Some(&tok[prefix.len()..])
-        } else {
-            None
-        }
+        // Router text: a char across the `=` index is no key, not a panic.
+        let (k, v) = tok.split_at_checked(prefix.len())?;
+        k.eq_ignore_ascii_case(&prefix).then_some(v)
     })
 }
 

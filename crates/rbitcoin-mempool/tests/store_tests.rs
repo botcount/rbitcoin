@@ -1078,6 +1078,50 @@ fn clear_dirty_keeps_a_second_interval_from_rewriting_meta() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn open_or_init_meta_reads_written_fields_and_rejects_bad_files() {
+    let dir = tmp_dir();
+    let path = dir.join("meta");
+    let mut buf = [0u8; META_LEN];
+    write_meta_bytes(&mut buf, 17, 8, 3);
+    fs::write(&path, buf).unwrap();
+    let (_file, gen, cap, live, schema) = match open_or_init_meta(&path) {
+        Ok(opened) => opened,
+        Err(err) => panic!("{err}"),
+    };
+    assert_eq!((gen, cap, live, schema), (17, 8, 3, MEM_SCHEMA));
+    write_meta_bytes(&mut buf, 1, 0, 0);
+    fs::write(&path, buf).unwrap();
+    match open_or_init_meta(&path) {
+        Err(MempoolError::Corrupt(m)) => assert!(m.contains("slot_cap zero"), "{m}"),
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("zero slot_cap opened"),
+    }
+    let mut junk = [0u8; META_LEN];
+    junk[0..4].copy_from_slice(b"BAD!");
+    fs::write(&path, junk).unwrap();
+    match open_or_init_meta(&path) {
+        Err(MempoolError::BadMagic) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("bad magic opened"),
+    }
+    fs::write(&path, b"rBMP").unwrap();
+    match open_or_init_meta(&path) {
+        Err(MempoolError::Io { .. }) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("short meta opened"),
+    }
+    let fresh = dir.join("missing-meta");
+    let (_file, gen, cap, live, schema) = match open_or_init_meta(&fresh) {
+        Ok(opened) => opened,
+        Err(err) => panic!("{err}"),
+    };
+    assert_eq!(
+        (gen, cap, live, schema),
+        (0, DEFAULT_SLOT_CAP, 0, MEM_SCHEMA)
+    );
+}
+
 /// Two new slot rows share one `pwrite` when they are adjacent. Separate
 /// writes leave the same bytes a reopen reads. The merge is the persist
 /// path for a burst of admits.
@@ -1144,4 +1188,38 @@ fn compact_rejects_a_live_slot_whose_body_range_is_not_in_the_file() {
         other => panic!("expected live slot body range, got {other:?}"),
     }
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn body_logical_len_reads_the_word_and_rejects_short() {
+    let mut body = vec![0u8; BODY_HEADER];
+    body[8..16].copy_from_slice(&24u64.to_le_bytes());
+    body.extend_from_slice(&[0u8; 8]);
+    assert_eq!(body_logical_len(&body).unwrap(), 24);
+    match body_logical_len(&body[..8]) {
+        Err(MempoolError::Corrupt("body too short")) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("a short body reported a length"),
+    }
+    body[8..16].copy_from_slice(&4u64.to_le_bytes());
+    match body_logical_len(&body) {
+        Err(MempoolError::Corrupt("body logical len")) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("a logical length under the header was accepted"),
+    }
+}
+
+#[test]
+fn live_slot_accept_secs_and_txid_roundtrip() {
+    let dir = tmp_dir();
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    let tx = tiny_tx();
+    let tid = tx.compute_txid();
+    let slot = put_live(&mut mp, &tid, 15, 80);
+    assert_eq!(mp.live_accept_secs(slot), Some(1_700_000_000));
+    let live = mp.load_live_txs().unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].packed.txid, tid);
+    assert_eq!(live[0].packed.fee_sat, 15);
+    assert_eq!(live[0].slot, slot);
 }

@@ -35,7 +35,7 @@ pub fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
             "incrementalrelayfee": relay_fee_json(),
             "unbroadcastcount": 0,
             "fullrbf": true,
-            "maxdatacarriersize": Value::Null,
+            "maxdatacarriersize": rbitcoin_consensus::policy::MAX_DATACARRIER_REPORTED_BYTES,
             "limitclustercount": limit_count,
             "limitclustersize": limit_vsize,
             "permitbaremultisig": true,
@@ -60,7 +60,7 @@ pub fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
         "relay_enabled": mp.relay_enabled(),
         "unbroadcastcount": mp.unbroadcast_count(),
         "fullrbf": true,
-        "maxdatacarriersize": Value::Null,
+        "maxdatacarriersize": rbitcoin_consensus::policy::MAX_DATACARRIER_REPORTED_BYTES,
         "limitclustercount": limit_count,
         "limitclustersize": limit_vsize,
         "permitbaremultisig": true,
@@ -356,7 +356,7 @@ fn raw_tx_block(ctx: &RpcContext, hash: [u8; 32]) -> Result<RawTxBlock, Value> {
 
 fn fk_in_block(ctx: &RpcContext, fks: &[Fk], want: &[u8; 32]) -> Result<Option<Fk>, Value> {
     let misc = |e: rbitcoin_query::QueryError| rpc_error(ERR_MISC, e.to_string());
-    if let Some((fk, _)) = ctx.query.get_tx_by_txid(want).map_err(misc)? {
+    if let Some(fk) = ctx.query.tx_fk_by_txid(want).map_err(misc)? {
         if fks.contains(&fk) {
             return Ok(Some(fk));
         }
@@ -530,6 +530,7 @@ pub(crate) fn insert_vin_prevouts(obj: &mut Value, prevouts: &[Value]) {
 fn finish_verbose_tx(
     ctx: &RpcContext,
     tx: &Transaction,
+    txid: &[u8; 32],
     fk: Fk,
     block: Option<Fk>,
     verbosity: u32,
@@ -539,12 +540,12 @@ fn finish_verbose_tx(
     if verbosity >= 2 {
         if let Some((fee, prevouts)) = raw_tx_prevouts(ctx, tx, fk, block, UndoRead::Prevouts)? {
             extra.insert("fee".into(), sat_btc_json(fee));
-            let mut obj = tx_to_json(tx, Some(Value::Object(extra)), net);
+            let mut obj = tx_to_json(tx, Some(txid), Some(Value::Object(extra)), net);
             insert_vin_prevouts(&mut obj, &prevouts);
             return Ok(obj);
         }
     }
-    Ok(tx_to_json(tx, Some(Value::Object(extra)), net))
+    Ok(tx_to_json(tx, Some(txid), Some(Value::Object(extra)), net))
 }
 
 fn getrawtransaction_in_block(
@@ -581,7 +582,43 @@ fn getrawtransaction_in_block(
     } else {
         extra.insert("confirmations".into(), json!(0));
     }
-    finish_verbose_tx(ctx, &tx, fk, Some(block.header_fk), verbosity, extra)
+    finish_verbose_tx(ctx, &tx, &want, fk, Some(block.header_fk), verbosity, extra)
+}
+
+pub(crate) enum RawTxHit {
+    Mempool(Transaction),
+    Chain { tx: Transaction, fk: Fk },
+}
+
+impl RawTxHit {
+    pub(crate) fn tx(&self) -> &Transaction {
+        match self {
+            Self::Mempool(tx) | Self::Chain { tx, .. } => tx,
+        }
+    }
+}
+
+/// Mempool hit, otherwise the chain row. No `blockhash`. The caller already
+/// refused the genesis coinbase.
+pub(crate) fn locate_raw_tx(ctx: &RpcContext, want: [u8; 32]) -> Result<Option<RawTxHit>, Value> {
+    if let Some(mp) = ctx.mempool.as_ref() {
+        let tid = Txid::from_byte_array(want);
+        if let Some(tx) = mp.get_tx(&tid) {
+            return Ok(Some(RawTxHit::Mempool(tx)));
+        }
+    }
+    let Some(fk) = ctx
+        .query
+        .tx_fk_by_txid(&want)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let tx = ctx
+        .query
+        .reconstruct_tx(fk)
+        .map_err(|e| map_query(e, RAW_TX_PRUNED))?;
+    Ok(Some(RawTxHit::Chain { tx, fk }))
 }
 
 pub fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -601,47 +638,50 @@ pub fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, 
         return getrawtransaction_in_block(ctx, want, verbosity, hash);
     }
 
-    if let Some(mp) = ctx.mempool.as_ref() {
-        let tid = Txid::from_byte_array(want);
-        if let Some(tx) = mp.get_tx(&tid) {
+    let Some(hit) = locate_raw_tx(ctx, want)? else {
+        return Err(rpc_error(ERR_INVALID_ADDRESS_OR_KEY, RAW_TX_NOT_FOUND));
+    };
+    match hit {
+        RawTxHit::Mempool(tx) => {
             if verbosity == 0 {
                 return Ok(json!(serialize_hex(&tx)));
             }
             let mut extra = json!({ "in_mempool": true });
-            if let Some(weight) = mp.get_live_adjusted_weight(&tid) {
+            if let Some(weight) = ctx
+                .mempool
+                .as_ref()
+                .and_then(|mp| mp.get_live_adjusted_weight(&Txid::from_byte_array(want)))
+            {
                 extra["vsize_adjusted"] = json!(rbitcoin_consensus::policy::vbytes_ceil(weight));
             }
-            return Ok(tx_to_json(&tx, Some(extra), rpc_btc_network(ctx.network)));
+            Ok(tx_to_json(
+                &tx,
+                Some(&want),
+                Some(extra),
+                rpc_btc_network(ctx.network),
+            ))
+        }
+        RawTxHit::Chain { tx, fk } => {
+            if verbosity == 0 {
+                return Ok(json!(serialize_hex(&tx)));
+            }
+            let mut extra = serde_json::Map::new();
+            extra.insert("in_mempool".into(), json!(false));
+            // The resolver falls back to an unconnected Class A row (reorg orphan,
+            // invalidateblock, never-connected archive). It has no active-chain block,
+            // so it gets the plain object, without confirmations or block fields.
+            if let Some((header, height, tip)) = confirmed_tx_header(ctx, fk)? {
+                extra.insert(
+                    "confirmations".into(),
+                    json!(tip.saturating_sub(height).saturating_add(1)),
+                );
+                extra.insert("blockhash".into(), json!(hash_hex_display(&header.hash)));
+                extra.insert("blocktime".into(), json!(header.timestamp));
+                extra.insert("time".into(), json!(header.timestamp));
+            }
+            finish_verbose_tx(ctx, &tx, &want, fk, None, verbosity, extra)
         }
     }
-
-    let (fk, _) = ctx
-        .query
-        .get_tx_by_txid(&want)
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
-        .ok_or_else(|| rpc_error(ERR_INVALID_ADDRESS_OR_KEY, RAW_TX_NOT_FOUND))?;
-    let tx = ctx
-        .query
-        .reconstruct_tx(fk)
-        .map_err(|e| map_query(e, RAW_TX_PRUNED))?;
-    if verbosity == 0 {
-        return Ok(json!(serialize_hex(&tx)));
-    }
-    let mut extra = serde_json::Map::new();
-    extra.insert("in_mempool".into(), json!(false));
-    // The resolver falls back to an unconnected Class A row (reorg orphan,
-    // invalidateblock, never-connected archive). It has no active-chain block,
-    // so it gets the plain object, without confirmations or block fields.
-    if let Some((header, height, tip)) = confirmed_tx_header(ctx, fk)? {
-        extra.insert(
-            "confirmations".into(),
-            json!(tip.saturating_sub(height).saturating_add(1)),
-        );
-        extra.insert("blockhash".into(), json!(hash_hex_display(&header.hash)));
-        extra.insert("blocktime".into(), json!(header.timestamp));
-        extra.insert("time".into(), json!(header.timestamp));
-    }
-    finish_verbose_tx(ctx, &tx, fk, None, verbosity, extra)
 }
 
 /// Header of the active block that still holds `fk`, plus that height and the tip.
@@ -1352,6 +1392,63 @@ pub fn testmempoolaccept_package_precheck(
     None
 }
 
+fn tma_ids(tx: &Transaction) -> (String, String) {
+    (
+        hash_hex_display(&tx.compute_txid().to_byte_array()),
+        hash_hex_display(&tx.compute_wtxid().to_byte_array()),
+    )
+}
+
+fn tma_reject(txid: &str, wtxid: &str, reason: &str) -> Value {
+    json!({
+        "txid": txid,
+        "wtxid": wtxid,
+        "allowed": false,
+        "reject-reason": reason,
+    })
+}
+
+fn tma_bip125(txid: &str, wtxid: &str) -> Value {
+    json!({
+        "txid": txid,
+        "wtxid": wtxid,
+        "allowed": false,
+        "reject-reason": "bip125-replacement-disallowed",
+        "reject-details": "bip125-replacement-disallowed",
+    })
+}
+
+/// One `testmempoolaccept` allowed or `max-fee-exceeded` row.
+fn tma_from_accept(
+    tx: &Transaction,
+    txid: &str,
+    wtxid: &str,
+    fee_sat: u64,
+    weight: u64,
+    max_feerate: u64,
+) -> Value {
+    if fee_exceeds_max(fee_sat, weight, max_feerate) {
+        return tma_reject(txid, wtxid, "max-fee-exceeded");
+    }
+    json!({
+        "txid": txid,
+        "wtxid": wtxid,
+        "allowed": true,
+        "vsize": rbitcoin_consensus::policy::vbytes_ceil(weight),
+        "vsize_adjusted": rbitcoin_consensus::policy::vbytes_ceil(weight),
+        "vsize_bip141": tx.vsize(),
+        "fees": accept_fees_json(fee_sat, weight, wtxid),
+    })
+}
+
+fn tma_from_err(tx: &Transaction, txid: &str, wtxid: &str, e: &impl std::fmt::Display) -> Value {
+    let mut row = tma_reject(txid, wtxid, &accept_reject_reason(e));
+    if let Some(details) = accept_reject_details(e, tx) {
+        row["reject-details"] = json!(details);
+    }
+    row
+}
+
 #[doc(hidden)]
 pub fn testmempoolaccept_package_rows(
     mp: &MempoolHub,
@@ -1361,15 +1458,9 @@ pub fn testmempoolaccept_package_rows(
     let mut added = Vec::new();
     let mut out = Vec::new();
     for tx in decoded {
-        let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
-        let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
+        let (txid, wtxid) = tma_ids(tx);
         if rpc_tx_version_nonstandard(tx) {
-            out.push(json!({
-                "txid": txid,
-                "wtxid": wtxid,
-                "allowed": false,
-                "reject-reason": "version",
-            }));
+            out.push(tma_reject(&txid, &wtxid, "version"));
             continue;
         }
         if tx
@@ -1377,49 +1468,22 @@ pub fn testmempoolaccept_package_rows(
             .iter()
             .any(|i| mp.spending_txid(&i.previous_output).is_some())
         {
-            out.push(json!({
-                "txid": txid,
-                "wtxid": wtxid,
-                "allowed": false,
-                "reject-reason": "bip125-replacement-disallowed",
-                "reject-details": "bip125-replacement-disallowed",
-            }));
+            out.push(tma_bip125(&txid, &wtxid));
             continue;
         }
         match mp.accept_test_package_member(tx) {
             Ok(r) => {
                 added.push(r.txid);
-                if fee_exceeds_max(r.fee_sat, r.weight, max_feerate) {
-                    out.push(json!({
-                        "txid": txid,
-                        "wtxid": wtxid,
-                        "allowed": false,
-                        "reject-reason": "max-fee-exceeded",
-                    }));
-                } else {
-                    out.push(json!({
-                        "txid": txid,
-                        "wtxid": wtxid,
-                        "allowed": true,
-                        "vsize": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
-                        "vsize_adjusted": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
-                        "vsize_bip141": tx.vsize(),
-                        "fees": accept_fees_json(r.fee_sat, r.weight, &wtxid),
-                    }));
-                }
+                out.push(tma_from_accept(
+                    tx,
+                    &txid,
+                    &wtxid,
+                    r.fee_sat,
+                    r.weight,
+                    max_feerate,
+                ));
             }
-            Err(e) => {
-                let mut row = json!({
-                    "txid": txid,
-                    "wtxid": wtxid,
-                    "allowed": false,
-                    "reject-reason": accept_reject_reason(&e),
-                });
-                if let Some(details) = accept_reject_details(&e, tx) {
-                    row["reject-details"] = json!(details);
-                }
-                out.push(row);
-            }
+            Err(e) => out.push(tma_from_err(tx, &txid, &wtxid, &e)),
         }
     }
     if !added.is_empty() {
@@ -1437,59 +1501,25 @@ pub fn testmempoolaccept_single_rows(
 ) -> Result<Value, Value> {
     let mut out = Vec::new();
     for tx in decoded {
-        let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
-        let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
+        let (txid, wtxid) = tma_ids(&tx);
         if tx_confirmed_on_active_chain(ctx, &tx)? {
-            out.push(json!({
-                "txid": txid,
-                "wtxid": wtxid,
-                "allowed": false,
-                "reject-reason": "txn-already-known",
-            }));
+            out.push(tma_reject(&txid, &wtxid, "txn-already-known"));
             continue;
         }
         if rpc_tx_version_nonstandard(&tx) {
-            out.push(json!({
-                "txid": txid,
-                "wtxid": wtxid,
-                "allowed": false,
-                "reject-reason": "version",
-            }));
+            out.push(tma_reject(&txid, &wtxid, "version"));
             continue;
         }
         match mp.test_accept(&tx) {
-            Ok(r) => {
-                if fee_exceeds_max(r.fee_sat, r.weight, max_feerate) {
-                    out.push(json!({
-                        "txid": txid,
-                        "wtxid": wtxid,
-                        "allowed": false,
-                        "reject-reason": "max-fee-exceeded",
-                    }));
-                    continue;
-                }
-                out.push(json!({
-                    "txid": txid,
-                    "wtxid": wtxid,
-                    "allowed": true,
-                    "vsize": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
-                    "vsize_adjusted": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
-                    "vsize_bip141": tx.vsize(),
-                    "fees": accept_fees_json(r.fee_sat, r.weight, &wtxid),
-                }));
-            }
-            Err(e) => {
-                let mut row = json!({
-                    "txid": txid,
-                    "wtxid": wtxid,
-                    "allowed": false,
-                    "reject-reason": accept_reject_reason(&e),
-                });
-                if let Some(details) = accept_reject_details(&e, &tx) {
-                    row["reject-details"] = json!(details);
-                }
-                out.push(row);
-            }
+            Ok(r) => out.push(tma_from_accept(
+                &tx,
+                &txid,
+                &wtxid,
+                r.fee_sat,
+                r.weight,
+                max_feerate,
+            )),
+            Err(e) => out.push(tma_from_err(&tx, &txid, &wtxid, &e)),
         }
     }
     Ok(json!(out))
@@ -1518,15 +1548,9 @@ async fn testmempoolaccept_package_rows_work(
     let mut added = Vec::new();
     let mut out = Vec::new();
     for tx in decoded {
-        let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
-        let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
+        let (txid, wtxid) = tma_ids(&tx);
         if rpc_tx_version_nonstandard(&tx) {
-            out.push(json!({
-                "txid": txid,
-                "wtxid": wtxid,
-                "allowed": false,
-                "reject-reason": "version",
-            }));
+            out.push(tma_reject(&txid, &wtxid, "version"));
             continue;
         }
         let mp_s = Arc::clone(mp);
@@ -1538,49 +1562,22 @@ async fn testmempoolaccept_package_rows_work(
         })
         .await;
         if spending {
-            out.push(json!({
-                "txid": txid,
-                "wtxid": wtxid,
-                "allowed": false,
-                "reject-reason": "bip125-replacement-disallowed",
-                "reject-details": "bip125-replacement-disallowed",
-            }));
+            out.push(tma_bip125(&txid, &wtxid));
             continue;
         }
         match mp.accept_test_package_member_async(tx.clone()).await {
             Ok(r) => {
                 added.push(r.txid);
-                if fee_exceeds_max(r.fee_sat, r.weight, max_feerate) {
-                    out.push(json!({
-                        "txid": txid,
-                        "wtxid": wtxid,
-                        "allowed": false,
-                        "reject-reason": "max-fee-exceeded",
-                    }));
-                } else {
-                    out.push(json!({
-                        "txid": txid,
-                        "wtxid": wtxid,
-                        "allowed": true,
-                        "vsize": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
-                        "vsize_adjusted": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
-                        "vsize_bip141": tx.vsize(),
-                        "fees": accept_fees_json(r.fee_sat, r.weight, &wtxid),
-                    }));
-                }
+                out.push(tma_from_accept(
+                    &tx,
+                    &txid,
+                    &wtxid,
+                    r.fee_sat,
+                    r.weight,
+                    max_feerate,
+                ));
             }
-            Err(e) => {
-                let mut row = json!({
-                    "txid": txid,
-                    "wtxid": wtxid,
-                    "allowed": false,
-                    "reject-reason": accept_reject_reason(&e),
-                });
-                if let Some(details) = accept_reject_details(&e, &tx) {
-                    row["reject-details"] = json!(details);
-                }
-                out.push(row);
-            }
+            Err(e) => out.push(tma_from_err(&tx, &txid, &wtxid, &e)),
         }
     }
     if !added.is_empty() {
@@ -1597,64 +1594,30 @@ async fn testmempoolaccept_single_rows_async(
 ) -> Result<Value, Value> {
     let mut out = Vec::new();
     for tx in decoded {
-        let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
-        let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
+        let (txid, wtxid) = tma_ids(&tx);
         let ctx_c = Arc::clone(ctx);
         let tx_c = tx.clone();
         let known =
             rbitcoin_net::off_pool_budgeted(move || tx_confirmed_on_active_chain(&ctx_c, &tx_c))
                 .await?;
         if known {
-            out.push(json!({
-                "txid": txid,
-                "wtxid": wtxid,
-                "allowed": false,
-                "reject-reason": "txn-already-known",
-            }));
+            out.push(tma_reject(&txid, &wtxid, "txn-already-known"));
             continue;
         }
         if rpc_tx_version_nonstandard(&tx) {
-            out.push(json!({
-                "txid": txid,
-                "wtxid": wtxid,
-                "allowed": false,
-                "reject-reason": "version",
-            }));
+            out.push(tma_reject(&txid, &wtxid, "version"));
             continue;
         }
         match mp.test_accept_async(tx.clone()).await {
-            Ok(r) => {
-                if fee_exceeds_max(r.fee_sat, r.weight, max_feerate) {
-                    out.push(json!({
-                        "txid": txid,
-                        "wtxid": wtxid,
-                        "allowed": false,
-                        "reject-reason": "max-fee-exceeded",
-                    }));
-                    continue;
-                }
-                out.push(json!({
-                    "txid": txid,
-                    "wtxid": wtxid,
-                    "allowed": true,
-                    "vsize": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
-                    "vsize_adjusted": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
-                    "vsize_bip141": tx.vsize(),
-                    "fees": accept_fees_json(r.fee_sat, r.weight, &wtxid),
-                }));
-            }
-            Err(e) => {
-                let mut row = json!({
-                    "txid": txid,
-                    "wtxid": wtxid,
-                    "allowed": false,
-                    "reject-reason": accept_reject_reason(&e),
-                });
-                if let Some(details) = accept_reject_details(&e, &tx) {
-                    row["reject-details"] = json!(details);
-                }
-                out.push(row);
-            }
+            Ok(r) => out.push(tma_from_accept(
+                &tx,
+                &txid,
+                &wtxid,
+                r.fee_sat,
+                r.weight,
+                max_feerate,
+            )),
+            Err(e) => out.push(tma_from_err(&tx, &txid, &wtxid, &e)),
         }
     }
     Ok(json!(out))
@@ -1822,15 +1785,17 @@ pub fn estimatesmartfee(ctx: &RpcContext, params: &RpcParams) -> Result<Value, V
 }
 
 /// Core's `estimatesmartfee` result: `feerate` and `blocks` with an estimate;
-/// `errors` and `blocks`, and no `feerate`, without one. The hub's published
-/// rates are already at least `mempoolminfee`.
+/// `errors` and `blocks`, and no `feerate`, without one. Target 1 answers
+/// as 2, like Core, while flow is not warm (`smart_fee_target`). The hub's
+/// published rates are already at least `mempoolminfee`.
 #[doc(hidden)]
 pub fn smart_fee_result(ctx: &RpcContext, conf_target: u32) -> Result<Value, Value> {
-    let blocks = conf_target.max(1);
     let Some(mp) = ctx.mempool.as_ref() else {
+        let blocks = rbitcoin_net::tx_relay::smart_fee_target(conf_target, 0.0);
         return Ok(json!({ "errors": ["mempool unavailable"], "blocks": blocks }));
     };
-    Ok(smart_fee_json(blocks, mp.estimate_fee_sat_kvb(conf_target)))
+    let (blocks, rate) = mp.estimate_smart_fee_sat_kvb(conf_target);
+    Ok(smart_fee_json(blocks, rate))
 }
 
 /// Core's result for `rate` (sat/kvB; `None` = no estimate): `feerate` and
@@ -2298,6 +2263,9 @@ struct PackagePlan {
     tx_results: serde_json::Map<String, Value>,
     replaced: Vec<String>,
     any_fail: bool,
+    /// Members whose txid was live at plan time. Their rows are written
+    /// after the package's trim ([`submitpackage_apply`]).
+    live: Vec<Transaction>,
     eval_txs: Vec<Transaction>,
     over_max: Vec<Transaction>,
     package_eval: bool,
@@ -2311,15 +2279,7 @@ pub fn submitpackage_admit(
 ) -> Value {
     let plan = submitpackage_plan(ctx, mp, txs, max_feerate);
     let rows = mp.submit_package_rpc_eval(&plan.eval_txs, plan.package_eval);
-    submitpackage_apply(
-        mp,
-        plan.tx_results,
-        plan.replaced,
-        plan.any_fail,
-        &plan.eval_txs,
-        plan.over_max,
-        rows,
-    )
+    submitpackage_apply(mp, plan, rows)
 }
 
 /// HTTP `submitpackage` admit. Scripts are awaited on the request task.
@@ -2344,18 +2304,7 @@ pub async fn submitpackage_admit_async(
             .await;
         park_before_unbroadcast_note(&mp_a).await;
         let mp_b = Arc::clone(&mp_a);
-        rbitcoin_net::off_pool(move || {
-            submitpackage_apply(
-                &mp_b,
-                plan.tx_results,
-                plan.replaced,
-                plan.any_fail,
-                &plan.eval_txs,
-                plan.over_max,
-                rows,
-            )
-        })
-        .await
+        rbitcoin_net::off_pool(move || submitpackage_apply(&mp_b, plan, rows)).await
     })
     .await
     .expect("submitpackage")
@@ -2370,6 +2319,7 @@ fn submitpackage_plan(
     let mut tx_results = serde_json::Map::new();
     let replaced = Vec::new();
     let mut to_admit = Vec::new();
+    let mut live = Vec::new();
     let mut any_fail = false;
     for tx in txs {
         let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
@@ -2385,26 +2335,10 @@ fn submitpackage_plan(
             );
             continue;
         }
-        if !mp.contains(&tx.compute_txid()) {
-            to_admit.push(tx.clone());
-            continue;
-        }
-        if let (Some((fee, _)), Some(weight)) = (
-            mp.get_live_meta(&tx.compute_txid()),
-            mp.get_live_adjusted_weight(&tx.compute_txid()),
-        ) {
-            tx_results.insert(
-                wtxid,
-                json!({
-                    "txid": txid_s,
-                    "vsize": rbitcoin_consensus::policy::vbytes_ceil(weight),
-                    "vsize_adjusted": rbitcoin_consensus::policy::vbytes_ceil(weight),
-                    "vsize_bip141": tx.vsize(),
-                    "fees": { "base": sat_btc_json(fee as i64) },
-                }),
-            );
+        if mp.contains(&tx.compute_txid()) {
+            live.push(tx.clone());
         } else {
-            tx_results.insert(wtxid, json!({ "txid": txid_s }));
+            to_admit.push(tx.clone());
         }
     }
     // Core compares each member's own feerate with `maxfeerate` before
@@ -2436,6 +2370,7 @@ fn submitpackage_plan(
         tx_results,
         replaced,
         any_fail,
+        live,
         eval_txs,
         over_max,
         package_eval,
@@ -2444,13 +2379,18 @@ fn submitpackage_plan(
 
 fn submitpackage_apply(
     mp: &MempoolHub,
-    mut tx_results: serde_json::Map<String, Value>,
-    mut replaced: Vec<String>,
-    mut any_fail: bool,
-    eval_txs: &[Transaction],
-    over_max: Vec<Transaction>,
+    plan: PackagePlan,
     rows: Vec<rbitcoin_net::tx_relay::SubmitPackageRow>,
 ) -> Value {
+    let PackagePlan {
+        mut tx_results,
+        mut replaced,
+        mut any_fail,
+        live,
+        eval_txs,
+        over_max,
+        package_eval: _,
+    } = plan;
     for (tx, row) in eval_txs.iter().zip(rows) {
         match row.result {
             Ok(ok) => {
@@ -2488,6 +2428,35 @@ fn submitpackage_apply(
                 );
             }
         }
+    }
+    // Core `AcceptPackage` rechecks these by txid after `LimitMempoolSize`:
+    // the package's trim, or a concurrent replace, may have changed them.
+    for tx in &live {
+        let txid = tx.compute_txid();
+        let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
+        let txid_s = hash_hex_display(&txid.to_byte_array());
+        let row = match mp.wtxid_of(&txid) {
+            None => {
+                any_fail = true;
+                json!({ "txid": txid_s, "error": "mempool full" })
+            }
+            // Core `DIFFERENT_WITNESS`: the txid is live under another witness.
+            Some(other) if other != tx.compute_wtxid() => json!({
+                "txid": txid_s,
+                "other-wtxid": hash_hex_display(&other.to_byte_array()),
+            }),
+            Some(_) => match (mp.get_live_meta(&txid), mp.get_live_adjusted_weight(&txid)) {
+                (Some((fee, _)), Some(weight)) => json!({
+                    "txid": txid_s,
+                    "vsize": rbitcoin_consensus::policy::vbytes_ceil(weight),
+                    "vsize_adjusted": rbitcoin_consensus::policy::vbytes_ceil(weight),
+                    "vsize_bip141": tx.vsize(),
+                    "fees": { "base": sat_btc_json(fee as i64) },
+                }),
+                _ => json!({ "txid": txid_s }),
+            },
+        };
+        tx_results.insert(wtxid, row);
     }
     for tx in over_max {
         any_fail = true;
@@ -2535,10 +2504,25 @@ pub fn gettxspendingprevout(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
             .get("txid")
             .and_then(|x| x.as_str())
             .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "txid required"))?;
-        let vout =
-            obj.get("vout")
-                .and_then(|x| x.as_u64())
-                .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "vout required"))? as u32;
+        let vout = match obj.get("vout") {
+            None | Some(Value::Null) => return Err(rpc_error(ERR_TYPE_ERROR, "Missing vout")),
+            Some(v @ Value::Number(_)) => v,
+            Some(v) => {
+                return Err(rpc_error(
+                    ERR_TYPE_ERROR,
+                    format!(
+                        "JSON value of type {} for field vout is not of expected type number",
+                        json_type_name(v)
+                    ),
+                ));
+            }
+        };
+        let vout = u32::try_from(core_json_int::<i32>(vout)?).map_err(|_| {
+            rpc_error(
+                ERR_INVALID_PARAMETER,
+                "Invalid parameter, vout cannot be negative",
+            )
+        })?;
         let want = parse_hash32_display(txid)?;
         let op = OutPoint {
             txid: Txid::from_byte_array(want),
@@ -2594,7 +2578,7 @@ pub fn getorphantxs(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value
         let weight = s.tx.weight().to_wu();
         let mut row = json!({
             "txid": hash_hex_display(&s.tx.compute_txid().to_byte_array()),
-            "wtxid": hash_hex_display(&s.tx.compute_wtxid().to_byte_array()),
+            "wtxid": hash_hex_display(bitcoin::hashes::sha256d::Hash::hash(&raw).as_byte_array()),
             "bytes": raw.len(),
             "vsize": s.tx.vsize(),
             "vsize_bip141": s.tx.vsize(),
@@ -2602,7 +2586,7 @@ pub fn getorphantxs(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value
             "from": s.announcers,
         });
         if verbosity == 2 {
-            row["hex"] = json!(serialize_hex(&s.tx));
+            row["hex"] = json!(rbitcoin_primitives::hex_encode(&raw));
         }
         out.push(row);
     }

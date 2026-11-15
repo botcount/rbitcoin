@@ -189,6 +189,9 @@ enum LaneOwner {
     Empty,
     /// `take` ran outside a tokio task. That thread is the holder.
     PlainThread,
+    /// The id is read by `take_lane_exemption`. A body replaced with `false`
+    /// does not name it; the allow keeps that mutant compiling.
+    #[allow(dead_code)]
     Task(tokio::task::Id),
 }
 
@@ -235,53 +238,56 @@ pub fn arm_lane_oneshot() {
 
 /// True for this whole entry. The oneshot is consumed once so a retry loop
 /// does not lose it, and a tokio worker is not left exempt after the poll.
-#[cfg(debug_assertions)]
 fn take_lane_exemption() -> bool {
-    if on_tip_accept_thread() {
+    #[cfg(not(debug_assertions))]
+    {
         return true;
     }
-    let oneshot = LANE_ONESHOT.with(|c| c.replace(false));
-    if oneshot {
-        return true;
+    #[cfg(debug_assertions)]
+    {
+        if on_tip_accept_thread() {
+            return true;
+        }
+        let oneshot = LANE_ONESHOT.with(|c| c.replace(false));
+        if oneshot {
+            return true;
+        }
+        if lane_held_after_revoke() == 0 {
+            return false;
+        }
+        // `LANE_HELD` is the worker thread. Another task polled there is not
+        // the holder. A plain-thread take has no task id to compare.
+        match LANE_OWNER.with(|c| c.get()) {
+            LaneOwner::Empty => false,
+            // A task polled on this thread is not the plain-thread holder.
+            LaneOwner::PlainThread => tokio::task::try_id().is_none(),
+            LaneOwner::Task(id) => tokio::task::try_id() == Some(id),
+        }
     }
-    if lane_held_after_revoke() == 0 {
-        return false;
-    }
-    // `LANE_HELD` is the worker thread. Another task polled there is not
-    // the holder. A plain-thread take has no task id to compare.
-    match LANE_OWNER.with(|c| c.get()) {
-        LaneOwner::Empty => false,
-        // A task polled on this thread is not the plain-thread holder.
-        LaneOwner::PlainThread => tokio::task::try_id().is_none(),
-        LaneOwner::Task(id) => tokio::task::try_id() == Some(id),
-    }
-}
-
-#[cfg(not(debug_assertions))]
-fn take_lane_exemption() -> bool {
-    true
 }
 
 /// Held across `send` / `try_send` so [`LanePermit::take`] cannot miss a
 /// caller that already decided the lane was free. `None` when this entry is
 /// exempt (the permit holder, or release builds).
-#[cfg(debug_assertions)]
 fn lane_send_guard(exempt: bool) -> Option<std::sync::MutexGuard<'static, ()>> {
-    if exempt || !LANE_GATE_ON.load(Ordering::Acquire) {
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = exempt;
         return None;
     }
-    let mut g = LANE_EXCLUSIVE_MU.lock().unwrap_or_else(|p| p.into_inner());
-    while LANE_EXCLUSIVE.load(Ordering::Acquire) {
-        LANE_SEND_GUARD_WAITERS.fetch_add(1, Ordering::SeqCst);
-        g = LANE_EXCLUSIVE_CV.wait(g).unwrap_or_else(|p| p.into_inner());
-        LANE_SEND_GUARD_WAITERS.fetch_sub(1, Ordering::SeqCst);
+    #[cfg(debug_assertions)]
+    {
+        if exempt || !LANE_GATE_ON.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut g = LANE_EXCLUSIVE_MU.lock().unwrap_or_else(|p| p.into_inner());
+        while LANE_EXCLUSIVE.load(Ordering::Acquire) {
+            LANE_SEND_GUARD_WAITERS.fetch_add(1, Ordering::SeqCst);
+            g = LANE_EXCLUSIVE_CV.wait(g).unwrap_or_else(|p| p.into_inner());
+            LANE_SEND_GUARD_WAITERS.fetch_sub(1, Ordering::SeqCst);
+        }
+        Some(g)
     }
-    Some(g)
-}
-
-#[cfg(not(debug_assertions))]
-fn lane_send_guard(_exempt: bool) -> Option<std::sync::MutexGuard<'static, ()>> {
-    None
 }
 
 #[cfg(debug_assertions)]
@@ -648,14 +654,17 @@ fn send_parked() -> &'static tokio::sync::Notify {
     N.get_or_init(tokio::sync::Notify::new)
 }
 
-/// The async sender is inside its `slot_freed` wait.
+/// The async sender is inside its `slot_freed` wait. Only a `Notified`
+/// created before the park sees it.
 #[doc(hidden)]
 pub fn send_parked_notify() -> &'static tokio::sync::Notify {
     send_parked()
 }
 
+/// `notify_waiters` stores no permit, so a park with no listener does not
+/// fire a listener created later.
 fn note_send_parked() {
-    send_parked().notify_one();
+    send_parked().notify_waiters();
 }
 
 fn note_async_enqueued() {
@@ -845,5 +854,97 @@ pub async fn run_on_tip_accept_async<R: Send + 'static>(
     match (JoinOnDrop { cell }).await {
         Ok(v) => v,
         Err(p) => panic::resume_unwind(p),
+    }
+}
+
+#[cfg(test)]
+mod lane_mutants {
+    use super::*;
+    use std::time::Duration;
+
+    fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn lane_gate_follows_the_flag() {
+        let _one = one_at_a_time();
+        LANE_GATE_ON.store(false, Ordering::Release);
+        let enabled = lane_test_gate_enabled();
+        enable_lane_test_gate();
+        assert!(!enabled, "the gate reports the flag, not a constant");
+        assert!(lane_test_gate_enabled());
+    }
+
+    #[test]
+    fn lane_notify_is_one_static() {
+        let _one = one_at_a_time();
+        assert!(std::ptr::eq(
+            lane_exclusive_notify(),
+            lane_exclusive_notify()
+        ));
+    }
+
+    #[test]
+    fn lane_send_guard_holds_the_permit_mutex() {
+        let _one = one_at_a_time();
+        enable_lane_test_gate();
+        let guard = lane_send_guard(false).expect("a non-exempt send locks");
+        assert!(
+            LANE_EXCLUSIVE_MU.try_lock().is_err(),
+            "the guard must hold the permit mutex"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn nested_release_keeps_the_outer_owner() {
+        let _one = one_at_a_time();
+        hold_lane();
+        hold_lane();
+        release_lane_hold();
+        assert!(
+            !matches!(LANE_OWNER.with(|c| c.get()), LaneOwner::Empty),
+            "an inner release must leave the outer owner"
+        );
+        release_lane_hold();
+        assert!(matches!(LANE_OWNER.with(|c| c.get()), LaneOwner::Empty));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_permit_holder_stays_exempt() {
+        // `block_on` has no task id. The owner compare runs only inside `spawn`.
+        let exempt = tokio::spawn(async {
+            let _one = one_at_a_time();
+            assert!(tokio::task::try_id().is_some(), "spawned work is a task");
+            let permit = LanePermit::take();
+            assert!(
+                matches!(LANE_OWNER.with(|c| c.get()), LaneOwner::Task(_)),
+                "the holder is this task"
+            );
+            let exempt = take_lane_exemption();
+            drop(permit);
+            exempt
+        })
+        .await
+        .expect("task");
+        assert!(exempt, "the holder is exempt");
+    }
+
+    #[test]
+    fn hold_lane_mutex_waits_until_released() {
+        let _one = one_at_a_time();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let rel = Arc::clone(&release);
+        let holder = thread::spawn(move || hold_lane_mutex_for_tests(&rel));
+        thread::sleep(Duration::from_millis(50));
+        assert!(!holder.is_finished(), "the hold returns only after release");
+        {
+            let (lock, cv) = &*release;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        holder.join().expect("holder");
     }
 }

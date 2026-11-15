@@ -5,15 +5,7 @@ use rbitcoin_store::hashhead::{initial_slots_for, HashHead, HeadScale};
 use rbitcoin_store::header_table::*;
 
 fn tmp() -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "rbitcoin-header-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&p);
+    let p = rbitcoin_store::testutil::fresh_path("header");
     std::fs::create_dir_all(&p).unwrap();
     p
 }
@@ -429,17 +421,37 @@ fn ensure_same_hash_twice_is_idempotent() {
 #[test]
 fn header_record_roundtrip_is_88_bytes() {
     let rec = HeaderRecord {
+        prev_fk: Fk(0x0807_0605_0403_0201),
+        version: 0x0403_0201,
+        timestamp: 0x0807_0605,
+        bits: 0x0c0b_0a09,
+        nonce: 0x100f_0e0d,
+        merkle_root: std::array::from_fn(|i| i as u8),
+        hash: std::array::from_fn(|i| (i as u8).wrapping_add(32)),
         size: 285,
         weight: 1140,
-        ..sample([1u8; 32])
     };
     let enc = rec.encode();
     assert_eq!(enc.len(), HEADER_RECORD_LEN);
     let back = HeaderRecord::decode(&enc).unwrap();
     assert_eq!(back.size, 0);
     assert_eq!(back.weight, 0);
+    assert_eq!(back.prev_fk, rec.prev_fk);
+    assert_eq!(back.version, rec.version);
+    assert_eq!(back.timestamp, rec.timestamp);
+    assert_eq!(back.bits, rec.bits);
+    assert_eq!(back.nonce, rec.nonce);
+    assert_eq!(back.merkle_root, rec.merkle_root);
     assert_eq!(back.hash, rec.hash);
-    assert!(HeaderRecord::decode(&[0u8; 40]).is_err());
+    assert!(matches!(
+        HeaderRecord::decode(&[0u8; 40]),
+        Err(StoreError::Corrupt(m)) if m == "short header record"
+    ));
+    let mut longer = [0u8; HEADER_RECORD_LEN_V24];
+    longer[..HEADER_RECORD_LEN].copy_from_slice(&enc);
+    let wide = HeaderRecord::decode(&longer).unwrap();
+    assert_eq!(wide.hash, rec.hash);
+    assert_eq!(wide.nonce, rec.nonce);
 }
 
 #[test]

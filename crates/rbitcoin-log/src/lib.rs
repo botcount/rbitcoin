@@ -5,6 +5,13 @@
 //!
 //! Format: `2026-07-15T19:21:03.456Z  INFO message…`
 //!
+//! When `RBITCOIN_DEBUG_LOG` is set, the plain line is appended to that file
+//! and flushed before stderr, and before [`log_at`] returns. The functional
+//! harness points it at `debug.log` so a test that reads the file as the
+//! socket closes sees a line this call just wrote. A missing env, an empty
+//! path, or a path that cannot be opened stays stderr-only until
+//! `reset_debug_log`.
+//!
 //! [`progress`] keeps live done/total for long stages, readable at any level.
 
 #![forbid(unsafe_code)]
@@ -17,10 +24,86 @@ pub mod progress;
 pub use api_log::PARAMS_MAX;
 pub use api_log::{api_call, close_api_log, init_api_log};
 
+use std::cell::RefCell;
 use std::fmt;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+static DEBUG_LOG: Mutex<Option<File>> = Mutex::new(None);
+/// Set once the env is missing, empty, or the file cannot be opened.
+/// Later lines do not lock the environment or call `open` again.
+static DEBUG_LOG_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Drop the cached `RBITCOIN_DEBUG_LOG` file and read the env again.
+/// Tests delete the path.
+#[doc(hidden)]
+pub fn reset_debug_log() {
+    let mut slot = DEBUG_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    DEBUG_LOG_OFF.store(false, Ordering::Relaxed);
+    *slot = None;
+}
+
+/// Open the debug-log file once. `false` means later lines stay on stderr.
+fn debug_log_sink_ready() -> bool {
+    if DEBUG_LOG_OFF.load(Ordering::Relaxed) {
+        return false;
+    }
+    let mut slot = DEBUG_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    if DEBUG_LOG_OFF.load(Ordering::Relaxed) {
+        return false;
+    }
+    if slot.is_some() {
+        return true;
+    }
+    let Ok(path) = std::env::var("RBITCOIN_DEBUG_LOG") else {
+        DEBUG_LOG_OFF.store(true, Ordering::Relaxed);
+        return false;
+    };
+    if path.is_empty() {
+        DEBUG_LOG_OFF.store(true, Ordering::Relaxed);
+        return false;
+    }
+    match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => {
+            *slot = Some(file);
+            true
+        }
+        Err(_) => {
+            DEBUG_LOG_OFF.store(true, Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+fn append_debug_log(line: &str) {
+    if DEBUG_LOG_OFF.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut slot = DEBUG_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(file) = slot.as_mut() else {
+        return;
+    };
+    let locked = file.lock().is_ok();
+    let _ = writeln!(file, "{line}");
+    let _ = file.flush();
+    if locked {
+        let _ = file.unlock();
+    }
+}
+
+fn write_stderr(level: Level, style: Style, ts: &str, message: &EscapedMessage<'_>) {
+    let mut stderr = io::stderr().lock();
+    let bold = matches!(style, Style::Bold) && io::IsTerminal::is_terminal(&stderr);
+    if bold {
+        let _ = writeln!(stderr, "{ts} {level:<5} \x1b[1m{message}\x1b[0m");
+    } else {
+        let _ = writeln!(stderr, "{ts} {level:<5} {message}");
+    }
+    let _ = stderr.flush();
+}
 
 /// Log severity. Higher numeric values are more verbose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -190,6 +273,52 @@ pub enum Style {
     Bold,
 }
 
+/// Peer- and client-driven info lines that must not append once per event.
+///
+/// The slot is the event class. A distinct header hash, peer address, or
+/// client address does not open a new slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepeatedInfo {
+    ConnectedToSelf = 0,
+    HeaderReject = 1,
+    RpcAtMaxConnections = 2,
+}
+
+const REPEATED_INFO_GAP_MS: u64 = 1_000;
+
+thread_local! {
+    static REPEATED_INFO_AT: RefCell<[Option<Instant>; 3]> = const { RefCell::new([None; 3]) };
+}
+
+/// Forget this thread's last emit time. Tests start a burst from an empty window.
+#[doc(hidden)]
+pub fn reset_repeated_info() {
+    REPEATED_INFO_AT.with(|slot| *slot.borrow_mut() = [None; 3]);
+}
+
+/// [`log_at`] at info, at most once per second for `which` on this thread.
+///
+/// A repeat inside the gap is dropped before capture and before stderr.
+/// The slot is the event class, so a new header hash does not open a new line.
+/// The clock is monotonic, so a wall-clock step does not silence the line.
+pub fn info_repeated(which: RepeatedInfo, args: fmt::Arguments<'_>) {
+    let now = Instant::now();
+    let emit = REPEATED_INFO_AT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let prev = slot[which as usize];
+        if prev.is_some_and(|t| {
+            now.saturating_duration_since(t) < Duration::from_millis(REPEATED_INFO_GAP_MS)
+        }) {
+            return false;
+        }
+        slot[which as usize] = Some(now);
+        true
+    });
+    if emit {
+        log_at(Level::Info, args);
+    }
+}
+
 /// Write one log line if `level` is enabled.
 pub fn log_at(level: Level, args: fmt::Arguments<'_>) {
     log_at_style(level, Style::Plain, args);
@@ -224,14 +353,13 @@ pub fn log_at_style(level: Level, style: Style, args: fmt::Arguments<'_>) {
     let message = args.to_string();
     let message = EscapedMessage(&message);
     let ts = format_timestamp(SystemTime::now());
-    let mut stderr = io::stderr().lock();
-    let bold = matches!(style, Style::Bold) && io::IsTerminal::is_terminal(&stderr);
-    if bold {
-        let _ = writeln!(stderr, "{ts} {level:<5} \x1b[1m{message}\x1b[0m");
-    } else {
-        let _ = writeln!(stderr, "{ts} {level:<5} {message}");
+    // File first. A full stderr pipe must not delay the line a test reads
+    // from debug.log before this call returns and the peer is dropped.
+    if debug_log_sink_ready() {
+        let plain = format!("{ts} {level:<5} {message}");
+        append_debug_log(&plain);
     }
-    let _ = stderr.flush();
+    write_stderr(level, style, &ts, &message);
 }
 
 #[macro_export]

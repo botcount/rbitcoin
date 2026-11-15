@@ -28,19 +28,11 @@ pub fn verify(
     input_index: crate::block::InputIndex,
     tx: &Transaction,
     pre: &TxScriptPrecompute,
+    keyhash: &[u8; 20],
     spk: &[u8],
     amount: Amount,
 ) -> Result<(), ConsensusError> {
-    debug_assert!(spk.len() == 22 && spk.starts_with(&rbitcoin_primitives::P2WPKH_PREFIX));
-    let keyhash: &[u8; 20] = spk
-        .get(2..22)
-        .and_then(|slice| <&[u8; 20]>::try_from(slice).ok())
-        .ok_or_else(|| ConsensusError::Script("p2wpkh program".into()))?;
-
     let (sig_raw, pubkey_raw) = witness_pair(&tx.input[input_index.get()])?;
-    if sig_raw.is_empty() || pubkey_raw.is_empty() {
-        return Err(ConsensusError::Script("p2wpkh empty witness item".into()));
-    }
     verify_loaded(
         job,
         input_index,

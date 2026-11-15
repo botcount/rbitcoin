@@ -202,6 +202,26 @@ fn sample_pulls_atomics() {
 }
 
 #[test]
+fn owned_sizes_json_omits_prep_ahead_inflight() {
+    // Load no longer publishes prep-ahead pins. The sizes line must not
+    // print those counters as zero.
+    #[derive(serde::Serialize)]
+    struct Wrap {
+        #[serde(serialize_with = "ser_process_owned")]
+        owned: ProcessOwnedSizes,
+    }
+    let v = serde_json::to_value(Wrap {
+        owned: ProcessOwnedSizes::default(),
+    })
+    .unwrap();
+    let obj = v["owned"].as_object().unwrap();
+    assert!(obj.get("inflight_layers").is_none(), "{obj:?}");
+    assert!(obj.get("inflight_pins").is_none(), "{obj:?}");
+    assert!(obj.get("inflight_bytes").is_none(), "{obj:?}");
+    assert!(obj.contains_key("wloc_packs"), "{obj:?}");
+}
+
+#[test]
 fn tip_perf_json_is_timestamped() {
     let line = tip_perf_json(&TipPerfLog {
         rss: ProcessRss {

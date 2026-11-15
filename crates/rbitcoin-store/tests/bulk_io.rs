@@ -16,6 +16,37 @@ fn unset_io_env_opens_a_session_except_on_darwin() {
 }
 use std::io::Write;
 
+#[test]
+fn unknown_io_token_takes_the_unset_default() {
+    let unknown = parse_io_token_str("nonsense");
+    assert_eq!(unknown, None);
+    assert_eq!(session_kind_for(unknown), default_session_kind());
+    assert_eq!(session_wanted(unknown), session_wanted(None));
+}
+
+/// `backend_name` is the engine the session probe built, or `pread` when no
+/// session opened. With `RBITCOIN_IO` unset it is the OS default.
+#[test]
+fn backend_name_is_the_session_built_or_pread() {
+    use rbitcoin_store::uring_session::UringSession;
+    let live = backend_name();
+    if io_uring_enabled() {
+        let built = UringSession::try_open(32).expect("the probe opened one");
+        assert_eq!(live, built.kind().name());
+    } else {
+        assert_eq!(live, "pread", "no session means libc pread");
+    }
+    if std::env::var_os("RBITCOIN_IO").is_some() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    assert_eq!(live, "pread", "Darwin defaults to libc pread");
+    #[cfg(target_os = "linux")]
+    assert!(matches!(live, "io_uring" | "pread"), "{live}");
+    #[cfg(windows)]
+    assert!(matches!(live, "iocp" | "pool" | "pread"), "{live}");
+}
+
 fn dummy_handle() -> IoHandle {
     #[cfg(unix)]
     {

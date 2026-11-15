@@ -165,7 +165,7 @@ fn put_full_batch_from_pins_roundtrip() {
     let outs = vec![OutputRecord::unspent(7, vec![0x51])];
     let pin = std::sync::Arc::new((tx, outs));
     let (fks, loc) = t
-        .put_full_batch_from_pins(&[(pin, ins)], true, &[])
+        .put_full_batch_from_pins(&[(pin, ins)], true, SpentBodyImage::zeros(&[1]))
         .unwrap();
     assert_eq!(loc.len(), 1);
     assert_eq!(loc[0].txout, t.body_range(fks[0]).unwrap());
@@ -420,6 +420,184 @@ fn input_n_in_scans_both_prevouts() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn coinbase_batch(n: u8) -> Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> {
+    (1..=n)
+        .map(|i| {
+            let mut txid = [0u8; 32];
+            txid[0] = i;
+            (
+                TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
+                },
+                vec![InputRecord::coinbase(u32::MAX, vec![i], vec![])],
+                vec![OutputRecord::unspent(u64::from(i), vec![0x51])],
+            )
+        })
+        .collect()
+}
+
+fn cut_file_to_header(path: &std::path::Path) {
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_len(rbitcoin_store::file::FILE_HEADER_LEN as u64)
+        .unwrap();
+}
+
+fn write_prune_sidecar(dir: &std::path::Path) {
+    std::fs::write(dir.join("seqsigwit.prune"), u32::MAX.to_le_bytes()).unwrap();
+}
+
+fn coinbases(n: u16) -> Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> {
+    (1..=n)
+        .map(|i| {
+            let mut txid = [0u8; 32];
+            txid[0..2].copy_from_slice(&i.to_le_bytes());
+            (
+                TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
+                },
+                vec![InputRecord::coinbase(
+                    u32::MAX,
+                    i.to_le_bytes().to_vec(),
+                    vec![],
+                )],
+                vec![OutputRecord::unspent(u64::from(i), vec![0x51])],
+            )
+        })
+        .collect()
+}
+
+/// An append died after the locator grew and before the checkpoint landed.
+/// The sidecar is not a cut. Open keeps the checkpoint prefix and the stem.
+#[test]
+fn pruned_short_checkpoint_keeps_the_witness_prefix() {
+    let dir = tempfile_dir("prune-short-checkpoint");
+    let t = create_tiny(&dir);
+    t.put_full_batch_indexed(&coinbases(1100), true).unwrap();
+    t.flush().unwrap();
+    assert_eq!(t.count(), 1100);
+    t.seqsigwit_loc
+        .off
+        .set_logical_len(rbitcoin_store::file::FILE_HEADER_LEN as u64)
+        .unwrap();
+    drop(t);
+    write_prune_sidecar(&dir);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.seqsigwit_loc.count(), 1023);
+    assert_eq!(t.count(), 1023);
+    assert_eq!(t.txids.count(), 1023);
+    assert_eq!(t.input.count(), 1023);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The cut flushed locator length 0 and died before the checkpoint shrank.
+/// That header is the prefix. Open keeps the creates.
+#[test]
+fn header_first_witness_cut_keeps_creates() {
+    let dir = tempfile_dir("prune-header-first-cut");
+    let t = create_tiny(&dir);
+    t.put_full_batch_indexed(&coinbases(1100), true).unwrap();
+    t.flush().unwrap();
+    t.seqsigwit_loc
+        .loc
+        .set_logical_len(rbitcoin_store::file::FILE_HEADER_LEN as u64)
+        .unwrap();
+    t.seqsigwit_loc.loc.flush().unwrap();
+    drop(t);
+    write_prune_sidecar(&dir);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 1100);
+    assert_eq!(t.txids.count(), 1100);
+    assert_eq!(t.input.count(), 1100);
+    assert_eq!(t.seqsigwit_loc.count(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The locator header itself is the short prefix. Open still drops the tail.
+#[test]
+fn pruned_open_still_truncates_a_short_witness_locator() {
+    let dir = tempfile_dir("prune-short-loc");
+    let t = create_tiny(&dir);
+    t.put_full_batch_indexed(&coinbases(4), true).unwrap();
+    t.flush().unwrap();
+    t.seqsigwit_loc.truncate_to_count(2).unwrap();
+    t.flush().unwrap();
+    drop(t);
+    write_prune_sidecar(&dir);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.txids.count(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Prune open keeps creates when the witness stem is only a header.
+#[test]
+fn pruned_open_keeps_creates_when_seqsigwit_stem_is_header() {
+    let dir = tempfile_dir("prune-open-header");
+    let t = create_tiny(&dir);
+    t.put_full_batch_indexed(&coinbase_batch(2), true).unwrap();
+    t.flush().unwrap();
+    let n = t.count();
+    assert_eq!(n, 2);
+    assert_eq!(t.input.count(), n);
+    drop(t);
+    cut_file_to_header(&dir.join("seqsigwit.body"));
+    cut_file_to_header(&dir.join("seqsigwit.loc"));
+    write_prune_sidecar(&dir);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), n, "pruned open must keep creates");
+    assert_eq!(t.input.count(), n);
+    assert!(t.prune_seqsigwit_mode());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Creates and txids landed. The input append did not. The witness stem is
+/// already cut, so open keeps the input prefix instead of refusing to start.
+#[test]
+fn pruned_short_input_after_the_witness_cut_keeps_the_prefix() {
+    let dir = tempfile_dir("prune-open-short-input");
+    let t = create_tiny(&dir);
+    t.put_full_batch_indexed(&coinbase_batch(4), true).unwrap();
+    t.flush().unwrap();
+    t.input.truncate_to_count(2).unwrap();
+    t.flush().unwrap();
+    drop(t);
+    cut_file_to_header(&dir.join("seqsigwit.body"));
+    cut_file_to_header(&dir.join("seqsigwit.loc"));
+    write_prune_sidecar(&dir);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.txids.count(), 2);
+    assert_eq!(t.input.count(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A positive short witness locator still cannot rebuild a short input.
+/// That tail is dropped. Count 0 is the finished cut and is not this case.
+#[test]
+fn pruned_open_truncates_a_positive_short_witness_locator_with_a_short_input() {
+    let dir = tempfile_dir("prune-open-positive-short");
+    let t = create_tiny(&dir);
+    t.put_full_batch_indexed(&coinbase_batch(2), true).unwrap();
+    t.flush().unwrap();
+    t.seqsigwit_loc.truncate_to_count(1).unwrap();
+    t.input.truncate_to_count(0).unwrap();
+    t.flush().unwrap();
+    drop(t);
+    write_prune_sidecar(&dir);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 0);
+    assert_eq!(t.input.count(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// One Class A append roundtrips the output it stored.
 #[test]
 fn put_full_batch_roundtrips_one_output() {
@@ -436,7 +614,7 @@ fn put_full_batch_roundtrips_one_output() {
     let outs = vec![OutputRecord::unspent(7, vec![0x51])];
     let pin = std::sync::Arc::new((tx, outs));
     let (fks, _loc) = t
-        .put_full_batch_from_pins(&[(pin, ins)], true, &[])
+        .put_full_batch_from_pins(&[(pin, ins)], true, SpentBodyImage::zeros(&[1]))
         .unwrap();
     assert_eq!(fks.len(), 1);
     let (tx, got_ins, got_outs) = t.get_full(fks[0]).unwrap();
@@ -484,12 +662,12 @@ fn put_full_batch_from_pins_same_batch_spent_slot() {
         script_sig: vec![0x01],
         witness: vec![],
     }];
-    let overlay = [vec![(0u32, Fk(2), 0)], vec![]];
+    let overlay = SpentBodyImage::from_pairs(&[2, 1], &[vec![(0u32, Fk(2), 0)], vec![]]).unwrap();
     let (fks, loc) = t
         .put_full_batch_from_pins(
             &[(parent_pin, parent_ins), (child_pin, child_ins)],
             false,
-            &overlay,
+            overlay,
         )
         .unwrap();
     assert_eq!(fks, vec![Fk(1), Fk(2)]);
@@ -1043,6 +1221,93 @@ fn reopen_resumes_partial_legacy_input_backfill() {
             vout: 0
         }],
         "resume must read the legacy prevout, not stamp n_in 0"
+    );
+    assert!(
+        !t2.input.pending_sync(),
+        "backfill must sync before open returns"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The prune sidecar is on, and the witness stem still holds the legacy
+/// prevouts. An interrupted backfill has to finish from that stem.
+#[test]
+fn pruned_open_resumes_a_partial_legacy_input_backfill() {
+    let dir = tempfile_dir("input-backfill-prune");
+    let t = create_tiny(&dir);
+    let coinbase = (
+        TxRecord {
+            txid: [1u8; 32],
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+        vec![OutputRecord::unspent(1, vec![0x51])],
+    );
+    let spend = (
+        TxRecord {
+            txid: [2u8; 32],
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        vec![InputRecord {
+            prev_txid: [1u8; 32],
+            parent: InputParent::Prevout {
+                create_fk: Fk(1),
+                vout: 0,
+            },
+            sequence: u32::MAX,
+            script_sig: vec![0xab; 8],
+            witness: vec![vec![0x30; 16]],
+        }],
+        vec![OutputRecord::unspent(2, vec![0x51])],
+    );
+    t.put_full_batch_indexed(&[coinbase, spend], true).unwrap();
+    for (i, payload) in [
+        vec![
+            input_flags::NULL_PREV
+                | input_flags::SEQ_FINAL
+                | input_flags::EMPTY_SCRIPT
+                | input_flags::EMPTY_WITNESS,
+        ],
+        {
+            let mut v = vec![
+                input_flags::SEQ_FINAL | input_flags::EMPTY_SCRIPT | input_flags::EMPTY_WITNESS,
+            ];
+            v.extend_from_slice(&1u64.to_le_bytes());
+            write_compact_size(&mut v, 0);
+            v
+        },
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (off, len) = t.seqsigwit_range(Fk((i + 1) as u64)).unwrap();
+        let mut raw = payload.clone();
+        raw.resize(len as usize, 0);
+        t.seqsigwit.write_body_abs(off, &raw).unwrap();
+    }
+    drop(t);
+    for name in ["input.loc", "input.off", "input.body"] {
+        std::fs::remove_file(dir.join(name)).unwrap();
+    }
+    let partial = rbitcoin_store::input::Input::create(&dir).unwrap();
+    partial
+        .append(&[vec![rbitcoin_store::input::InputEdge::coinbase()]])
+        .unwrap();
+    drop(partial);
+    write_prune_sidecar(&dir);
+    let t2 = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(
+        t2.input.edges(Fk(2)).unwrap().unwrap(),
+        vec![rbitcoin_store::input::InputEdge {
+            parent: Fk(1),
+            vout: 0
+        }]
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4370,6 +4635,42 @@ fn decode_body_meta_v17_reserved_bits_still_corrupt() {
     }
 }
 
+#[test]
+fn tx_record_decode_reads_the_txid_prefix() {
+    let txid = std::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(1));
+    let rec = TxRecord {
+        txid,
+        version: 0x0107,
+        locktime: 0,
+        input_count: 0,
+        output_count: 0,
+    };
+    let enc = rec.encode();
+    let got = TxRecord::decode(&enc).unwrap();
+    assert_eq!(got.txid, txid);
+    assert_eq!(got.version, 0x0107);
+    assert_eq!(got.locktime, 0);
+    match TxRecord::decode(&enc[..31]) {
+        Err(StoreError::Corrupt(msg)) => assert!(msg.contains("short tx record"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn v17_version_word_is_the_four_bytes_after_flags() {
+    let flags = BODY_META_V17_LAYOUT17 | BODY_META_V17_N_IN_TXSTAT | BODY_META_V17_LOCKTIME_ZERO;
+    match decode_body_meta_v17(&[flags]) {
+        Err(StoreError::Corrupt(msg)) => assert!(msg.contains("short v17 txout version"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
+    let buf = [flags, 0x07, 0x01, 0x00, 0x00];
+    let (got, n) = decode_body_meta_v17(&buf).unwrap();
+    assert_eq!(n, 5);
+    assert_eq!(got.version, 0x0107);
+    assert_eq!(got.locktime, 0);
+    assert_eq!(got.input_count, 0);
+}
+
 fn p2pkh_script(h160: [u8; 20]) -> Vec<u8> {
     let mut s = vec![0x76, 0xa9, 0x14];
     s.extend_from_slice(&h160);
@@ -4558,47 +4859,49 @@ fn spent_slot_vin_at_2pow16_is_corrupt() {
 }
 
 #[test]
-fn encode_spent_slots_overlays_one_vout() {
-    let mut buf = Vec::new();
-    encode_spent_slots(3, &[(1, Fk(9), 3)], &mut buf).unwrap();
-    assert_eq!(buf.len(), 24);
-    let (f0, field0, v0) = decode_spent_slot(&buf[0..8]).unwrap();
-    assert_eq!(f0, 0);
-    assert!(field0.is_null());
-    assert_eq!(v0, 0);
-    let (f1, field1, v1) = decode_spent_slot(&buf[8..16]).unwrap();
-    assert_eq!(f1, 0);
-    assert_eq!(field1, Fk(9));
-    assert_eq!(v1, 3);
-    let (f2, field2, _v2) = decode_spent_slot(&buf[16..24]).unwrap();
-    assert_eq!(f2, 0);
-    assert!(field2.is_null());
-}
-
-#[test]
-fn encode_spent_slots_empty_matches_zeros() {
-    let mut a = Vec::new();
-    let mut b = Vec::new();
-    encode_spent_zeros(4, &mut a);
-    encode_spent_slots(4, &[], &mut b).unwrap();
-    assert_eq!(a, b);
-}
-
-#[test]
-fn encode_spent_slots_vout_oob_is_corrupt() {
-    let mut buf = Vec::new();
-    match encode_spent_slots(1, &[(1, Fk(2), 0)], &mut buf) {
-        Err(StoreError::Corrupt(m)) => assert!(m.contains("vout"), "{m}"),
-        other => panic!("expected Corrupt vout, got {other:?}"),
+fn spent_body_image_starts_follow_an_aligned_cursor() {
+    let starts = rbitcoin_store::var_table::exact_body_starts(16, &[16, 8], 24).unwrap();
+    assert_eq!(starts, vec![16, 32]);
+    match rbitcoin_store::var_table::exact_body_starts(17, &[16, 8], 24) {
+        Err(StoreError::Corrupt(m)) => assert!(m.contains("cursor"), "{m}"),
+        other => panic!("expected Corrupt, got {other:?}"),
     }
 }
 
 #[test]
-fn encode_spent_slots_duplicate_vout_last_wins() {
-    let mut buf = Vec::new();
-    encode_spent_slots(1, &[(0, Fk(1), 0), (0, Fk(2), 1)], &mut buf).unwrap();
-    assert_eq!(decode_spent_slot(&buf).unwrap().1, Fk(2));
-    assert_eq!(decode_spent_slot(&buf).unwrap().2, 1);
+fn spent_body_image_keeps_the_lower_fk() {
+    let mut image = SpentBodyImage::zeros(&[2, 1]);
+    assert_eq!(image.offs(), &[0, 16, 24]);
+    assert_eq!(image.bytes().len(), 24);
+    assert!(image.bytes().iter().all(|&b| b == 0));
+
+    image.place(0, 1, Fk(9), 3).unwrap();
+    let want = encode_spent_slot(0, Fk(9), 3).unwrap();
+    assert_eq!(&image.bytes()[8..16], &want);
+    assert!(image.bytes()[0..8].iter().all(|&b| b == 0));
+    assert!(image.bytes()[16..24].iter().all(|&b| b == 0));
+
+    let before = image.bytes().to_vec();
+    image.place(0, 1, Fk(4), 1).unwrap();
+    let (_, fk, vin) = decode_spent_slot(&image.bytes()[8..16]).unwrap();
+    assert_eq!((fk, vin), (Fk(4), 1));
+    image.place(0, 1, Fk(8), 7).unwrap();
+    let (_, fk, vin) = decode_spent_slot(&image.bytes()[8..16]).unwrap();
+    assert_eq!((fk, vin), (Fk(4), 1), "higher fk must not replace");
+    image.place(0, 1, Fk(4), 2).unwrap();
+    let (_, fk, vin) = decode_spent_slot(&image.bytes()[8..16]).unwrap();
+    assert_eq!((fk, vin), (Fk(4), 1), "equal fk keeps the first vin");
+
+    let snap = image.bytes().to_vec();
+    match image.place(0, 2, Fk(1), 0) {
+        Err(StoreError::Corrupt(m)) => assert!(m.contains("vout"), "{m}"),
+        other => panic!("expected Corrupt vout, got {other:?}"),
+    }
+    assert!(image.place(0, 1, Fk(1u64 << 40), 0).is_err());
+    assert!(image.place(0, 1, Fk(1), 1u32 << 16).is_err());
+    assert!(image.place(2, 0, Fk(1), 0).is_err());
+    assert_eq!(image.bytes(), &snap);
+    assert_ne!(before, snap);
 }
 
 #[test]
@@ -4870,3 +5173,164 @@ fn backfill_head_from_empty_and_unindexed() {
 }
 
 mod packed;
+
+fn put_values(t: &TxTable, tag: u8, values: &[u64]) -> Fk {
+    let mut txid = [0u8; 32];
+    txid[0] = tag;
+    txid[1] = 0x5e;
+    let tx = TxRecord {
+        txid,
+        version: 2,
+        locktime: 0,
+        input_count: 1,
+        output_count: values.len() as u32,
+    };
+    let inputs = vec![InputRecord::coinbase(u32::MAX, vec![0x51], vec![])];
+    let outs: Vec<OutputRecord> = values
+        .iter()
+        .map(|&v| OutputRecord::unspent(v, vec![0x6a]))
+        .collect();
+    t.put_full_batch_indexed(&[(tx, inputs, outs)], false)
+        .unwrap()[0]
+}
+
+/// Per-create output value sums over a span, at a span cap that coalesces
+/// everything, one that splits mid-range, and one below every create.
+#[test]
+fn output_value_sums_follow_fk_order_across_span_reads() {
+    let dir = tempfile_dir("value-sums");
+    let t = create_tiny(&dir);
+    let many: Vec<u64> = (0..300u64)
+        .map(|i| if i % 7 == 0 { 0 } else { i * 1_000 + 3 })
+        .collect();
+    let rows: Vec<Vec<u64>> = vec![
+        many,
+        vec![50_0000_0000],
+        vec![0, 0, 0],
+        vec![21_000_000 * 100_000_000, 1],
+        vec![546],
+    ];
+    let fks: Vec<Fk> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, v)| put_values(&t, i as u8 + 1, v))
+        .collect();
+    let want: Vec<u64> = rows.iter().map(|v| v.iter().sum()).collect();
+    let (first, last) = (fks[0].0, fks[fks.len() - 1].0);
+
+    let locs = t.create_loc_range_batch(&fks).unwrap();
+    let lens: Vec<u64> = locs.iter().map(|p| p.unwrap().txout.1).collect();
+    let split = lens[0] + lens[1];
+    assert!(split < lens.iter().sum::<u64>(), "cap must split the range");
+    for cap in [u64::MAX, split, 1] {
+        assert_eq!(
+            t.output_value_sums_in_fk_span(first, last, cap).unwrap(),
+            want,
+            "cap={cap}"
+        );
+    }
+    assert_eq!(
+        t.output_value_sums_in_fk_span(fks[1].0, fks[2].0, split)
+            .unwrap(),
+        want[1..3].to_vec()
+    );
+    assert!(t
+        .output_value_sums_in_fk_span(last, first, split)
+        .unwrap()
+        .is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A create in the span without a location is an error, never a short list.
+#[test]
+fn output_value_sums_missing_location_is_an_error() {
+    let dir = tempfile_dir("value-sums-missing");
+    let t = create_tiny(&dir);
+    let a = put_values(&t, 1, &[5, 6]);
+    let b = put_values(&t, 2, &[7]);
+    assert_eq!(
+        t.output_value_sums_in_fk_span(a.0, b.0, u64::MAX).unwrap(),
+        vec![11, 7]
+    );
+    for (lo, hi) in [(a.0, b.0 + 1), (b.0 + 1, b.0 + 2)] {
+        match t.output_value_sums_in_fk_span(lo, hi, u64::MAX) {
+            Err(StoreError::Corrupt(m)) => assert!(m.contains("create.loc"), "{m}"),
+            other => panic!("expected Corrupt for {lo}..={hi}, got {other:?}"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn input_sequence_and_create_fk_keep_values_and_reject_short() {
+    let flags =
+        input_flags::PREV_ON_INPUTS | input_flags::EMPTY_SCRIPT | input_flags::EMPTY_WITNESS;
+    let mut buf = vec![flags];
+    buf.extend_from_slice(&0x11u32.to_le_bytes());
+    let (rec, n) = InputRecord::decode_at(&buf).unwrap();
+    assert_eq!(n, 5);
+    assert_eq!(rec.sequence, 0x11);
+    match InputRecord::decode_at(&buf[..3]) {
+        Err(StoreError::Corrupt("input sequence truncated")) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("a short sequence decoded"),
+    }
+
+    let mut prev = Vec::new();
+    prev.extend_from_slice(&7u64.to_le_bytes());
+    prev.push(2);
+    let mut off = 0usize;
+    let got = read_inline_prevout(&prev, 0, &mut off).unwrap();
+    assert_eq!(got, Some((Fk(7), 2)));
+    assert_eq!(off, 9);
+    match read_inline_prevout(&prev[..4], 0, &mut 0) {
+        Err(StoreError::Corrupt("input create_fk truncated")) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("a short create_fk decoded"),
+    }
+    let mut zero = 0u64.to_le_bytes().to_vec();
+    zero.push(0);
+    match read_inline_prevout(&zero, 0, &mut 0) {
+        Err(StoreError::Corrupt("non-coinbase create_fk is null")) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("a null create_fk decoded"),
+    }
+}
+
+#[test]
+fn txid_pread_pairs_keep_the_written_id_and_reject_short() {
+    use rbitcoin_store::io_handle::IoHandle;
+    use rbitcoin_store::store_secret::StoreSecret;
+    use rbitcoin_store::txid_body::TXID_BODY_HEADER;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let dir = tempfile_dir("txid-pread");
+    let path = dir.join("txid.body");
+    let mut txid = [0u8; 32];
+    txid[0] = 0x5a;
+    let mut raw = vec![0u8; TXID_BODY_HEADER as usize];
+    raw.extend_from_slice(&txid);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
+    file.write_all(&raw).unwrap();
+    let secret = StoreSecret::from_bytes([3u8; 32]);
+    let fd = IoHandle::from_file(&file);
+    let pairs = TxTable::fuse_pairs_from_txid_pread(fd, &path, &secret, 1, 1).unwrap();
+    assert_eq!(pairs.len(), 1);
+    assert_eq!(pairs[0].1, 1);
+    let expect = rbitcoin_store::fuse8_filter::fuse_key_from_mixed(&secret.mix_txid(&txid));
+    assert_eq!(pairs[0].0, expect);
+
+    file.set_len(TXID_BODY_HEADER + 8).unwrap();
+    match TxTable::fuse_pairs_from_txid_pread(IoHandle::from_file(&file), &path, &secret, 1, 1) {
+        Err(StoreError::Corrupt("tx.head seal collect txid.body short")) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("a short txid body collected"),
+    }
+}

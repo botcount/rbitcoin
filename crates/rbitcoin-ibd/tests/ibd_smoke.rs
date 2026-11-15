@@ -200,6 +200,73 @@ async fn ibd_redial_keeps_dialing_until_a_peer_or_cancel() {
     let _ = std::fs::remove_dir_all(&peer_dir);
 }
 
+/// A row added to the shared book after catch-up starts (the deferred DNS
+/// seeds) is dialled on the next sweep and kept when catch-up flushes the
+/// book. While that session is live the hub counts it as outbound full
+/// relay, and the count drops to 0 when catch-up ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ibd_dials_a_row_added_to_the_shared_book_mid_catch_up() {
+    let seed_dir = tmp_dir("seed-late-row");
+    let peer_dir = tmp_dir("peer-late-row");
+    let seed = start_node(&seed_dir).await;
+    seed_chain(&seed, 2);
+    let peer = start_node(&peer_dir).await;
+    let dead = rbitcoin_net::NetAddr::Ip("127.0.0.1:1".parse().unwrap());
+    let late = rbitcoin_net::NetAddr::Ip(seed.local_addr);
+    let mut book = rbitcoin_net::AddrMan::new();
+    book.add_addr(dead);
+    let shared = Arc::new(std::sync::Mutex::new(book));
+    let mut cfg = IbdConfig::for_test();
+    cfg.target_peers = 1;
+    cfg.connect_timeout = Duration::from_millis(300);
+    cfg.initial_dial_waves = 1;
+    cfg.peerless = rbitcoin_ibd::Peerless::Redial {
+        cap: Duration::from_millis(100),
+    };
+    cfg.peers = Some(Arc::clone(&shared));
+
+    let clock = Arc::clone(&peer.hub.clock);
+    let add_to = Arc::clone(&shared);
+    tokio::spawn(async move {
+        while clock.connection_attempt_at() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        add_to.lock().unwrap().add_addr(late);
+    });
+    let done = Arc::new(AtomicBool::new(false));
+    let max_out = {
+        let (hub, done) = (Arc::clone(&peer.peers), Arc::clone(&done));
+        std::thread::spawn(move || {
+            let mut max = 0;
+            while !done.load(Ordering::SeqCst) {
+                max = max.max(hub.full_outbound_count());
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            max
+        })
+    };
+    let synced = tokio::time::timeout(
+        Duration::from_secs(20),
+        rbitcoin_ibd::sync(&peer, &[dead], cfg),
+    )
+    .await
+    .expect("the next sweep reaches the late row");
+    done.store(true, Ordering::SeqCst);
+    assert!(synced.is_ok(), "{synced:?}");
+    assert_eq!(peer.tip_height(), Some(2));
+    assert_eq!(max_out.join().unwrap(), 1, "the catch-up session counted");
+    assert_eq!(peer.peers.full_outbound_count(), 0);
+    assert!(
+        shared.lock().unwrap().entry_of(&late).is_some(),
+        "flush keeps it"
+    );
+
+    seed.shutdown().await;
+    peer.shutdown().await;
+    let _ = std::fs::remove_dir_all(&seed_dir);
+    let _ = std::fs::remove_dir_all(&peer_dir);
+}
+
 fn logs_from_sync() -> impl Fn() -> Vec<String> {
     rbitcoin_log::capture_logs(true);
     || {
@@ -426,4 +493,156 @@ async fn coord_shared_lock_skips_header_and_store_io() {
     peer.shutdown().await;
     let _ = std::fs::remove_dir_all(&seed_dir);
     let _ = std::fs::remove_dir_all(&peer_dir);
+}
+
+#[test]
+fn for_test_is_the_short_dial_the_catch_up_journeys_use() {
+    // Catch-up journeys dial with for_test. The node default waits longer.
+    let test = IbdConfig::for_test();
+    let node = IbdConfig::default();
+    assert!(test.connect_timeout < node.connect_timeout);
+    assert!(test.stall < node.stall);
+    assert!(test.window < node.window);
+    assert!(test.per_peer < node.per_peer);
+    assert!(test.target_peers < node.target_peers);
+}
+
+#[test]
+fn dial_retry_stays_delay_ahead() {
+    use rbitcoin_ibd::ibd::dial_retry_deadline;
+    use std::time::Instant;
+    let now = Instant::now();
+    let delay = Duration::from_millis(400);
+    assert_eq!(
+        dial_retry_deadline(now, delay).saturating_duration_since(now),
+        delay
+    );
+}
+
+#[test]
+fn catch_up_counts_only_a_live_full_outbound() {
+    use rbitcoin_ibd::ibd::catch_up_full_outbound;
+    use rbitcoin_net::peers::PeerConnType;
+    assert!(catch_up_full_outbound(
+        true,
+        PeerConnType::OutboundFullRelay
+    ));
+    assert!(!catch_up_full_outbound(
+        false,
+        PeerConnType::OutboundFullRelay
+    ));
+    assert!(!catch_up_full_outbound(true, PeerConnType::Manual));
+}
+
+#[test]
+fn ordered_hash_is_past_when_either_side_says_so() {
+    use rbitcoin_ibd::ibd::ordered_hash_is_past;
+    assert!(ordered_hash_is_past(true, None, 0));
+    assert!(ordered_hash_is_past(false, Some(3), 3));
+    assert!(!ordered_hash_is_past(false, Some(4), 3));
+    assert!(!ordered_hash_is_past(false, None, 3));
+}
+
+#[test]
+fn header_path_is_empty_only_before_headers_latch() {
+    use rbitcoin_ibd::ibd::header_path_empty;
+    assert!(header_path_empty(true, false));
+    assert!(!header_path_empty(true, true));
+    assert!(!header_path_empty(false, false));
+}
+
+#[test]
+fn hard_path_reset_is_past_six_stalls_and_drained() {
+    use rbitcoin_ibd::ibd::hard_path_reset_due;
+    let stall = Duration::from_secs(3);
+    let six = stall.saturating_mul(6);
+    let under = six - Duration::from_nanos(1);
+    let over = six + Duration::from_nanos(1);
+    assert!(!hard_path_reset_due(six, stall, true));
+    assert!(!hard_path_reset_due(under, stall, true));
+    assert!(hard_path_reset_due(over, stall, true));
+    assert!(!hard_path_reset_due(over, stall, false));
+}
+
+#[test]
+fn drop_redial_drops_a_blocked_or_live_addr() {
+    use rbitcoin_ibd::ibd::drop_redial_slot;
+    use rbitcoin_net::NetAddr;
+    use std::collections::HashSet;
+    use std::net::SocketAddr;
+    let a = NetAddr::Ip("127.0.0.1:1".parse::<SocketAddr>().unwrap());
+    let b = NetAddr::Ip("127.0.0.1:2".parse::<SocketAddr>().unwrap());
+    let mut blocked = HashSet::new();
+    blocked.insert(a);
+    let none: [NetAddr; 0] = [];
+    assert!(drop_redial_slot(&blocked, none, a));
+    assert!(drop_redial_slot(&HashSet::new(), [a], a));
+    assert!(!drop_redial_slot(&HashSet::new(), [b], a));
+}
+
+#[test]
+fn a_live_slot_is_not_dark() {
+    use rbitcoin_ibd::ibd::peer_slot_alive;
+    assert!(!peer_slot_alive(0));
+    assert!(peer_slot_alive(1));
+}
+
+#[test]
+fn redial_added_any_counts_one() {
+    use rbitcoin_ibd::ibd::redial_added_any;
+    assert!(!redial_added_any(0));
+    assert!(redial_added_any(1));
+}
+
+#[test]
+fn redial_again_only_while_dark_and_willing() {
+    use rbitcoin_ibd::ibd::{redial_again_when_dark, Peerless};
+    let redial = Peerless::Redial {
+        cap: Duration::from_secs(60),
+    };
+    assert!(redial_again_when_dark(0, redial));
+    assert!(!redial_again_when_dark(0, Peerless::GiveUp));
+    assert!(!redial_again_when_dark(1, redial));
+}
+
+#[test]
+fn dark_redial_does_not_wait_fifteen_seconds() {
+    use rbitcoin_ibd::ibd::{redial_interval_for, Peerless};
+    let redial = Peerless::Redial {
+        cap: Duration::from_secs(60),
+    };
+    assert_eq!(redial_interval_for(0, 1, redial), redial.dark_delay(1));
+    assert_ne!(redial_interval_for(0, 1, redial), Duration::from_secs(15));
+    assert_eq!(redial_interval_for(1, 1, redial), Duration::from_secs(15));
+}
+
+#[test]
+fn redial_spawns_only_when_every_conjunct_holds() {
+    use rbitcoin_ibd::ibd::redial_spawn_due;
+    let interval = Duration::from_secs(15);
+    let due = interval;
+    let early = interval - Duration::from_nanos(1);
+    assert!(redial_spawn_due(true, 3, 4, true, true, due, interval));
+    assert!(!redial_spawn_due(false, 3, 4, true, true, due, interval));
+    assert!(!redial_spawn_due(true, 4, 4, true, true, due, interval));
+    assert!(!redial_spawn_due(true, 3, 4, false, true, due, interval));
+    assert!(!redial_spawn_due(true, 3, 4, true, false, due, interval));
+    assert!(!redial_spawn_due(true, 3, 4, true, true, early, interval));
+}
+
+#[test]
+fn overlay_reservation_is_a_live_overlay() {
+    use rbitcoin_ibd::ibd::live_overlay_slot;
+    assert!(live_overlay_slot(true, true));
+    assert!(!live_overlay_slot(false, true));
+    assert!(!live_overlay_slot(true, false));
+}
+
+#[test]
+fn status_tick_is_due_at_five_seconds() {
+    use rbitcoin_ibd::ibd::status_tick_due;
+    assert!(status_tick_due(Duration::from_secs(5)));
+    assert!(!status_tick_due(
+        Duration::from_secs(5) - Duration::from_nanos(1)
+    ));
 }

@@ -88,16 +88,17 @@ pub use net_permissions::{
     WhitebindGrant, WhitelistGrant, DEFAULT_WHITELISTFORCERELAY, DEFAULT_WHITELISTRELAY,
 };
 pub use netaddr::{is_cjdns_ip, NetAddr, OnlyNet};
-pub use netgroup::netgroup;
+pub use netgroup::{netgroup, netgroup_net};
 pub use peer::{
     drain_pending_now, flush_tx_invs, force_announce_txid, local_service_flags, run_feeler_timed,
     PendingBlocks, V2PlainSession, MAX_SERVE_BLOCKS,
 };
 pub use peer_dos::DEFAULT_MAX_INBOUND;
 pub use peers::{
-    connection_counts, outbound_time_offset, parse_peer_addr, parse_peer_addr_with_port,
-    parse_peer_net, pick_stale_follow_evict, DialReady, DialRequest, DialTarget, LivePeer,
-    OutboundPass, OutboundPassCounts, PeerConnType, PeerHub, PeerInfo, PeerOut,
+    connection_counts, ensure_host_port, outbound_time_offset, parse_peer_addr,
+    parse_peer_addr_with_port, parse_peer_net, pick_stale_follow_evict, DialReady, DialRequest,
+    DialTarget, LivePeer, OutboundPass, OutboundPassCounts, PeerConnType, PeerHub, PeerInfo,
+    PeerOut,
 };
 pub use perf_meter::RequestMeter;
 pub use rbitcoin_mempool::MempoolGraphStats;
@@ -105,9 +106,9 @@ pub use rbitcoin_mempool::{
     AcceptError, AcceptResult, CoreDatTx, CoreMempoolDat, SelectBudget, Selected, UtxoProvider,
 };
 pub use reactor::{
-    acquire_armed_store_budget, hold_store_permit, off_pool, off_pool_budgeted,
-    release_store_permit, spawn_with_store_budget, with_store_budget, BlockingRegion,
-    StorePermitGuard,
+    acquire_armed_store_budget, finish_join, hold_store_permit, is_join_error, off_pool,
+    off_pool_budgeted, release_store_permit, spawn_with_store_budget, with_store_budget,
+    with_store_budget_waiters, BlockingRegion, StorePermitGuard,
 };
 pub use seeds::{
     default_port, default_rpc_port, dns_seeds, resolve_dns_seeds, socks_dns_seed_dests, AddrMan,

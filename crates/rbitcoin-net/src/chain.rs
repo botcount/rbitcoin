@@ -28,17 +28,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 thread_local! {
-    static ENSURE_HEADERS_BATCH_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static ENSURE_HEADER_FK_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static HEADER_OF_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static CHAIN_WORK_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static UNRECORDED_WALK_CAP: std::cell::Cell<u32> = const { std::cell::Cell::new(10_000) };
 }
 
-#[cfg(debug_assertions)]
-pub fn reset_header_store_counts() {
-    ENSURE_HEADERS_BATCH_N.with(|c| c.set(0));
-    HEADER_OF_N.with(|c| c.set(0));
-    CHAIN_WORK_N.with(|c| c.set(0));
+/// Test cap for [`ChainHub::assemble_side_branch`]. Returns the previous cap.
+#[doc(hidden)]
+pub fn set_unrecorded_walk_cap(n: u32) -> u32 {
+    UNRECORDED_WALK_CAP.with(|c| c.replace(n))
 }
 
 #[cfg(debug_assertions)]
@@ -49,15 +46,6 @@ pub fn reset_ensure_header_fk_count() {
 #[cfg(debug_assertions)]
 pub fn ensure_header_fk_count() -> u64 {
     ENSURE_HEADER_FK_N.with(|c| c.get())
-}
-
-#[cfg(debug_assertions)]
-pub fn header_store_counts() -> (u64, u64, u64) {
-    (
-        ENSURE_HEADERS_BATCH_N.with(|c| c.get()),
-        HEADER_OF_N.with(|c| c.get()),
-        CHAIN_WORK_N.with(|c| c.get()),
-    )
 }
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -556,9 +544,12 @@ pub fn header_reject(header: &Header, e: &rbitcoin_query::ConfirmError) -> NetEr
         rbitcoin_query::ConfirmError::Rules(r) => r,
     };
     let reason = rbitcoin_consensus::block_reject_reason(rules);
-    rbitcoin_log::info!(
-        "{}",
-        rbitcoin_consensus::block_reject_log_line(header.block_hash(), &reason)
+    rbitcoin_log::info_repeated(
+        rbitcoin_log::RepeatedInfo::HeaderReject,
+        format_args!(
+            "{}",
+            rbitcoin_consensus::block_reject_log_line(header.block_hash(), &reason)
+        ),
     );
     NetError::from_consensus(rules.clone())
 }
@@ -661,9 +652,10 @@ pub struct ChainHub {
     pub confirmed: Arc<RwLock<HashSet<BlockHash>>>,
     /// Serializes tip connect / reorg so multi-peer accept cannot double Class A+C.
     pub connect_lock: std::sync::Mutex<()>,
-    /// Serializes one `generate` call, every block in the loop. Async generate
-    /// holds it across `.await`. Sync generate uses `blocking_lock` only when
-    /// the thread has no runtime handle; otherwise it spins on `try_lock`.
+    /// Serializes one `generate` call, from pool selection through the last
+    /// block. Async generate holds it across `.await`. Sync generate uses
+    /// `blocking_lock` only when the thread has no runtime handle; otherwise
+    /// it spins on `try_lock`.
     pub generate_lock: tokio::sync::Mutex<()>,
     /// Tests stop one `generate` before this 0-based block index. `0` mines
     /// the whole call. Production never sets it.
@@ -810,6 +802,15 @@ pub fn remember_stored_header(
             min_diff_walk: None,
         },
     );
+}
+
+/// Transactions for the first block of one `generate` call.
+///
+/// `Pool` is resolved only while `generate_lock` is held, so the next call
+/// sees removals from the call that just confirmed.
+enum GenerateFirst {
+    Chosen(Vec<Transaction>),
+    Pool,
 }
 
 impl ChainHub {
@@ -1140,12 +1141,7 @@ impl ChainHub {
         let one = self.tip_header().map(|h| h.work()).unwrap_or(zero);
         let mut window = zero;
         for _ in 0..144 {
-            let next = window + one;
-            if next > tip_work {
-                window = tip_work;
-                break;
-            }
-            window = next;
+            window = std::cmp::min(window + one, tip_work);
         }
         let near = tip_work - window;
         match self.min_chain_work_floor() {
@@ -1358,10 +1354,7 @@ impl ChainHub {
     /// background on connect). Must **not** fall back to `height_of_hash` here —
     /// header-only archive rows would force multi-thousand-height scans per call.
     pub fn has_block(&self, hash: &BlockHash) -> bool {
-        if self.cache.get_block(hash).is_some() {
-            return true;
-        }
-        self.confirmed.read().unwrap().contains(hash)
+        self.cache.has_body(hash) || self.confirmed.read().unwrap().contains(hash)
     }
 
     /// True if `hash` is connected on the best chain (has a height).
@@ -1407,10 +1400,8 @@ impl ChainHub {
                     return;
                 };
                 let rank = |s: &str| match s {
-                    "invalid" => 3,
                     "valid-fork" => 2,
                     "valid-headers" => 1,
-                    // `headers-only` and any other label share rank 0.
                     _ => 0,
                 };
                 match map.get(&hash) {
@@ -1553,9 +1544,10 @@ impl ChainHub {
         true
     }
 
-    /// Prev hash from a held/archive body, header-only tip, or the header store.
+    /// Prev hash from a held body, header-only tip, or the header row.
+    /// An archived block is not rebuilt: its header row already names the parent.
     pub fn prev_of(&self, hash: &BlockHash) -> Option<BlockHash> {
-        if let Some(b) = self.load_side_body(hash) {
+        if let Some(b) = self.held_body(hash) {
             return Some(b.header.prev_blockhash);
         }
         if let Some((prev, _)) = self.header_tips.read().unwrap().get(hash) {
@@ -1776,11 +1768,10 @@ impl ChainHub {
     /// A cache hit is the stored body header. It does not rebuild the block.
     /// A miss builds the wire header from the header row, and only that row.
     pub fn header_of(&self, hash: &BlockHash) -> Option<bitcoin::block::Header> {
-        HEADER_OF_N.with(|c| c.set(c.get().saturating_add(1)));
         if let Some(header) = self.cache.get_header(hash) {
             return Some(header);
         }
-        if let Some(b) = self.load_side_body(hash) {
+        if let Some(b) = self.held_body(hash) {
             return Some(b.header);
         }
         let (_, rec) = self
@@ -1881,7 +1872,6 @@ impl ChainHub {
                 self.persist_headers_batch(headers)
             });
         }
-        ENSURE_HEADERS_BATCH_N.with(|c| c.set(c.get().saturating_add(1)));
         if headers.is_empty() {
             return Ok(Vec::new());
         }
@@ -1979,6 +1969,7 @@ impl ChainHub {
 
     /// Off-tip header checks. `validate_header` is only for a confirmed parent,
     /// and that is the call which opens [`rbitcoin_consensus::TrustCollect`].
+    #[allow(clippy::too_many_arguments)] // each argument is one caller fact
     fn apply_off_tip_header(
         query: &rbitcoin_query::Query,
         params: &ChainParams,
@@ -1986,6 +1977,7 @@ impl ChainHub {
         height: u32,
         mtp: u32,
         parent_time: u32,
+        first: Option<rbitcoin_consensus::PeriodFirst>,
         expected: CompactTarget,
     ) -> Result<(), NetError> {
         soften_parent_header(query, header, height, || {
@@ -1995,6 +1987,7 @@ impl ChainHub {
                 header,
                 mtp,
                 parent_time,
+                first,
                 expected,
                 header.block_hash().to_byte_array(),
             )
@@ -2034,7 +2027,9 @@ impl ChainHub {
                 .sync_parent_height(&parent_hash, in_batch)
                 .ok_or_else(|| NetError::Consensus("header parent height unknown".into()))?;
             let mtp = self.mtp_off_tip(&parent, in_batch);
-            let expected = self.expected_bits_off_tip(header, &parent, parent_height, in_batch)?;
+            let first = self.period_first_off_tip(&parent, parent_height, in_batch);
+            let expected =
+                self.expected_bits_off_tip(header, &parent, parent_height, first, in_batch)?;
             // `validate_header` opens the collector, and it only runs for a confirmed parent.
             Self::apply_off_tip_header(
                 self.query.as_ref(),
@@ -2043,6 +2038,7 @@ impl ChainHub {
                 parent_height.saturating_add(1),
                 mtp,
                 parent.time,
+                first,
                 expected,
             )
         })
@@ -2140,15 +2136,34 @@ impl ChainHub {
             .unwrap_or(parent.time)
     }
 
+    /// The header at [`ChainParams::period_first_height`] for the child of
+    /// `parent`, on the branch that ends at `parent`.
+    #[doc(hidden)]
+    pub fn period_first_off_tip(
+        &self,
+        parent: &Header,
+        parent_height: u32,
+        in_batch: &HashMap<[u8; 32], HeaderSyncNode>,
+    ) -> Option<rbitcoin_consensus::PeriodFirst> {
+        let first_h = self
+            .params
+            .period_first_height(parent_height.saturating_add(1))?;
+        self.header_along_off_tip(parent, parent_height, first_h, in_batch)
+            .map(|first| rbitcoin_consensus::PeriodFirst::of(&first))
+    }
+
+    /// `first` is [`Self::period_first_off_tip`] for the same parent.
     #[doc(hidden)]
     pub fn expected_bits_off_tip(
         &self,
         header: &Header,
         parent: &Header,
         parent_height: u32,
+        first: Option<rbitcoin_consensus::PeriodFirst>,
         in_batch: &HashMap<[u8; 32], HeaderSyncNode>,
     ) -> Result<CompactTarget, NetError> {
-        let bits = self.expected_bits_off_tip_base(header, parent, parent_height, in_batch)?;
+        let bits =
+            self.expected_bits_off_tip_base(header, parent, parent_height, first, in_batch)?;
         Ok(rbitcoin_consensus::header::apply_regtest_pow_overlay(
             &self.params,
             parent_height.saturating_add(1),
@@ -2163,6 +2178,7 @@ impl ChainHub {
         header: &Header,
         parent: &Header,
         parent_height: u32,
+        first: Option<rbitcoin_consensus::PeriodFirst>,
         in_batch: &HashMap<[u8; 32], HeaderSyncNode>,
     ) -> Result<CompactTarget, NetError> {
         let height = parent_height.saturating_add(1);
@@ -2176,15 +2192,13 @@ impl ChainHub {
         if self.params.no_pow_retargeting() {
             return Ok(parent.bits);
         }
-        let first_h = height.saturating_sub(interval);
-        let first = self
-            .header_along_off_tip(parent, parent_height, first_h, in_batch)
-            .ok_or_else(|| NetError::Consensus("missing retarget first header".into()))?;
+        let first =
+            first.ok_or_else(|| NetError::Consensus("missing retarget first header".into()))?;
         Ok(rbitcoin_consensus::header::retarget_bits(
             &self.params,
             parent.bits,
             parent.time,
-            rbitcoin_consensus::PeriodFirst::of(&first),
+            first,
         ))
     }
 
@@ -2280,16 +2294,13 @@ impl ChainHub {
         if want > parent_height {
             return None;
         }
-        if want < parent_height {
-            let mut hdr = *parent;
-            let mut h = parent_height;
-            while h > want {
-                hdr = self.sync_parent_header(&hdr.prev_blockhash, in_batch)?;
-                h = h.saturating_sub(1);
-            }
-            return Some(hdr);
+        let mut hdr = *parent;
+        let mut h = parent_height;
+        while h > want {
+            hdr = self.sync_parent_header(&hdr.prev_blockhash, in_batch)?;
+            h = h.saturating_sub(1);
         }
-        Some(*parent)
+        Some(hdr)
     }
 
     /// Contiguous tip-extension slice for one-shot load (owned Block).
@@ -2481,13 +2492,22 @@ impl ChainHub {
     }
 
     /// Core `UpdateTime`: the clock, raised to
-    /// [`rbitcoin_query::next_block_mintime`].
+    /// [`rbitcoin_query::next_block_mintime`]. Past the future limit no block
+    /// on the tip is valid yet, and Core's `CreateNewBlock` refuses
+    /// (bitcoin/bitcoin#36192).
     #[doc(hidden)]
     pub fn generate_block_time(&self, tip_h: u32) -> Result<u32, NetError> {
         let mintime =
             rbitcoin_query::next_block_mintime(self.query.as_ref(), &self.params, Height(tip_h))
                 .map_err(NetError::from_confirm)?;
-        Ok(mintime.max(self.clock.now_secs() as u32))
+        let now = self.clock.now_secs();
+        let time = mintime.max(now as u32);
+        if rbitcoin_consensus::time_too_new(time, now) {
+            return Err(NetError::Rules(
+                rbitcoin_consensus::ConsensusError::BadHeader("timestamp too far in future"),
+            ));
+        }
+        Ok(time)
     }
 
     /// Mine one block paying `script_pubkey` without connecting it.
@@ -2599,11 +2619,66 @@ impl ChainHub {
         self.generate_paying(
             nblocks,
             script_pubkey,
-            extra_txs,
+            GenerateFirst::Chosen(extra_txs),
             Self::GENERATE_MAX_BLOCKS,
             false,
             false,
         )
+    }
+
+    /// Confirm `nblocks` empty regtest blocks through [`rbitcoin_query::confirm_wire_run`].
+    ///
+    /// IBD packs at most 144 blocks into one confirm wave. A long fixture uses
+    /// that wave. [`Self::generate_to_script`] still accepts one block at a time
+    /// on `tip-accept` when the test needs pool txs, assembly stats, or the lane.
+    #[doc(hidden)]
+    pub fn confirm_empty_regtest(&self, nblocks: u32) -> Result<Vec<BlockHash>, NetError> {
+        if nblocks == 0 {
+            return Ok(Vec::new());
+        }
+        if nblocks > Self::GENERATE_MAX_BLOCKS {
+            return Err(NetError::Consensus(format!(
+                "nblocks too large (max {})",
+                Self::GENERATE_MAX_BLOCKS
+            )));
+        }
+        self.ensure_genesis()?;
+        // Same hard cap as `CONFIRM_RUN_MAX_BLOCKS` in the IBD packer.
+        const WAVE: u32 = 144;
+        let mut hashes = Vec::with_capacity(nblocks as usize);
+        let mut left = nblocks;
+        while left > 0 {
+            let n = left.min(WAVE);
+            let tip_h = self
+                .tip_height()
+                .ok_or(NetError::Protocol("confirm: no tip"))?;
+            let mut prev = self
+                .tip_hash()
+                .ok_or(NetError::Protocol("confirm: no tip hash"))?;
+            let base = self.generate_block_time(tip_h)?;
+            let mut blocks = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                let height = tip_h.saturating_add(1).saturating_add(i);
+                let block =
+                    rbitcoin_consensus::mine_empty_regtest(prev, base.saturating_add(i), height);
+                prev = block.block_hash();
+                hashes.push(prev);
+                blocks.push((Height(height), block));
+            }
+            rbitcoin_query::confirm_wire_run(&self.query, &self.params, self.milestone, &blocks)
+                .map_err(NetError::from_confirm)?;
+            let mut confirmed = self.confirmed.write().unwrap();
+            for hash in hashes.iter().skip(hashes.len() - n as usize) {
+                confirmed.insert(*hash);
+            }
+            drop(confirmed);
+            left -= n;
+        }
+        self.ensure_chain_work_prefix()?;
+        // `generate_to_script` seals write-behind indexes before it returns.
+        // A fixture that turned the filter index on needs that same watermark.
+        self.drain_generate_indexes();
+        Ok(hashes)
     }
 
     /// RPC `generate` / `generateblock`. Same mine as [`Self::generate_to_script`],
@@ -2622,10 +2697,30 @@ impl ChainHub {
         self.generate_paying(
             nblocks,
             script_pubkey,
-            extra_txs,
+            GenerateFirst::Chosen(extra_txs),
             Self::GENERATE_MAX_BLOCKS,
             true,
             record_assembly,
+        )
+    }
+
+    /// RPC `generate` / `generatetoaddress` / `generatetodescriptor`.
+    ///
+    /// The pool is read after [`Self::generate_lock`] is held. A second call
+    /// waits, then selects what the first call left.
+    #[doc(hidden)]
+    pub fn generate_pool_for_rpc(
+        &self,
+        nblocks: u32,
+        script_pubkey: ScriptBuf,
+    ) -> Result<Vec<BlockHash>, NetError> {
+        self.generate_paying(
+            nblocks,
+            script_pubkey,
+            GenerateFirst::Pool,
+            Self::GENERATE_MAX_BLOCKS,
+            true,
+            true,
         )
     }
 
@@ -2641,10 +2736,28 @@ impl ChainHub {
         self.generate_paying_async(
             nblocks,
             script_pubkey,
-            extra_txs,
+            GenerateFirst::Chosen(extra_txs),
             Self::GENERATE_MAX_BLOCKS,
             true,
             record_assembly,
+        )
+        .await
+    }
+
+    /// HTTP form of [`Self::generate_pool_for_rpc`].
+    #[doc(hidden)]
+    pub async fn generate_pool_for_rpc_async(
+        self: &std::sync::Arc<Self>,
+        nblocks: u32,
+        script_pubkey: ScriptBuf,
+    ) -> Result<Vec<BlockHash>, NetError> {
+        self.generate_paying_async(
+            nblocks,
+            script_pubkey,
+            GenerateFirst::Pool,
+            Self::GENERATE_MAX_BLOCKS,
+            true,
+            true,
         )
         .await
     }
@@ -2653,7 +2766,7 @@ impl ChainHub {
         self: &std::sync::Arc<Self>,
         nblocks: u32,
         script_pubkey: ScriptBuf,
-        extra_txs: Vec<Transaction>,
+        first: GenerateFirst,
         limit: u32,
         commit_on_accept: bool,
         record_assembly: bool,
@@ -2677,7 +2790,13 @@ impl ChainHub {
             }
             let _guard = hub.generate_lock.lock().await;
             let mut hashes = Vec::with_capacity(nblocks as usize);
-            let mut extras = extra_txs;
+            let mut extras = match first {
+                GenerateFirst::Chosen(txs) => txs,
+                GenerateFirst::Pool => {
+                    let hub = std::sync::Arc::clone(&hub);
+                    crate::reactor::off_pool(move || hub.pool_txs_for_generate()).await
+                }
+            };
             for i in 0..nblocks {
                 let stop = hub.generate_fail_before.load(Ordering::Relaxed);
                 if stop > 0 && i == stop {
@@ -2769,14 +2888,38 @@ impl ChainHub {
         extra_txs: Vec<Transaction>,
         limit: u32,
     ) -> Result<Vec<BlockHash>, NetError> {
-        self.generate_paying(nblocks, script_pubkey, extra_txs, limit, false, false)
+        self.generate_paying(
+            nblocks,
+            script_pubkey,
+            GenerateFirst::Chosen(extra_txs),
+            limit,
+            false,
+            false,
+        )
+    }
+
+    /// Live pool transactions for the first block of `generate`.
+    ///
+    /// Caller holds `generate_lock`. The copy does not remove them;
+    /// `commit_generated_txids` does that after the block is accepted.
+    fn pool_txs_for_generate(&self) -> Vec<Transaction> {
+        self.mempool()
+            .map(|mp| mp.select_generate_txs(self.block_min_tx_fee_sat_kvb()))
+            .unwrap_or_default()
+    }
+
+    fn pool_or_chosen(&self, first: GenerateFirst) -> Vec<Transaction> {
+        match first {
+            GenerateFirst::Chosen(txs) => txs,
+            GenerateFirst::Pool => self.pool_txs_for_generate(),
+        }
     }
 
     fn generate_paying(
         &self,
         nblocks: u32,
         script_pubkey: ScriptBuf,
-        extra_txs: Vec<Transaction>,
+        first: GenerateFirst,
         limit: u32,
         commit_on_accept: bool,
         record_assembly: bool,
@@ -2794,7 +2937,7 @@ impl ChainHub {
         // (rpc_generate.py parallel) cannot race the same tip into AlreadyHave.
         let _guard = self.lock_generate_sync();
         let mut hashes = Vec::with_capacity(nblocks as usize);
-        let mut extras = extra_txs;
+        let mut extras = self.pool_or_chosen(first);
         for i in 0..nblocks {
             let stop = self.generate_fail_before.load(Ordering::Relaxed);
             if stop > 0 && i == stop {
@@ -2817,7 +2960,7 @@ impl ChainHub {
                 self.note_block_assembled(weight, txs.len());
             }
             hashes.push(self.mine_and_accept_paying(&script_pubkey, txs)?);
-            if let Some(ids) = ids.filter(|ids| !ids.is_empty()) {
+            if let Some(ids) = ids {
                 let Some(mp) = self.mempool() else {
                     continue;
                 };
@@ -3190,6 +3333,8 @@ impl ChainHub {
             if keep {
                 kept.push(*tip);
             }
+            // An existing fork tip covers its ancestors even when this call
+            // does not keep that tip.
             if keep || forks.contains(tip) {
                 under_valid.extend(below.iter().copied());
             }
@@ -3217,7 +3362,8 @@ impl ChainHub {
         starts.extend(*self.precious.read().unwrap());
         starts.extend(leaves.iter().copied());
         let mut seen = HashSet::new();
-        starts.retain(|s| seen.insert(*s) && !inv.contains(s) && !skip.contains(s));
+        starts.retain(|s| seen.insert(*s));
+        starts.retain(|s| !skip.contains(s));
         starts
             .into_iter()
             .filter_map(move |s| self.assemble_side_branch(s, restored))
@@ -3432,7 +3578,7 @@ impl ChainHub {
                 if new_height == tip_h {
                     // Park before the branch attempt so connect reads this
                     // session bit. Only an equal-work loser stays parked.
-                    let hash = block.block_hash();
+                    // A hold that was already here stays across a fault.
                     let already =
                         hold_unconnected && self.held_bodies.read().unwrap().contains(&hash);
                     if hold_unconnected {
@@ -3628,10 +3774,8 @@ impl ChainHub {
         fork_height: Option<u32>,
     ) -> Result<Vec<Arc<Block>>, NetError> {
         let tip_h = self.tip_height().unwrap_or(0);
-        let Some(fh) = fork_height.filter(|fh| tip_h > *fh) else {
-            return Ok(Vec::new());
-        };
-        let mut old_path = Vec::with_capacity((tip_h - fh) as usize);
+        let fh = fork_height.unwrap_or(tip_h);
+        let mut old_path = Vec::with_capacity(tip_h.saturating_sub(fh) as usize);
         for h in (fh + 1)..=tip_h {
             let b = self.block_at_height(h)?.ok_or_else(|| {
                 NetError::Store(format!("invariant: no body at connected height {h}"))
@@ -3672,11 +3816,14 @@ impl ChainHub {
                             .map_err(|e| header_reject(&b.header, &e))
                         } else {
                             let parent = &blocks[i - 1].header;
+                            let parent_height = height.saturating_sub(1);
                             let mtp = self.mtp_off_tip(parent, &batch);
+                            let first = self.period_first_off_tip(parent, parent_height, &batch);
                             let expected = self.expected_bits_off_tip(
                                 &b.header,
                                 parent,
-                                height.saturating_sub(1),
+                                parent_height,
+                                first,
                                 &batch,
                             )?;
                             soften_parent_header(self.query.as_ref(), &b.header, height, || {
@@ -3686,6 +3833,7 @@ impl ChainHub {
                                     &b.header,
                                     mtp,
                                     parent.time,
+                                    first,
                                     expected,
                                     hash.to_byte_array(),
                                 )
@@ -3727,9 +3875,6 @@ impl ChainHub {
             .map_err(|e| NetError::Store(e.to_string()))?;
         let Some(fh) = fork_height else {
             while self.query.tip_height().is_some() {
-                if let Some(th) = self.tip_hash() {
-                    self.confirmed.write().unwrap().remove(&th);
-                }
                 self.query
                     .disconnect_tip_in_commit()
                     .map_err(NetError::store)?;
@@ -3758,7 +3903,7 @@ impl ChainHub {
         self.reaccept_disconnected(&gone);
         // An outer invalidate hold still has `template_prev`. Maintenance
         // takes that lock, so it runs after the outer drop instead.
-        let defer_maint = hold.as_ref().is_some_and(|h| h.is_nested());
+        let defer_maint = hold.as_ref().is_some_and(|h| h.nested);
         drop(hold);
         if !defer_maint {
             self.maintain_pool_after_ibd(was_ibd);
@@ -4206,8 +4351,9 @@ impl ChainHub {
         let mut unrecorded = 0u32;
         loop {
             if !restored.contains(&h) {
-                unrecorded += 1;
-                if unrecorded > 10_000 {
+                unrecorded = unrecorded.saturating_add(1);
+                let cap = UNRECORDED_WALK_CAP.with(std::cell::Cell::get);
+                if unrecorded > cap {
                     return None;
                 }
             }
@@ -4458,7 +4604,7 @@ impl ChainHub {
         self.confirmed.write().unwrap().insert(hash);
         let tx_count = block.txdata.len();
         let owned = Arc::try_unwrap(block).unwrap_or_else(|a| (*a).clone());
-        let _ = self.cache.push_best(owned);
+        self.cache.push_best(height, owned);
         // The store can serve this hash now. A staged copy would outlive
         // prune and answer getdata the archive is not allowed to serve.
         self.cache.drop_servable(&hash);
@@ -4545,14 +4691,21 @@ impl ChainHub {
             if h.0 <= keep_height {
                 break;
             }
-            if let Some(th) = self.tip_hash() {
-                self.confirmed.write().unwrap().remove(&th);
+            let gone = self.query.header_at_height(h).map_err(NetError::store)?;
+            let res = self.query.disconnect_tip_keep_pending_in_commit();
+            // A failed disconnect can still have lowered the store tip.
+            let now = self.query.tip_height().map_or(0, |t| t.0);
+            if now < h.0 {
+                if let Some((_, rec)) = gone {
+                    self.confirmed
+                        .write()
+                        .unwrap()
+                        .remove(&BlockHash::from_byte_array(rec.hash));
+                }
             }
-            self.query
-                .disconnect_tip_keep_pending_in_commit()
-                .map_err(NetError::store)?;
+            self.cache.truncate_to_height(now);
+            res.map_err(NetError::store)?;
         }
-        self.cache.truncate_to_height(keep_height);
         if let Some(mp) = mp {
             mp.clear_recent_confirmed();
         }
@@ -4591,11 +4744,6 @@ impl ChainHub {
     #[cfg(debug_assertions)]
     pub fn test_chain_work_prefix_len(&self) -> usize {
         self.chain_work_prefix.read().unwrap().len()
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn reset_block_at_height_calls(&self) {
-        self.block_at_height_calls.store(0, Ordering::Relaxed);
     }
 
     #[cfg(debug_assertions)]
@@ -4653,7 +4801,6 @@ impl ChainHub {
 
     /// Total chain work from genesis through tip (best effort from headers).
     pub fn chain_work(&self) -> Result<Work, NetError> {
-        CHAIN_WORK_N.with(|c| c.set(c.get().saturating_add(1)));
         self.work_from_fork_to_tip(None)
     }
 
@@ -4807,12 +4954,15 @@ pub fn check_block_proposal_with(
             .map(|c| c.to_consensus())
             .unwrap_or(tip_rec.bits);
     let mtp = rbitcoin_query::median_time_past_store(query, tip_h).map_err(|e| e.to_string())?;
+    let period_first =
+        rbitcoin_query::period_first(query, params, height).map_err(|e| e.to_string())?;
     let header = ProposalHeader {
         block,
         height,
         expected_bits: expected,
         mtp,
         parent_time: tip_rec.timestamp,
+        period_first,
         now,
     };
     proposal_header_checks(params, header)?;
@@ -4849,6 +4999,10 @@ pub fn check_block_proposal_with(
     );
     for (tx, ins) in block.txdata.iter().skip(1).zip(prevouts) {
         let prev_spks: Vec<&[u8]> = ins.iter().map(|o| o.script_pubkey.as_bytes()).collect();
+        if params.enforce_bip54 {
+            rbitcoin_consensus::block::reject_bip54_sigops(tx, &prev_spks)
+                .map_err(|e| rbitcoin_consensus::block_reject_reason(&e))?;
+        }
         sigops = sigops.saturating_add(rbitcoin_consensus::tx_sigop_cost(
             tx,
             &prev_spks,
@@ -4871,6 +5025,7 @@ struct ProposalHeader<'a> {
     expected_bits: u32,
     mtp: u32,
     parent_time: u32,
+    period_first: Option<rbitcoin_consensus::PeriodFirst>,
     now: u32,
 }
 
@@ -4881,6 +5036,7 @@ fn proposal_header_checks(params: &ChainParams, header: ProposalHeader<'_>) -> R
         expected_bits,
         mtp,
         parent_time,
+        period_first,
         now,
     } = header;
     if block.header.bits.to_consensus() != expected_bits {
@@ -4892,10 +5048,11 @@ fn proposal_header_checks(params: &ChainParams, header: ProposalHeader<'_>) -> R
     if block.header.time < mtp {
         return Err("time-too-old".into());
     }
-    if let Err(e) = rbitcoin_consensus::header::check_timewarp(
+    if let Err(e) = rbitcoin_consensus::header::check_period_times(
         params,
         Height(height),
         parent_time,
+        period_first,
         &block.header,
     ) {
         return Err(rbitcoin_consensus::block_reject_reason(&e));
@@ -5507,4 +5664,43 @@ pub fn sixty_four_byte_body(prev: BlockHash, time: u32) -> Block {
     rbitcoin_consensus::grind_regtest_pow(&mut block.header);
     assert!(block.check_merkle_root());
     block
+}
+
+#[cfg(test)]
+mod restored_leaf_under_fork_tip {
+    use super::tiny_regtest_hub_labeled;
+    use bitcoin::BlockHash;
+    use std::collections::HashSet;
+
+    /// State after a heavier chain has won and activation left the fork in
+    /// place: the leaf was connected, and that fork tip still covers it.
+    #[test]
+    fn a_leaf_under_an_existing_fork_tip_is_not_recorded() {
+        let (dir, hub) = tiny_regtest_hub_labeled("park-under-fork");
+        hub.ensure_genesis().unwrap();
+        let genesis = hub.tip_hash().unwrap();
+        let time = hub.tip_header().unwrap().time;
+        let leaf = rbitcoin_consensus::mine_empty_regtest(genesis, time + 1, 1);
+        let leaf_hash = leaf.block_hash();
+        let fork = rbitcoin_consensus::mine_empty_regtest(leaf_hash, time + 2, 2);
+        let fork_hash = fork.block_hash();
+        hub.hold_body(std::sync::Arc::new(leaf), false);
+        hub.hold_body(std::sync::Arc::new(fork), false);
+        hub.fork_tips.write().unwrap().insert(fork_hash);
+
+        let restored = HashSet::from([leaf_hash, fork_hash]);
+        let validated = HashSet::from([leaf_hash]);
+        hub.park_restored_leaves(&[leaf_hash], &restored, &validated);
+
+        let forks: Vec<BlockHash> = hub.fork_tips.read().unwrap().iter().collect();
+        assert!(
+            forks.contains(&fork_hash),
+            "the existing fork tip stays: {forks:?}"
+        );
+        assert!(
+            !forks.contains(&leaf_hash),
+            "a restored leaf under that tip is not a tip: {forks:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

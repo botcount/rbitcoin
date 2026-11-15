@@ -48,10 +48,10 @@ name = "model"
 path = "tests/model/main.rs"
 
 [target.'cfg(loom)'.dependencies]
-loom = "0.7"
+loom = "0.7.3"
 
 [target.'cfg(shuttle)'.dependencies]
-shuttle = "0.9"
+shuttle = "0.9.10"
 
 [lints]
 workspace = true

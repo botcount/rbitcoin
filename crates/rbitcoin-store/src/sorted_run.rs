@@ -124,15 +124,71 @@ pub fn mem_available_from_windows_host() -> Option<u64> {
     Some(st.ull_avail_phys)
 }
 
-/// Host memory available for new allocations.
+/// Bytes the cgroup v2 hierarchy still lets this process charge.
 ///
-/// Linux: `MemAvailable`. Darwin: free+inactive pages. Windows: `ullAvailPhys`.
+/// `proc_self_cgroup` is `/proc/self/cgroup` text; its `0::<path>` line is
+/// resolved under `cgroup_root` (the v2 mount). Each level from that cgroup up
+/// to `cgroup_root` caps at `min(memory.max, memory.high)` less
+/// `memory.current` without its reclaimable file pages (`memory.stat`).
+/// `None` when no level sets a limit or the v2 files are absent (v1, hybrid).
+#[cfg(any(debug_assertions, target_os = "linux"))]
+#[doc(hidden)]
+pub fn cgroup_headroom_bytes(cgroup_root: &std::path::Path, proc_self_cgroup: &str) -> Option<u64> {
+    let rel = proc_self_cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?
+        .trim()
+        .trim_start_matches('/');
+    let rel = std::path::Path::new(rel);
+    if rel
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let leaf = cgroup_root.join(rel);
+    leaf.ancestors()
+        .take(rel.components().count() + 1)
+        .filter_map(cgroup_level_headroom)
+        .min()
+}
+
+#[cfg(any(debug_assertions, target_os = "linux"))]
+fn cgroup_level_headroom(dir: &std::path::Path) -> Option<u64> {
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+    let limit = ["memory.max", "memory.high"]
+        .into_iter()
+        .filter_map(|name| read(name)?.trim().parse::<u64>().ok())
+        .min()?;
+    let current: u64 = read("memory.current")?.trim().parse().ok()?;
+    // `memory.current` counts the page cache, which the kernel reclaims
+    // before the OOM killer runs. `file` would also count shmem. No
+    // `memory.stat` counts as nothing to reclaim.
+    let reclaimable: u64 = read("memory.stat").map_or(0, |stat| {
+        stat.lines()
+            .filter_map(|line| line.split_once(' '))
+            .filter(|(key, _)| matches!(*key, "active_file" | "inactive_file"))
+            .filter_map(|(_, v)| v.trim().parse::<u64>().ok())
+            .sum()
+    });
+    Some(limit.saturating_sub(current.saturating_sub(reclaimable)))
+}
+
+/// Memory this process can still allocate.
+///
+/// Linux: `MemAvailable`, capped by cgroup v2 headroom
+/// (`cgroup_headroom_bytes`) so `MemoryMax=` / `docker --memory` bound the
+/// worker count. Darwin: free+inactive pages. Windows: `ullAvailPhys`.
 /// Other OS: `None` (worker cap falls back to 1).
-pub fn host_mem_available_bytes() -> Option<u64> {
+pub fn mem_available_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        mem_available_from_meminfo(&text)
+        let host = mem_available_from_meminfo(&text)?;
+        let cgroup = std::fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .and_then(|t| cgroup_headroom_bytes(std::path::Path::new("/sys/fs/cgroup"), &t));
+        Some(cgroup.map_or(host, |c| host.min(c)))
     }
     #[cfg(target_os = "macos")]
     {
@@ -148,9 +204,9 @@ pub fn host_mem_available_bytes() -> Option<u64> {
     }
 }
 
-/// `MemAvailable` as a log label (`"12.3"` GiB, or `"?"` when unknown).
+/// [`mem_available_bytes`] as a log label (`"12.3"` GiB, or `"?"` when unknown).
 pub fn free_gib_label() -> String {
-    host_mem_available_bytes()
+    mem_available_bytes()
         .map(|b| format!("{:.1}", b as f64 / (1u64 << 30) as f64))
         .unwrap_or_else(|| "?".into())
 }

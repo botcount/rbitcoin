@@ -1,7 +1,9 @@
 use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
-use rbitcoin_mempool::{fee_at_target_sat_kvb, AcceptError, Coin, UtxoProvider};
+use rbitcoin_mempool::{
+    fee_at_target_sat_kvb, AcceptError, Coin, CoreDatTx, CoreMempoolDat, UtxoProvider,
+};
 use rbitcoin_net::fee_history::HistoricalFeeBlock;
 use rbitcoin_net::fee_history_file;
 use rbitcoin_net::tx_relay::parent_req::ParentNote;
@@ -17,6 +19,14 @@ use bitcoin::transaction::Version;
 use bitcoin::{Sequence, TxIn, Witness};
 
 use std::time::{SystemTime, UNIX_EPOCH};
+
+fn block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(fut)
+}
 
 fn tmp() -> std::path::PathBuf {
     // macOS clocks tick in µs: back-to-back calls can share `n`.
@@ -148,6 +158,38 @@ fn confirm_target_two_is_the_two_block_rate() {
         (one - two).abs() > 1e-12,
         "target 2 must not collapse onto target 1 ({one})"
     );
+    let _ = std::fs::remove_dir_all(&mp_dir);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
+/// Core's `estimateSmartFee` answers target 1 as 2. Ours does while the
+/// 1-block quote still blends in the cold q0.999 history (flow fullness < 1).
+#[test]
+fn smart_fee_target_one_is_two_until_flow_is_warm() {
+    let store_dir = tmp();
+    let mp_dir = tmp();
+    let q = Query::open_or_create_tiny(&store_dir).unwrap();
+    let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
+    let rates: Vec<Option<u64>> = FEE_SNAPSHOT_DEPTHS
+        .iter()
+        .enumerate()
+        .map(|(i, _)| Some(10_000 - i as u64 * 100))
+        .collect();
+    let at = |t| fee_at_target_sat_kvb(FEE_SNAPSHOT_DEPTHS, &rates, t);
+    for (fullness, one_as) in [(0.0, 2), (0.99, 2), (1.0, 1)] {
+        let mut snap = FeeSnapshot::empty(Instant::now());
+        snap.depth_rates_sat_kvb = rates.clone();
+        snap.flow_fullness = fullness;
+        hub.fee_dirty.store(false, Ordering::Release);
+        hub.fee_snapshot.store(Arc::new(snap));
+        assert_eq!(
+            hub.estimate_smart_fee_sat_kvb(1),
+            (one_as, at(one_as)),
+            "fullness {fullness}"
+        );
+        assert_eq!(hub.estimate_smart_fee_sat_kvb(2), (2, at(2)));
+        assert_eq!(hub.estimate_smart_fee_sat_kvb(6), (6, at(6)));
+    }
     let _ = std::fs::remove_dir_all(&mp_dir);
     let _ = std::fs::remove_dir_all(&store_dir);
 }
@@ -417,6 +459,70 @@ fn tip_script_pres_skips_only_matching_wtxid() {
     let _ = std::fs::remove_dir_all(&mdir);
 }
 
+#[test]
+fn tip_script_pres_leaves_a_legacy_tx_on_connect() {
+    use rbitcoin_mempool::TxEntry;
+    let dir = tmp();
+    let mdir = tmp();
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    let hub = MempoolHub::open(&mdir, Arc::new(q)).unwrap();
+    let live = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Txid::from_byte_array([3u8; 32]),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::from_slice(&[vec![0x01]]),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    hub.lock_write().graph.insert(
+        TxEntry {
+            txid: live.compute_txid(),
+            wtxid: live.compute_wtxid(),
+            fee_sat: 1,
+            weight: live.weight().to_wu(),
+            sigop_cost: 0,
+            slot: 0,
+            parents: BTreeSet::new(),
+            children: BTreeSet::new(),
+        },
+        &live,
+    );
+    let legacy = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Txid::from_byte_array([4u8; 32]),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::from_bytes(vec![0x51]),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(500),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let (pres, skip) = hub.tip_script_pres(std::slice::from_ref(&legacy));
+    assert!(skip.is_empty());
+    assert!(
+        pres[0].sha_prevouts().is_none(),
+        "a legacy tx must not start the sighash engines"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&mdir);
+}
+
 /// Spend `prev` to one OP_TRUE output of `value`.
 fn spend_vout(prev: OutPoint, value: u64) -> Transaction {
     let mut tx = spend_true(prev.txid, 0, ScriptBuf::from_bytes(vec![0x51]));
@@ -504,7 +610,9 @@ async fn unreturned_isolated_tx_is_sent_again_until_the_cap() {
     let tx = spend_true(cbs[3], 1_000, spk.clone());
     let txid = tx.compute_txid();
     hub.accept_tx_from(&tx, TxOrigin::Local).expect("accept");
-    assert_eq!(hub.next_isolated().await.0, txid);
+    let (first, behind) = hub.next_isolated().await;
+    assert_eq!(first, txid);
+    assert_eq!(behind, 0, "one local tx has nobody waiting behind it");
     hub.isolated_sent(&txid);
     hub.note_mock_now(1_119);
     assert_eq!(hub.requeue_unreturned(), 0, "too soon to send again");
@@ -523,6 +631,52 @@ async fn unreturned_isolated_tx_is_sent_again_until_the_cap() {
         hub.is_local_origin(&txid),
         "past the cap it waits for a block"
     );
+
+    let a = spend_true(cbs[5], 1_000, spk.clone());
+    let b = spend_true(cbs[6], 1_000, spk.clone());
+    let id_a = a.compute_txid();
+    let id_b = b.compute_txid();
+    hub.accept_tx_from(&a, TxOrigin::Local).expect("accept a");
+    hub.accept_tx_from(&b, TxOrigin::Local).expect("accept b");
+    let (got, behind) = hub.next_isolated().await;
+    assert_eq!(got, id_a, "the first submit is taken first");
+    assert_eq!(behind, 1, "the later submit still waits");
+    hub.isolated_sent(&id_a);
+    assert_eq!(hub.next_isolated().await.0, id_b);
+    hub.isolated_sent(&id_b);
+    let queued = hub.isolated_queued();
+    let waiter = tokio::spawn({
+        let hub = Arc::clone(&hub);
+        async move { hub.next_isolated().await }
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !waiter.is_finished(),
+        "next_isolated waits while nothing is queued"
+    );
+    hub.note_mock_now(hub.relay_now_secs() + 181);
+    assert_eq!(hub.requeue_unreturned(), 2);
+    assert_eq!(
+        hub.isolated_queued(),
+        queued + 2,
+        "each unreturned send gets a new place in line"
+    );
+    let woke = tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .expect("requeue must wake next_isolated")
+        .expect("join");
+    assert!(
+        woke.0 == id_a || woke.0 == id_b,
+        "requeue wakes one of the unreturned sends, got {}",
+        woke.0
+    );
+    assert_eq!(woke.1, 1, "the other unreturned send is still waiting");
+    let rest = hub.next_isolated().await.0;
+    assert!(
+        rest == id_a || rest == id_b,
+        "the other unreturned send is next, got {rest}"
+    );
+    assert_ne!(rest, woke.0);
 
     let back = spend_true(cbs[4], 1_000, spk);
     let txid = back.compute_txid();
@@ -571,6 +725,10 @@ async fn returned_tx_waits_for_in_flight_isolated_sends() {
         Some(2_000),
         "the inbound gate starts when the private broadcast ends"
     );
+    assert!(
+        !hub.any_tx_inv_due(),
+        "restamping the only live accept restarts the inbound INV age"
+    );
 
     hub.note_mock_now(3_000);
     let sent = spend_true(cbs[2], 1_000, spk);
@@ -586,6 +744,60 @@ async fn returned_tx_waits_for_in_flight_isolated_sends() {
         hub.accept_time_txid(&txid),
         Some(4_000),
         "an echo after the one-shots restarts the relay age"
+    );
+}
+
+/// The inbound INV floor is the oldest live accept. Confirming a newer tx
+/// keeps it, and confirming the oldest moves it to the next oldest, not the
+/// newest. Ending a private broadcast restamps the oldest accept, and the
+/// floor moves to the other live tx rather than to the new stamp.
+#[tokio::test]
+async fn inv_floor_follows_the_oldest_live_accept() {
+    let (_store, q, cbs) = pad_cbs(6);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let hub = MempoolHub::open(tmp(), Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let admit = |cb: Txid, at: u64| {
+        hub.note_mock_now(at);
+        let tx = spend_true(cb, 1_000, spk.clone());
+        hub.accept_tx(&tx).expect("accept");
+        tx.compute_txid()
+    };
+    let oldest = admit(cbs[1], 1_000);
+    admit(cbs[2], 5_000);
+    let newest = admit(cbs[3], 5_005);
+    hub.note_mock_now(5_010);
+    assert_eq!(hub.remove_for_block(&[newest]), 1);
+    assert!(
+        hub.any_tx_inv_due(),
+        "the 1000 accept is still live and due"
+    );
+    assert_eq!(hub.remove_for_block(&[oldest]), 1);
+    assert!(
+        !hub.any_tx_inv_due(),
+        "the 5000 accept is the floor, 10s old"
+    );
+    hub.note_mock_now(5_030);
+    assert!(hub.any_tx_inv_due(), "the 5000 accept is 30s old");
+
+    let hub = MempoolHub::open(tmp(), Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    hub.set_isolated_broadcast(true);
+    hub.note_mock_now(1_000);
+    let local = spend_true(cbs[4], 1_000, spk.clone());
+    let local_id = local.compute_txid();
+    hub.accept_tx_from(&local, TxOrigin::Local).expect("accept");
+    assert_eq!(hub.next_isolated().await.0, local_id);
+    hub.note_mock_now(5_000);
+    hub.accept_tx(&spend_true(cbs[5], 1_000, spk))
+        .expect("accept");
+    hub.isolated_sent(&local_id);
+    hub.note_mock_now(5_040);
+    hub.note_returned(&local_id);
+    assert_eq!(hub.accept_time_txid(&local_id), Some(5_040));
+    assert!(
+        hub.any_tx_inv_due(),
+        "the floor is the 5000 accept, not the 5040 restamp"
     );
 }
 
@@ -724,6 +936,69 @@ fn unbroadcast_survives_reopen_and_logs_confirm_before_broadcast() {
     let _ = std::fs::remove_dir_all(&mp);
 }
 
+/// `importmempool` logs each Core `LoadMempool` outcome: a fresh admit, a
+/// duplicate, an expired entry, and a tx that cannot enter.
+#[test]
+fn importmempool_counts_each_load_outcome() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    hub.note_mock_now(10_000);
+    hub.set_expiry_hours(1);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let ok = spend_true(cbs[8], 1_000, spk.clone());
+    let expired = spend_true(cbs[9], 1_000, spk.clone());
+    let mut missing = spend_true(cbs[10], 1_000, spk);
+    missing.input[0].previous_output.txid = Txid::from_byte_array([0xcd; 32]);
+    let dat = CoreMempoolDat {
+        txs: vec![
+            CoreDatTx {
+                tx: ok.clone(),
+                time: 10_000,
+                fee_delta: 0,
+            },
+            CoreDatTx {
+                tx: ok.clone(),
+                time: 10_000,
+                fee_delta: 0,
+            },
+            CoreDatTx {
+                tx: expired.clone(),
+                time: 10_000 - 3600 - 5,
+                fee_delta: 0,
+            },
+            CoreDatTx {
+                tx: missing,
+                time: 10_000,
+                fee_delta: 0,
+            },
+        ],
+        deltas: Default::default(),
+        unbroadcast: Default::default(),
+    };
+    rbitcoin_log::capture_logs(true);
+    hub.load_core_mempool_dat(
+        dat,
+        CoreDatImport {
+            use_current_time: false,
+            apply_fee_delta_priority: false,
+            apply_unbroadcast_set: false,
+        },
+    );
+    let logs = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    assert!(
+        logs.iter().any(|(_, line)| line.contains(
+            "Imported mempool transactions from file: 1 succeeded, 1 failed, 1 expired, 1 already there, 0 waiting for initial broadcast"
+        )),
+        "import log must name each outcome, got {logs:?}"
+    );
+    assert!(hub.contains(&ok.compute_txid()));
+    assert!(!hub.contains(&expired.compute_txid()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn scripthash_reopen_drops_parent_then_child() {
     use rbitcoin_store::script_hash;
@@ -766,6 +1041,53 @@ fn scripthash_reopen_drops_parent_then_child() {
     assert!(!hub.scripthash_mempool(&sh).is_empty());
     assert!(hub.remove_for_block(&[child.compute_txid()]) >= 1);
     assert!(hub.scripthash_mempool(&sh).is_empty());
+    let _ = std::fs::remove_dir_all(&mp);
+}
+
+/// The announce names the outpoints an accept spends, and for a replacement
+/// also the ones its victims spent, which it frees.
+#[test]
+fn announce_lists_spent_and_freed_outpoints() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let mp = tmp();
+    let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let mut rx = hub.subscribe_announces();
+    let kept = OutPoint {
+        txid: cbs[4],
+        vout: 0,
+    };
+    let freed = OutPoint {
+        txid: cbs[5],
+        vout: 0,
+    };
+    let input = |previous_output| TxIn {
+        previous_output,
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+        witness: Witness::new(),
+    };
+    let victim = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![input(kept), input(freed)],
+        output: vec![TxOut {
+            value: Amount::from_sat(100_0000_0000 - 1_000),
+            script_pubkey: spk.clone(),
+        }],
+    };
+    hub.accept_tx(&victim).expect("accept victim");
+    let ann = rx.try_recv().expect("victim announce");
+    let listed: BTreeSet<OutPoint> = ann.outpoints.iter().copied().collect();
+    assert_eq!(listed, BTreeSet::from([kept, freed]));
+
+    let replacement = spend_true(cbs[4], 20_000, spk);
+    let r = hub.accept_tx(&replacement).expect("accept replacement");
+    assert_eq!(r.replaced, vec![victim.compute_txid()]);
+    let ann = rx.try_recv().expect("replacement announce");
+    let listed: BTreeSet<OutPoint> = ann.outpoints.iter().copied().collect();
+    assert_eq!(listed, BTreeSet::from([kept, freed]));
     let _ = std::fs::remove_dir_all(&mp);
 }
 
@@ -1669,36 +1991,61 @@ fn onep_rollback_unindexes_slot_eviction() {
 fn failed_1p1c_trim_restores_the_conflict() {
     let (_store, q, cbs) = pad_cbs(3);
     let spk = ScriptBuf::from_bytes(vec![0x51]);
-    let victim = spend_true(cbs[0], 1_000, spk.clone());
-    let victim_id = victim.compute_txid();
+    for (round, on_async) in [false, true].into_iter().enumerate() {
+        let victim = spend_true(cbs[round], 1_000, spk.clone());
+        let victim_id = victim.compute_txid();
+        let dir = tmp();
+        let hub = MempoolHub::open_with_weight(&dir, Arc::clone(&q), victim.weight().to_wu() + 400)
+            .unwrap();
+        hub.set_relay_enabled(true);
+        hub.accept_tx(&victim).expect("victim");
+        let parent = spend_true(cbs[round], 20_000, spk.clone());
+        let parent_id = parent.compute_txid();
+        assert!(hub.try_note_extra_compact(&parent));
+        let mut child = spend_vout(
+            OutPoint {
+                txid: parent_id,
+                vout: 0,
+            },
+            parent.output[0].value.to_sat() - 5_000,
+        );
+        child.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x51; 4_000]);
+        let err = if on_async {
+            block_on(hub.accept_tx_from_async(child.clone(), TxOrigin::Relay(None)))
+        } else {
+            hub.accept_tx(&child)
+        };
+        assert!(
+            err.is_err(),
+            "an over-budget 1p1c must not stay, got {err:?}"
+        );
+        assert!(
+            !hub.contains(&parent_id),
+            "trimmed parent must be rolled back"
+        );
+        assert!(!hub.contains(&child.compute_txid()));
+        assert!(
+            hub.contains(&victim_id),
+            "the conflict the parent replaced must be restored"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A failed re-admit drops the trust mark only when the tx is already gone.
+#[test]
+fn failed_restore_drops_trust_only_when_the_tx_left() {
+    let (_store, q, cbs) = pad_cbs(1);
     let dir = tmp();
-    let hub = MempoolHub::open_with_weight(&dir, q, victim.weight().to_wu() + 400).unwrap();
-    hub.set_relay_enabled(true);
-    hub.accept_tx(&victim).expect("victim");
-    let parent = spend_true(cbs[0], 20_000, spk.clone());
-    let parent_id = parent.compute_txid();
-    assert!(hub.try_note_extra_compact(&parent));
-    let mut child = spend_vout(
-        OutPoint {
-            txid: parent_id,
-            vout: 0,
-        },
-        parent.output[0].value.to_sat() - 5_000,
-    );
-    child.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x51; 4_000]);
-    let err = hub.accept_tx(&child);
+    let hub = MempoolHub::open(&dir, q).unwrap();
+    let mut gone = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    gone.input[0].previous_output.vout = 99;
+    let gone_id = gone.compute_txid();
+    hub.lock_write().trust_kept.insert(gone_id);
+    hub.restore_replaced(&[gone]);
     assert!(
-        err.is_err(),
-        "an over-budget 1p1c must not stay, got {err:?}"
-    );
-    assert!(
-        !hub.contains(&parent_id),
-        "trimmed parent must be rolled back"
-    );
-    assert!(!hub.contains(&child.compute_txid()));
-    assert!(
-        hub.contains(&victim_id),
-        "the conflict the parent replaced must be restored"
+        !hub.lock_read().trust_kept.contains(&gone_id),
+        "a failed re-admit of a tx that is not in the pool drops its trust mark"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1835,8 +2182,8 @@ fn unindex_drops_relay_seq_and_accept_at() {
     assert!(hub.contains(&stay.compute_txid()));
     assert!(hub.relay_seq_of(&gone_w).is_none());
     assert!(hub.relay_seq_of(&stay_w).is_some());
-    // A live tx stays indexed. A gone tx that is not parked drops its maps.
-    // An orphan that is only parked keeps them.
+    // A live tx stays indexed. A gone tx drops its maps, parked or not:
+    // parked is not a tx the node has.
     hub.unindex_if_absent(&stay);
     assert!(hub.relay_seq_of(&stay_w).is_some());
     let orphan = Transaction {
@@ -1871,8 +2218,8 @@ fn unindex_drops_relay_seq_and_accept_at() {
     assert!(hub.relay_seq_of(&orphan_w).is_some());
     hub.unindex_if_absent(&orphan);
     assert!(
-        hub.relay_seq_of(&orphan_w).is_some(),
-        "a parked orphan is still indexed"
+        hub.relay_seq_of(&orphan_w).is_none(),
+        "a parked orphan is not indexed"
     );
     let absent = spend_true(cbs[2], 3_000, ScriptBuf::from_bytes(vec![0x51]));
     let absent_w = absent.compute_wtxid();
@@ -1933,23 +2280,53 @@ fn tx_inv_due_uses_wall_clock_when_mocktime_unset() {
     let _ = std::fs::remove_dir_all(&mp);
 }
 
-/// A tx that is already confirmed-strong leaves the relay maps when purge
-/// drops it. The graph filter is what decides, including a tx that is gone.
+/// A leftover after IBD: the chain already has the parent, the pool still
+/// holds it and its child, then tip-mode maintenance purges the confirmed
+/// parent, persists that, and publishes the template mark.
 #[test]
 fn purge_confirmed_drops_relay_maps() {
     use rbitcoin_consensus::{mine_regtest_paying, ChainParams, Milestone};
     use rbitcoin_primitives::Height;
     use rbitcoin_query::accept_and_connect_block;
+    use rbitcoin_store::script_hash;
 
     let (store, q, cbs) = copy_maturity_pad(3);
     let params = ChainParams::regtest();
+    let empty_dir = tmp();
+    let empty = MempoolHub::open(&empty_dir, Arc::clone(&q)).unwrap();
+    let watch_empty = empty.subscribe_template();
+    let before_empty = *watch_empty.borrow();
+    assert!(empty.begin_pool_maintenance());
+    assert_ne!(
+        *watch_empty.borrow(),
+        before_empty,
+        "first maintenance must publish the tip it armed"
+    );
+    let _ = std::fs::remove_dir_all(&empty_dir);
     let dir = tmp();
     let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
-    hub.set_relay_enabled(true);
-    let tx = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
-    hub.accept_tx(&tx).expect("admit");
-    let w = tx.compute_wtxid();
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let sh = script_hash(spk.as_bytes());
+    let parent = spend_true(cbs[0], 1_000, spk.clone());
+    let child = spend_vout(
+        OutPoint {
+            txid: parent.compute_txid(),
+            vout: 0,
+        },
+        parent.output[0].value.to_sat() - 2_000,
+    );
+    hub.accept_tx(&parent).expect("admit parent");
+    hub.accept_tx(&child).expect("admit child");
+    let fee_dir = tmp();
+    let fee_hub = MempoolHub::open(&fee_dir, Arc::clone(&q)).unwrap();
+    fee_hub
+        .accept_tx(&parent)
+        .expect("admit parent on the fee hub");
+    let parent_id = parent.compute_txid();
+    let child_id = child.compute_txid();
+    let w = parent.compute_wtxid();
     assert!(hub.relay_seq_of(&w).is_some());
+    let mempool_delta = hub.scripthash_unconfirmed_delta(&sh).unwrap();
     let tip_h = q.tip_height().unwrap().0;
     let fk = q.tip_header_fk().unwrap().unwrap();
     let rec = q.get_header(fk).unwrap();
@@ -1959,17 +2336,78 @@ fn purge_confirmed_drops_relay_maps() {
         rec.timestamp + 600,
         tip_h + 1,
         ScriptBuf::from_bytes(vec![0x51]),
-        vec![tx.clone()],
+        vec![parent.clone()],
     );
     accept_and_connect_block(&q, &params, Height(tip_h + 1), &block, Milestone::NONE)
-        .expect("connect the mempool tx");
-    assert!(hub.contains(&tx.compute_txid()));
-    assert!(hub.purge_confirmed_on_chain() >= 1);
-    assert!(!hub.contains(&tx.compute_txid()));
+        .expect("connect the mempool parent");
+    assert!(hub.contains(&parent_id), "connect does not strip the pool");
+    assert!(!hub.pool_maintained());
+    assert_eq!(
+        block_on(hub.remove_for_block_async(vec![parent_id])),
+        0,
+        "per-block strip waits for maintenance"
+    );
+    assert!(
+        hub.contains(&parent_id),
+        "an unmaintained pool keeps the leftover"
+    );
+    fee_hub
+        .fee_dirty
+        .store(false, std::sync::atomic::Ordering::Release);
+    assert!(fee_hub.purge_confirmed_on_chain() >= 1);
+    assert!(
+        fee_hub.fee_dirty.load(std::sync::atomic::Ordering::Acquire),
+        "dropping a confirmed leftover dirties fees"
+    );
+    let _ = std::fs::remove_dir_all(&fee_dir);
+    let leftover_delta = hub.scripthash_unconfirmed_delta(&sh).unwrap();
+    assert_ne!(
+        leftover_delta, mempool_delta,
+        "covered parent output leaves unconfirmed"
+    );
+    assert_eq!(
+        leftover_delta,
+        child.output[0].value.to_sat() as i64,
+        "an unconfirmed child of a leftover parent does not subtract the covered parent again"
+    );
+    let watch = hub.subscribe_template();
+    let before = *watch.borrow();
+    rbitcoin_log::capture_logs(true);
+    assert!(hub.begin_pool_maintenance());
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    assert!(
+        lines
+            .iter()
+            .any(|(_, line)| line.contains("purged 1 leftover tx")),
+        "tip-mode entry must log the leftover, got {lines:?}"
+    );
+    assert!(!hub.contains(&parent_id));
+    assert!(hub.contains(&child_id), "the unconfirmed child stays");
     assert!(
         hub.relay_seq_of(&w).is_none(),
         "purge drops relay maps for a tx the graph no longer holds"
     );
+    assert_ne!(
+        *watch.borrow(),
+        before,
+        "first maintenance must publish the stripped tip"
+    );
+    assert_eq!(*watch.borrow(), hub.template_updates());
+    drop(hub);
+    let reopened = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    assert!(
+        !reopened.contains(&parent_id),
+        "the leftover must stay gone after reopen"
+    );
+    assert!(reopened.contains(&child_id));
+    reopened.set_relay_enabled(true);
+    assert_eq!(
+        block_on(reopened.remove_for_block_async(vec![child_id])),
+        1,
+        "once maintained, the armed path strips a live tx"
+    );
+    assert!(!reopened.contains(&child_id));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&store);
 }
@@ -2074,6 +2512,78 @@ fn dropped_hold_publishes_an_update_that_landed_without_a_commit() {
     }
     assert_eq!(*watch.borrow(), mp.template_updates());
     assert_ne!(*watch.borrow(), before);
+    let idle = *watch.borrow();
+    mp.note_template_update();
+    assert_eq!(
+        *watch.borrow(),
+        mp.template_updates(),
+        "a note with no hold must publish the new generation, not the previous one"
+    );
+    assert_ne!(*watch.borrow(), idle);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
+/// A template build samples the stripped tip twice. If the tip moves between
+/// those reads, the build must retry and arm the new hash, not the stale one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sample_template_prev_retries_when_the_tip_moves() {
+    use rbitcoin_net::{off_pool, sample_template_prev_for_build, with_store_budget};
+    use tokio::sync::Semaphore;
+
+    let dir = tmp();
+    let store_dir = tmp();
+    let q = Query::open_or_create_tiny(&store_dir).unwrap();
+    let mp = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+    let first = [0x11u8; 32];
+    let second = [0x22u8; 32];
+    mp.note_template_prev(first);
+    let armed = tokio::time::timeout(
+        Duration::from_secs(5),
+        sample_template_prev_for_build(Some(Arc::clone(&mp))),
+    )
+    .await
+    .expect("sample of a parked tip")
+    .armed;
+    assert_eq!(armed, Some(Some(first)));
+
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let entered_b = Arc::clone(&entered);
+    let release_b = Arc::clone(&release);
+    let blocker = tokio::spawn(off_pool(move || {
+        entered_b.store(true, std::sync::atomic::Ordering::SeqCst);
+        while !release_b.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }));
+    while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+    let budget = Arc::new(Semaphore::new(0));
+    let sample_mp = Arc::clone(&mp);
+    let task = tokio::spawn(with_store_budget(Arc::clone(&budget), async move {
+        sample_template_prev_for_build(Some(sample_mp)).await
+    }));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    release.store(true, std::sync::atomic::Ordering::SeqCst);
+    blocker.await.expect("off-pool gate");
+    off_pool(|| ()).await;
+    assert!(
+        !task.is_finished(),
+        "sample must be waiting on the store budget between the two tip reads"
+    );
+    mp.note_template_prev(second);
+    budget.add_permits(1);
+    let got = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("sample retried")
+        .expect("join");
+    assert_eq!(
+        got.armed,
+        Some(Some(second)),
+        "a build must not arm the hash from before the tip moved"
+    );
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&store_dir);
 }
@@ -2111,32 +2621,6 @@ fn maintenance_flag_stays_clear_until_the_purge_lock() {
     let _ = std::fs::remove_dir_all(&store_dir);
 }
 
-/// A connect waiting on `template_prev` must see maintenance and the leaving
-/// tip's fee sample. Both are stored before that lock is released.
-fn on_maint_publish(mp: &MempoolHub) {
-    assert!(
-        mp.pool_maintained(),
-        "maintenance flag was still clear inside the template lock"
-    );
-    let height = mp.query.tip_height().expect("tip").0;
-    assert!(
-        mp.block_p10_history.lock().unwrap().get(height).is_some(),
-        "leaving tip was not in fee history inside the template lock"
-    );
-}
-
-#[test]
-fn maintenance_is_published_before_the_template_lock_releases() {
-    let (store, q, _cbs) = copy_maturity_pad(3);
-    let dir = tmp();
-    let mp = MempoolHub::open(&dir, q).unwrap();
-    MempoolHub::set_maint_publish_hook(on_maint_publish);
-    assert!(mp.begin_pool_maintenance());
-    assert!(mp.pool_maintained());
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&store);
-}
-
 /// Callers queue a feefilter only when the stored relay bit changes. A second
 /// call, and a purge that does not publish, are not an edge.
 #[test]
@@ -2157,10 +2641,18 @@ fn relay_edge_reports_a_change_only_when_the_bit_moves() {
         None,
         "a second on is not an edge"
     );
+    assert!(
+        !mp.take_fee_backfill_due(),
+        "a second on must not queue another fee-history preload"
+    );
     assert_eq!(mp.apply_relay_edge(false), Some(false));
     assert!(!mp.relay_enabled());
     assert!(mp.pool_maintained(), "pausing relay keeps pool maintenance");
     assert_eq!(mp.apply_relay_edge(false), None);
+    assert!(
+        !mp.take_fee_backfill_due(),
+        "turning relay off when it is already off is not a preload edge"
+    );
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&store_dir);
 }
@@ -2180,6 +2672,11 @@ fn remove_for_block_skipped_until_relay_then_purge() {
     // Strip stays deferred until maintenance begins. The mined delta still drops.
     assert_eq!(mp.remove_for_block(&[dummy]), 0);
     assert_eq!(
+        block_on(mp.remove_for_block_async(vec![dummy])),
+        0,
+        "the armed strip is deferred until maintenance too"
+    );
+    assert_eq!(
         mp.fee_delta(&dummy),
         0,
         "a mined delta drops while relay is off"
@@ -2191,6 +2688,7 @@ fn remove_for_block_skipped_until_relay_then_purge() {
     assert_eq!(mp.purge_confirmed_on_chain(), 0);
     // Still no-op for unknown txid, but path is live.
     assert_eq!(mp.remove_for_block(&[dummy]), 0);
+    assert_eq!(block_on(mp.remove_for_block_async(vec![dummy])), 0);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&store_dir);
 }
@@ -2289,7 +2787,7 @@ fn accept_from_peer_erase_drops_orphan() {
         .unwrap_err();
     assert!(matches!(err, AcceptError::Orphaned { .. }), "{err}");
     assert_eq!(hub.orphan_snapshot()[0].announcers, vec![4]);
-    hub.add_orphan_announcer(&tx.compute_txid(), 8);
+    hub.add_orphan_announcer(&tx.compute_wtxid(), 8);
     assert_eq!(hub.orphan_snapshot()[0].announcers, vec![4, 8]);
     hub.erase_orphans_for_peer(4);
     assert_eq!(hub.orphan_count(), 1);
@@ -2546,35 +3044,6 @@ fn parent_req_stops_at_per_peer_cap() {
             );
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&store_dir);
-}
-
-#[test]
-fn parent_req_stops_at_global_cap() {
-    let dir = tmp();
-    let store_dir = tmp();
-    let q = Query::open_or_create_tiny(&store_dir).unwrap();
-    let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
-    let per_peer = parent_req::MAX_PARENT_ANN_PER_PEER as u32;
-    let global = parent_req::MAX_PARENT_ANN_GLOBAL as u32;
-    let mut n = 0u32;
-    let mut peer = 1u64;
-    while n < global {
-        assert_eq!(
-            hub.note_inv_tx_requested(peer, parent_hash(n), false, 1_000, false),
-            ParentNote::RequestNow
-        );
-        n += 1;
-        if n.is_multiple_of(per_peer) {
-            peer += 1;
-        }
-    }
-    assert_eq!(
-        hub.note_inv_tx_requested(peer, parent_hash(n), false, 1_000, false),
-        ParentNote::GlobalFull,
-        "a peer under its own cap is not misbehavior when the table is full"
-    );
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&store_dir);
 }
@@ -2867,6 +3336,172 @@ fn accept_package_does_not_park_orphan_member() {
     let _ = std::fs::remove_dir_all(&store_dir);
 }
 
+/// Core `p2p_orphan_handling.py` `test_orphan_in_mempool`: two witnesses of
+/// one child both wait. An RPC package leaves them parked. The peer's resent
+/// parent erases them once their txid is in the mempool.
+#[test]
+fn orphan_witnesses_wait_until_a_resent_parent_finds_their_txid_pooled() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let parent = spend_true(cbs[11], 0, ScriptBuf::from_bytes(vec![0x51]));
+    let child = spend_vout(OutPoint::new(parent.compute_txid(), 0), 49_9990_0000);
+    let malleate = |tx: &Transaction| {
+        let mut bad = tx.clone();
+        bad.input[0].witness = Witness::from_slice(&[[1u8]]);
+        bad
+    };
+    let parent_bad = malleate(&parent);
+    let child_bad = malleate(&child);
+    let peer = TxOrigin::Relay(Some(4));
+    hub.accept_tx_from(&parent_bad, peer)
+        .expect_err("a 0-fee parent");
+    for tx in [&child, &child_bad] {
+        let err = hub.accept_tx_from(tx, peer).unwrap_err();
+        assert!(matches!(err, AcceptError::Orphaned { .. }), "{err:?}");
+    }
+    let parked = |tx: &Transaction| {
+        hub.lock_read()
+            .orphanage
+            .contains_wtxid(&tx.compute_wtxid())
+    };
+    assert!(
+        parked(&child) && parked(&child_bad),
+        "both witnesses of the child wait"
+    );
+    assert!(
+        !hub.try_contains(&child.compute_txid()),
+        "a parked orphan is not a tx the node has"
+    );
+
+    let rows = hub.submit_package_rpc(&[parent.clone(), child.clone()]);
+    assert!(rows.iter().all(|r| r.result.is_ok()), "{rows:?}");
+    assert!(
+        parked(&child) && parked(&child_bad),
+        "an RPC package leaves both orphans parked"
+    );
+
+    let _ = hub.accept_tx_from(&parent_bad, peer);
+    assert!(
+        !parked(&child) && !parked(&child_bad),
+        "the resent parent erases the peer's orphans whose txid is pooled"
+    );
+    assert!(hub.try_contains(&child.compute_txid()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core `sendrawtransaction` runs ATMP, which does not read the orphanage.
+/// A parked tx whose parents are now in the mempool is admitted.
+#[test]
+fn local_submit_admits_a_parked_tx_whose_parent_is_pooled() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let parent = spend_true(cbs[10], 10_000, ScriptBuf::from_bytes(vec![0x51]));
+    let child = spend_vout(OutPoint::new(parent.compute_txid(), 0), 49_9980_0000);
+    hub.accept_tx_from(&parent, TxOrigin::Local)
+        .expect("the parent pays for itself");
+    assert!(hub.lock_write().orphanage.insert_from(
+        child.clone(),
+        BTreeSet::from([parent.compute_txid()]),
+        Some(4),
+    ));
+    hub.accept_tx_from(&child, TxOrigin::Local)
+        .expect("a local submit ignores the orphanage");
+    assert!(hub.try_contains(&child.compute_txid()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core `MempoolAcceptedTx`: a relay admit erases the parked copy of the
+/// same wtxid, with the peer weight it held.
+#[test]
+fn relay_admit_erases_the_parked_copy() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let parent = spend_true(cbs[9], 10_000, ScriptBuf::from_bytes(vec![0x51]));
+    let child = spend_vout(OutPoint::new(parent.compute_txid(), 0), 49_9980_0000);
+    hub.accept_tx_from(&parent, TxOrigin::Local)
+        .expect("the parent pays for itself");
+    assert!(hub.lock_write().orphanage.insert_from(
+        child.clone(),
+        BTreeSet::from([parent.compute_txid()]),
+        Some(4),
+    ));
+    hub.accept_tx_from(&child, TxOrigin::Relay(Some(5)))
+        .expect("its parent is pooled");
+    let g = hub.lock_read();
+    assert!(
+        !g.orphanage.contains_wtxid(&child.compute_wtxid()),
+        "the admitted wtxid leaves the orphanage"
+    );
+    assert_eq!(g.orphanage.peer_orphan_weight(4), 0);
+    drop(g);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core's `MempoolAcceptedTx` is peer relay only. A multi-tx
+/// `testmempoolaccept` member commits with no peer, so the parked copy of
+/// it stays parked under its peer.
+#[test]
+fn test_package_member_leaves_its_parked_copy() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let parent = spend_true(cbs[7], 10_000, ScriptBuf::from_bytes(vec![0x51]));
+    let child = spend_vout(OutPoint::new(parent.compute_txid(), 0), 49_9980_0000);
+    hub.accept_tx_from(&parent, TxOrigin::Local)
+        .expect("the parent pays for itself");
+    assert!(hub.lock_write().orphanage.insert_from(
+        child.clone(),
+        BTreeSet::from([parent.compute_txid()]),
+        Some(4),
+    ));
+    hub.accept_test_package_member(&child)
+        .expect("its parent is pooled");
+    assert_eq!(
+        hub.lock_read()
+            .orphanage
+            .announcers_of(&child.compute_wtxid()),
+        vec![4],
+        "a test member does not erase the parked copy"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core's `ProcessValidTx` erases a relayed 1p1c parent's parked copy by
+/// wtxid, as it does the child's.
+#[test]
+fn peer_anchor_pair_erases_the_parents_parked_copy() {
+    let (_store, q, cbs) = pad_cbs(12);
+    for (round, on_async) in [false, true].into_iter().enumerate() {
+        let dir = tmp();
+        let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+        hub.set_relay_enabled(true);
+        let parent = zero_fee_anchor(cbs[round * 2]);
+        let child = spend_anchor(&parent, cbs[round * 2 + 1], 50_000);
+        from_peer(&hub, &parent, 7, on_async).expect_err("alone");
+        assert!(hub.lock_write().orphanage.insert_from(
+            parent.clone(),
+            BTreeSet::from([Txid::from_byte_array([0x5b; 32])]),
+            Some(9),
+        ));
+        from_peer(&hub, &child, 8, on_async).expect("1p1c");
+        assert!(hub.contains(&parent.compute_txid()));
+        assert!(
+            !hub.lock_read()
+                .orphanage
+                .contains_wtxid(&parent.compute_wtxid()),
+            "the admitted parent leaves the orphanage"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// A child already in the orphan pool is still a package member.
 /// `submitpackage` and Electrum use this hub path.
 #[test]
@@ -2924,7 +3559,7 @@ fn hub_package_admits_its_parked_child() {
         );
     }
     assert!(
-        hub.add_orphan_announcer(&child_id, 4),
+        hub.add_orphan_announcer(&child.compute_wtxid(), 4),
         "the parked child takes the peer"
     );
     let accepted = hub
@@ -2933,9 +3568,19 @@ fn hub_package_admits_its_parked_child() {
     assert_eq!(accepted.len(), 2);
     assert!(hub.try_contains(&parent_id));
     assert!(hub.try_contains(&child_id));
+    assert_eq!(
+        hub.lock_read()
+            .orphanage
+            .announcers_of(&child.compute_wtxid()),
+        vec![4],
+        "the admitted child stays parked under its peer, as Core's RPC package leaves it"
+    );
+    hub.lock_write()
+        .orphanage
+        .remove_wtxid(&child.compute_wtxid());
     assert!(
         !hub.lock_write().orphanage.has_announcer(4),
-        "admitting the lifted child must drop its in-flight peer"
+        "the package must not leave the peer in the in-flight map"
     );
     assert!(
         hub.try_contains(&sibling_id),
@@ -2989,10 +3634,10 @@ fn hub_package_admits_its_parked_child() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A parent can land while its child is lifted. Putting the child back
-/// under that parent leaves it parked with nobody left to wake it.
+/// A failed package leaves a parked member where it was, with every peer
+/// that announced it. The package never takes it out of the orphanage.
 #[test]
-fn failed_package_does_not_park_child_under_a_live_parent() {
+fn failed_package_leaves_its_parked_child_parked() {
     let (_store, q, cbs) = pad_cbs(3);
     let spk = ScriptBuf::from_bytes(vec![0x51]);
     let dir = tmp();
@@ -3015,7 +3660,7 @@ fn failed_package_does_not_park_child_under_a_live_parent() {
         let mut g = hub.lock_write();
         g.park_orphan_from(&child, missing, Some(4));
     }
-    hub.add_orphan_announcer(&child_id, 8);
+    hub.add_orphan_announcer(&child.compute_wtxid(), 8);
     let dummy = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
@@ -3038,13 +3683,10 @@ fn failed_package_does_not_park_child_under_a_live_parent() {
         .expect_err("the second member has no parent");
     assert!(
         !matches!(err, AcceptError::Duplicate(id) if id == child_id),
-        "the live parent must not make the lifted child a duplicate, got {err:?}"
+        "the live parent must not make the parked child a duplicate, got {err:?}"
     );
-    assert!(
-        hub.contains(&child_id),
-        "a child whose parents are already in the mempool must be admitted, not parked, got {err:?}"
-    );
-    assert_eq!(hub.orphan_count(), 0);
+    assert!(!hub.contains(&child_id), "the rollback removes the child");
+    assert_eq!(hub.orphan_snapshot()[0].announcers, vec![4, 8]);
     assert!(hub.contains(&parent_id));
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -3079,7 +3721,7 @@ fn failed_package_does_not_park_child_under_a_live_parent() {
         let mut g = hub.lock_write();
         g.park_orphan_from(&child, missing, Some(4));
     }
-    hub.add_orphan_announcer(&child_id, 8);
+    hub.add_orphan_announcer(&child.compute_wtxid(), 8);
     let dummy = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
@@ -3110,72 +3752,8 @@ fn failed_package_does_not_park_child_under_a_live_parent() {
     assert_eq!(
         parked[0].announcers,
         vec![4, 8],
-        "putting the child back must keep the peers who announced it"
+        "the parked child keeps the peers who announced it"
     );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// A prioritised child is under the relay floor until its delta is applied.
-/// A failed package must still admit it once its parent is in the mempool.
-#[test]
-fn failed_package_admits_prioritised_child() {
-    let (_store, q, cbs) = pad_cbs(3);
-    let dir = tmp();
-    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
-    hub.set_relay_enabled(true);
-    let spk = ScriptBuf::from_bytes(vec![0x51]);
-    let parent = spend_true(cbs[2], 10_000, spk);
-    let parent_id = parent.compute_txid();
-    hub.accept_tx(&parent).expect("parent pays for itself");
-    let parent_value = 50_0000_0000 - 10_000;
-    let child = spend_vout(
-        OutPoint {
-            txid: parent_id,
-            vout: 0,
-        },
-        parent_value - 1,
-    );
-    let child_id = child.compute_txid();
-    let err = hub
-        .accept_tx(&child)
-        .expect_err("one sat is under the relay floor");
-    assert!(
-        matches!(err, AcceptError::Policy("min relay fee")),
-        "raw fee must miss the floor before the delta, got {err:?}"
-    );
-    hub.prioritise_tx(child_id, 1_000_000);
-    {
-        let mut missing = BTreeSet::new();
-        missing.insert(parent_id);
-        let mut g = hub.lock_write();
-        g.park_orphan_from(&child, missing, Some(4));
-    }
-    let dummy = Transaction {
-        version: Version::TWO,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array([0x46; 32]),
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
-    };
-    let err = hub
-        .accept_package(&[child, dummy])
-        .expect_err("the second member has no parent");
-    assert!(
-        hub.contains(&child_id),
-        "a prioritised child must be admitted after the package fails, got {err:?}"
-    );
-    assert_eq!(hub.orphan_count(), 0);
-    assert!(hub.contains(&parent_id));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3562,6 +4140,32 @@ fn invalid_anchor_spenders_do_not_hold_the_slot() {
             "the paying child got in"
         );
         assert_eq!(hub.orphan_count(), 0, "the dust spenders were dropped");
+
+        let mut locked = zero_fee_anchor(cbs[2]);
+        locked.output[0].value = Amount::from_sat(COINBASE_SAT - 10_000);
+        locked.lock_time = LockTime::from_height(1_000_000).unwrap();
+        locked.input[0].sequence = Sequence::from_consensus(0xfffffffe);
+        let child = spend_anchor(&locked, cbs[3], 50_000);
+        let err = from_peer(&hub, &child, 8, on_async).expect_err("parked");
+        assert!(matches!(err, AcceptError::Orphaned { .. }), "{err:?}");
+        let parked = hub.orphan_count();
+        let err = from_peer(&hub, &locked, 7, on_async).expect_err("non-final");
+        assert!(
+            !matches!(
+                err,
+                AcceptError::Policy("min relay fee") | AcceptError::Policy("mempool min fee")
+            ),
+            "the parent must fail for something other than fee, got {err:?}"
+        );
+        assert!(
+            !hub.contains(&locked.compute_txid()),
+            "a non-fee parent must not lift into 1p1c"
+        );
+        assert_eq!(
+            hub.orphan_count(),
+            parked,
+            "the child stays parked when the parent is not a fee-only failure"
+        );
     }
 }
 
@@ -3603,8 +4207,8 @@ fn peer_anchor_pair_pays_the_rolling_floor_as_a_package() {
     }
 }
 
-/// A parent that fails inside a peer pair is remembered by wtxid, so the
-/// next child of it does not verify and commit the parent again.
+/// A peer pair that already failed is remembered by package hash, so the
+/// same child does not verify and commit the parent again.
 #[test]
 fn failed_anchor_parent_is_not_tried_again_per_child() {
     let (_store, q, cbs) = pad_cbs(12);
@@ -3619,17 +4223,13 @@ fn failed_anchor_parent_is_not_tried_again_per_child() {
             matches!(err, AcceptError::Policy("min relay fee")),
             "{err:?}"
         );
+        assert!(hub.try_note_extra_compact(&parent));
         let first = spend_anchor(&parent, cbs[1], 50_000);
+        hub.note_recent_reject(package_hash(&parent, &first));
         assert!(from_peer(&hub, &first, 8, on_async).is_err());
         assert!(
-            hub.try_recent_reject(&parent.compute_wtxid()),
-            "the parent's commit failure is remembered"
-        );
-        let second = spend_anchor(&parent, cbs[1], 60_000);
-        assert!(from_peer(&hub, &second, 8, on_async).is_err());
-        assert!(
-            !hub.try_recent_reject(&package_hash(&parent, &second)),
-            "the second pair is not tried"
+            !hub.try_recent_reject(&parent.compute_wtxid()),
+            "a remembered pair is not tried again"
         );
     }
 }
@@ -3692,8 +4292,9 @@ fn failed_peer_anchor_pair_waits_for_the_next_block() {
 }
 
 #[test]
+#[allow(clippy::cognitive_complexity)]
 fn submit_package_rpc_admits_cpfp_below_minrelay() {
-    let (_store, owned_q, owned_cbs) = pad_cbs(3);
+    let (_store, owned_q, owned_cbs) = pad_cbs(12);
     let q = &owned_q;
     let cbs = owned_cbs.as_slice();
     let dir = tmp();
@@ -3815,7 +4416,122 @@ fn submit_package_rpc_admits_cpfp_below_minrelay() {
     hub.note_mock_now(at.saturating_add(30));
     assert!(hub.tx_inv_due(&poor.compute_wtxid()));
     assert!(hub.tx_inv_due(&sponsored.compute_wtxid()));
+
+    let dir2 = tmp();
+    let hub2 = MempoolHub::open(&dir2, Arc::clone(q)).unwrap();
+    hub2.set_relay_enabled(true);
+    let parent = spend_true(cbs[8], 1, ScriptBuf::from_bytes(vec![0x51]));
+    let child = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 1 - 50_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x63]),
+        }],
+    };
+    let held =
+        block_on(hub2.submit_package_rpc_eval_async(vec![parent.clone(), child.clone()], false));
+    assert!(
+        held[0].result.is_err(),
+        "async package_eval off must keep the individual min-relay failure, got {held:?}"
+    );
+    assert!(!hub2.try_contains(&parent.compute_txid()));
+    let rows =
+        block_on(hub2.submit_package_rpc_eval_async(vec![parent.clone(), child.clone()], true));
+    assert!(
+        rows.iter().all(|r| r.result.is_ok()),
+        "async below-min-relay parent + paying child must admit, got {rows:?}"
+    );
+    assert!(hub2.try_contains(&parent.compute_txid()));
+    assert!(hub2.try_contains(&child.compute_txid()));
+
+    let heavy = ScriptBuf::from_bytes(vec![0x51; 9_000]);
+    let filler = spend_true(cbs[9], 50_000, heavy);
+    let paying_parent = spend_true(cbs[10], 50_000, ScriptBuf::from_bytes(vec![0x51]));
+    let paying_child = spend_vout(
+        OutPoint {
+            txid: paying_parent.compute_txid(),
+            vout: 0,
+        },
+        paying_parent.output[0].value.to_sat() - 50_000,
+    );
+    let dir3 = tmp();
+    let hub3 = MempoolHub::open_with_weight(&dir3, Arc::clone(q), filler.weight().to_wu()).unwrap();
+    hub3.set_relay_enabled(true);
+    hub3.accept_tx(&filler).expect("filler");
+    {
+        let mut g = hub3.lock_write();
+        g.max_weight = g.graph.total_weight();
+    }
+    hub3.accept_tx_defer_trim(&paying_parent)
+        .expect("package parent");
+    assert!(
+        hub3.try_contains(&filler.compute_txid()),
+        "a package member must not trim until the child is in"
+    );
+    hub3.accept_tx_defer_trim(&paying_child)
+        .expect("package child");
+    hub3.trim_over_budget();
+    assert!(hub3.try_contains(&paying_parent.compute_txid()));
+    assert!(hub3.try_contains(&paying_child.compute_txid()));
+    assert!(
+        !hub3.try_contains(&filler.compute_txid()),
+        "the CPFP pair must evict the filler"
+    );
+
+    let dir4 = tmp();
+    let hub4 = MempoolHub::open(&dir4, Arc::clone(q)).unwrap();
+    hub4.set_relay_enabled(true);
+    let parent = spend_true(cbs[3], 1, ScriptBuf::from_bytes(vec![0x51]));
+    let child = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 1 - 50_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x63]),
+        }],
+    };
+    let mut locked = spend_true(cbs[4], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    locked.lock_time = LockTime::from_height(1_000_000).unwrap();
+    locked.input[0].sequence = Sequence::from_consensus(0xfffffffe);
+    let rows =
+        block_on(hub4.submit_package_rpc_eval_async(
+            vec![parent.clone(), child.clone(), locked.clone()],
+            true,
+        ));
+    assert!(
+        rows[0].result.is_ok() && rows[1].result.is_ok(),
+        "retryable remainder must still package-eval, got {rows:?}"
+    );
+    assert!(
+        rows[2].result.is_err(),
+        "a non-final sibling is not package-retryable, got {rows:?}"
+    );
+    assert!(hub4.try_contains(&parent.compute_txid()));
+    assert!(hub4.try_contains(&child.compute_txid()));
+    assert!(!hub4.try_contains(&locked.compute_txid()));
+    let _ = std::fs::remove_dir_all(&dir4);
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+    let _ = std::fs::remove_dir_all(&dir3);
 }
 
 /// A commit that evicts and then returns `mempool full` has already raised
@@ -5332,13 +6048,12 @@ async fn add_orphan_announcer_does_not_panic_on_tokio_worker() {
         .accept_tx_from(&tx, TxOrigin::Relay(Some(4)))
         .unwrap_err();
     assert!(matches!(err, AcceptError::Orphaned { .. }), "{err}");
-    let txid = tx.compute_txid();
     let wtxid = tx.compute_wtxid();
     let join = tokio::spawn(async move {
         let name = std::thread::current().name().unwrap_or("").to_string();
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            assert!(hub.add_orphan_announcer(&txid, 8));
-            assert!(hub.add_orphan_announcer_wtxid(&wtxid, 9));
+            assert!(hub.add_orphan_announcer(&wtxid, 8));
+            assert!(hub.add_orphan_announcer(&wtxid, 9));
             hub.erase_orphans_for_peer(4);
             hub.erase_orphans_for_peer(8);
             hub.erase_orphans_for_peer(9);

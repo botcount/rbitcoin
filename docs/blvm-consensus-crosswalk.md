@@ -104,12 +104,14 @@ enforces, and what we enforce.
 
 BIP54 (BLK-012, BLK-013, BLK-014, CB-007, SF-009, SF-010, SF-015) is
 in their register and marked inactive on mainnet, testnet, and signet.
-We do not implement the per-transaction 2,500-sigop cap, the consensus
-ban on a non-coinbase whose stripped size is exactly 64 bytes, the
-coinbase `nLockTime == height − 1` rule, or BIP54 version-bits
-lock-in. The 600-second time-warp bound **is** implemented, under
-Core’s BIP94 switch: `check_timewarp` runs when `enforce_bip94` is
-set, which is testnet4 only. Mainnet leaves it off, as Core does.
+We enforce it where BIP 95 turns it on, which is testnet5 from block 1
+(`ChainParams::enforce_bip54`): the per-transaction 2,500-sigop cap,
+the ban on a transaction whose stripped size is exactly 64 bytes, the
+coinbase `nLockTime == height − 1` rule, and both period-edge time
+rules. There is no BIP54 version-bits lock-in. The 600-second
+time-warp bound is Core’s BIP94 switch: `check_period_times` applies
+it when `enforce_bip94` is set, which is testnet4 only. Mainnet leaves
+both off, as Core does.
 
 CTV (SC-021, `OP_NOP4`) and CSFS (SC-020) are specified and disabled
 on mainnet in their Table 1 (`u64::MAX`). We treat `OP_NOP4` as a
@@ -142,7 +144,7 @@ compiled. A regtest node with those features on would disagree with us.
 Paths are under `crates/`. Tests are `#[test]` functions unless noted.
 `core_script_tests_all_rows`, `core_tx_valid_all_rows`,
 `core_tx_invalid_all_rows`, `core_sighash_all_rows`, and
-`core_bip341_wallet_vectors_all_rows` are the Core v32.1 corpora
+`core_bip341_wallet_vectors_all_rows` are the pinned Core corpora
 (consensus-tests C15–C19). “corpus” below means those harnesses.
 
 ### 1. Header
@@ -411,6 +413,6 @@ Production is `script/p2tr.rs` and the tapscript arm of
 Their spec-lock annotations and Z3 runs were not re-executed. A row
 marked **match** means the reject we ship is the one Core ships for
 that sentence. It does not mean the Orange Paper formula was checked
-in a solver. Historical mainnet script acceptance is the Core v32.1
+in a solver. Historical mainnet script acceptance is the pinned Core
 corpora plus block 866,342, as in
 [`consensus-tests.md`](./consensus-tests.md).

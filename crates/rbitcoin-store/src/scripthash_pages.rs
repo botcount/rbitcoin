@@ -24,7 +24,9 @@
 use crate::error::StoreError;
 use crate::scripthash_layout::SH_ENTRY_LEN;
 use crate::scripthash_slabs::{decode_fk_delta_stream_into, encode_fk_delta_stream_into};
-use rbitcoin_primitives::{read_uleb128, uleb128_len, write_uleb128_into, Fk};
+use rbitcoin_primitives::{
+    le_u16, le_u32, le_u64, read_uleb128, uleb128_len, write_uleb128_into, Fk,
+};
 
 /// Disk page size for SH FK chains (aligned allocations).
 pub const SH_PAGE_SIZE: usize = 4096;
@@ -190,16 +192,8 @@ pub fn sh_page_extent(page: &[u8; SH_PAGE_SIZE]) -> Result<Option<(u64, u32)>, S
     if page[SH_PAGE_OFF_VER] != SH_PAGE_EXTENT_VER {
         return Ok(None);
     }
-    let base = u64::from_le_bytes(
-        page[SH_PAGE_OFF_EXTENT_BASE..SH_PAGE_OFF_EXTENT_BASE + 8]
-            .try_into()
-            .unwrap(),
-    );
-    let n = u32::from_le_bytes(
-        page[SH_PAGE_OFF_EXTENT_N..SH_PAGE_OFF_EXTENT_N + 4]
-            .try_into()
-            .unwrap(),
-    );
+    let base = le_u64!(page, 8);
+    let n = le_u32!(page, 16);
     if n == 0 {
         return Err(StoreError::Corrupt("scripthash page: extent_n is 0"));
     }
@@ -236,11 +230,7 @@ pub fn sh_page_extent_creates(page: &[u8; SH_PAGE_SIZE]) -> u32 {
     if page[SH_PAGE_OFF_VER] != SH_PAGE_EXTENT_VER {
         return 0;
     }
-    u32::from_le_bytes(
-        page[SH_PAGE_OFF_EXTENT_CREATES..SH_PAGE_OFF_EXTENT_CREATES + 4]
-            .try_into()
-            .unwrap(),
-    )
+    le_u32!(page, 20)
 }
 
 pub fn sh_page_set_extent_creates(page: &mut [u8; SH_PAGE_SIZE], n: u32) {
@@ -292,11 +282,7 @@ pub fn sh_page_pack_extent_last_fks(
 /// Number of FKs stored in this page.
 #[inline]
 pub fn sh_page_n_fks(page: &[u8; SH_PAGE_SIZE]) -> Result<u16, StoreError> {
-    let n = u16::from_le_bytes(
-        page[SH_PAGE_OFF_N_FKS..SH_PAGE_OFF_N_FKS + 2]
-            .try_into()
-            .unwrap(),
-    );
+    let n = le_u16!(page, 1);
     if n as usize > sh_page_stream_cap(page) {
         return Err(StoreError::Corrupt("scripthash page n_fks > capacity"));
     }

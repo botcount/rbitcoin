@@ -648,6 +648,31 @@ async fn pin_esplora_block_txs_pages(esplora_addr: SocketAddr, tip_hash: &str, n
     );
 }
 
+/// Dialect `/block/:hash/txs/summary` rows equal `getblock` verbosity 2:
+/// txid order, fee (BTC there, coinbase has none), weight, and output sum.
+async fn pin_esplora_block_txs_summary_matches_getblock(
+    esplora_addr: SocketAddr,
+    tip_hash: &str,
+    txs: &[Value],
+) {
+    let sat = |v: &Value| (v.as_f64().expect("BTC amount") * 1e8).round() as u64;
+    let (st, body, rows) =
+        esplora_json_array(esplora_addr, &format!("/block/{tip_hash}/txs/summary")).await;
+    assert_eq!(st, 200, "GET /txs/summary: {body}");
+    assert_eq!(rows.len(), txs.len(), "{body}");
+    for (i, (row, tx)) in rows.iter().zip(txs).enumerate() {
+        let fee = if i == 0 { 0 } else { sat(&tx["fee"]) };
+        let value: u64 = tx["vout"]
+            .as_array()
+            .expect("vout")
+            .iter()
+            .map(|o| sat(&o["value"]))
+            .sum();
+        let want = json!([tx["txid"], fee, tx["weight"], value]);
+        assert_eq!(row, &want, "row {i}");
+    }
+}
+
 /// Extra Esplora HTTP leftover: txids, merkle-proof, coinbase outspend.
 async fn pin_esplora_block_txids_merkle_and_outspend(
     esplora_addr: SocketAddr,
@@ -720,6 +745,96 @@ async fn pin_esplora_block_json_raw_status(
     assert_eq!(st, 200, "{body}");
     let pst: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(pst["next_best"], tip_hash, "{body}");
+}
+
+#[allow(clippy::cognitive_complexity)] // One invalidate/reconsider HTTP session across block routes.
+async fn pin_esplora_stale_block(rpc: SocketAddr, http: SocketAddr) -> String {
+    let mined = jsonrpc(rpc, "generate", json!([2])).await;
+    let hashes = mined["result"].as_array().expect("mined hashes");
+    let first = hashes[0].as_str().unwrap();
+    let tip = hashes[1].as_str().unwrap();
+    let header = jsonrpc(rpc, "getblockheader", json!([tip, true])).await;
+    let height = header["result"]["height"].clone();
+    let summary = http_get(http, &format!("/block/{tip}")).await;
+    assert_eq!(summary.0, 200, "{}", summary.1);
+    let expected: Value = serde_json::from_str(&summary.1).unwrap();
+    let raw = http_get_raw(http, &format!("/block/{tip}/raw")).await;
+    let ids = http_get(http, &format!("/block/{tip}/txids")).await;
+    let txids: Vec<Value> = serde_json::from_str(&ids.1).unwrap();
+    let tx_summary = http_get(http, &format!("/block/{tip}/txs/summary")).await;
+
+    for _ in 0..2 {
+        let invalidated = jsonrpc(rpc, "invalidateblock", json!([first])).await;
+        assert!(invalidated["error"].is_null(), "{invalidated}");
+        let (status, body) = http_get(http, &format!("/block/{tip}/status")).await;
+        assert_eq!(status, 200, "{body}");
+        let status: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            status,
+            json!({"in_best_chain": false, "height": height, "next_best": null})
+        );
+        let (code, body) = http_get(http, &format!("/block/{tip}")).await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), expected);
+        assert_eq!(http_get_raw(http, &format!("/block/{tip}/raw")).await, raw);
+        assert_eq!(http_get(http, &format!("/block/{tip}/txids")).await, ids);
+        assert_eq!(
+            http_get(http, &format!("/block/{tip}/txs/summary")).await,
+            tx_summary
+        );
+        let (code, body) = http_get(http, &format!("/block/{tip}/header")).await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(
+            rbitcoin_primitives::hex_decode(body.trim()).unwrap(),
+            raw.1[..80]
+        );
+        let (code, body) = http_get(http, &format!("/block/{tip}/txid/0")).await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body, txids[0].as_str().unwrap());
+        for suffix in ["txs", "txs/0"] {
+            let (code, body, txs) =
+                esplora_json_array(http, &format!("/block/{tip}/{suffix}")).await;
+            assert_eq!(code, 200, "{body}");
+            assert_eq!(txs[0]["txid"], txids[0]);
+            assert_eq!(txs[0]["status"]["confirmed"], false);
+        }
+        let (code, body) = http_get(
+            http,
+            &format!("/tx/{}/status?asof={tip}", txids[0].as_str().unwrap()),
+        )
+        .await;
+        assert_eq!(code, 404, "stale asof: {body}");
+        let unknown = "ff".repeat(32);
+        for suffix in [
+            "",
+            "/status",
+            "/header",
+            "/raw",
+            "/txids",
+            "/txid/0",
+            "/txs",
+            "/txs/0",
+            "/txs/summary",
+        ] {
+            assert_eq!(
+                http_get_raw(http, &format!("/block/{unknown}{suffix}"))
+                    .await
+                    .0,
+                404
+            );
+        }
+        let reconsidered = jsonrpc(rpc, "reconsiderblock", json!([first])).await;
+        assert!(reconsidered["error"].is_null(), "{reconsidered}");
+        let (code, body) = http_get(http, &format!("/block/{tip}/status")).await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["in_best_chain"],
+            true
+        );
+    }
+    let invalidated = jsonrpc(rpc, "invalidateblock", json!([first])).await;
+    assert!(invalidated["error"].is_null(), "{invalidated}");
+    tip.to_owned()
 }
 
 async fn pin_esplora_txid_raw_hex_merkleblock(
@@ -2283,6 +2398,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     assert_template_spends_nothing_the_block_spent(&woken, txs);
     pin_esplora_blocks_summaries(esplora_addr, 108, new_hash).await;
     pin_esplora_block_txs_pages(esplora_addr, new_hash, txs.len()).await;
+    pin_esplora_block_txs_summary_matches_getblock(esplora_addr, new_hash, txs).await;
     pin_internal_block_txs_and_outspends(esplora_addr, new_hash).await;
     // Core-shaped coinbase input: a `coinbase` hex script and no txid/vout,
     // which is what mempool's indexer requires.
@@ -2582,7 +2698,10 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         one >= 1_000,
         "esplora target 1 below the paid decade: {estimates}"
     );
-    let expect = |target: u32| if target == 1 { one } else { floor };
+    // Electrum target 0 is the 1-block horizon, like 1.
+    let expect = |target: u32| if target <= 1 { one } else { floor };
+    // The max-weight admits fill flow, so smart target 1 stays the warm
+    // 1-block quote (`smart_fee_target_one_is_two_until_flow_is_warm`).
     for target in [1u32, 2, 6, 144, 504, 1008] {
         let sat_vb = estimates[target.to_string()]
             .as_f64()
@@ -2594,7 +2713,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         );
     }
     let mut warm_el = TcpStream::connect(electrum_addr).await.unwrap();
-    for (id, target) in [(50u64, 1u32), (51, 2), (52, 6), (53, 144)] {
+    for (id, target) in [(50u64, 1u32), (51, 2), (52, 6), (53, 144), (54, 0)] {
         let est = electrum_rpc(&mut warm_el, id, "blockchain.estimatefee", json!([target])).await;
         let btc = est["result"]
             .as_f64()
@@ -2648,6 +2767,8 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     };
     assert!(history, "fee history missing connected height {tip}");
 
+    let stale_hash = pin_esplora_stale_block(rpc_addr, esplora_addr).await;
+
     let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
     let stopped = tokio::time::timeout(Duration::from_secs(15), node).await;
     match stopped {
@@ -2656,6 +2777,51 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         Ok(Err(e)) => panic!("run_p2p join: {e}"),
         Err(_) => panic!("run_p2p did not exit after stop"),
     }
+
+    let reopened = Arc::new(Query::open_or_create_tiny(td.store_path()).unwrap());
+    let stale_bytes = bitcoin::BlockHash::from_str(&stale_hash)
+        .unwrap()
+        .to_byte_array();
+    assert!(
+        reopened
+            .reconstruct_archived_block(&stale_bytes)
+            .unwrap()
+            .is_some(),
+        "restart retains the stale block's archived body"
+    );
+    let (_, active) = reopened
+        .header_at_height(reopened.tip_height().unwrap())
+        .unwrap()
+        .unwrap();
+    let active_hash = bitcoin::BlockHash::from_byte_array(active.hash).to_string();
+    let cfg = rbitcoin_esplora::EsploraConfig::with_network(
+        "127.0.0.1:0".parse().unwrap(),
+        bitcoin::Network::Regtest,
+    );
+    let listener = rbitcoin_esplora::run_esplora(cfg, reopened, None)
+        .await
+        .expect("reopen Esplora");
+    for suffix in [
+        "",
+        "/status",
+        "/header",
+        "/raw",
+        "/txids",
+        "/txid/0",
+        "/txs",
+        "/txs/0",
+        "/txs/summary",
+    ] {
+        let (code, _) =
+            http_get_raw(listener.local_addr, &format!("/block/{stale_hash}{suffix}")).await;
+        assert_eq!(
+            code, 404,
+            "stale membership is forgotten on restart: {suffix}"
+        );
+    }
+    let (code, body) = http_get(listener.local_addr, &format!("/block/{active_hash}")).await;
+    assert_eq!(code, 200, "active block after restart: {body}");
+    listener.shutdown().await;
 }
 
 /// Nothing listens here. A pinned `--connect` at genesis still enters tip mode.
@@ -2915,11 +3081,13 @@ async fn node_listen_and_exit() {
 }
 
 /// Tor control port stand-in: PROTOCOLINFO advertises `methods`, SAFECOOKIE
-/// answers from `cookie`, and ADD_ONION NEW mints `key{n}` for service `n`.
+/// answers from `cookie`, and ADD_ONION NEW mints `fake_onion_key(n)` for
+/// service `n`, unless `add_onion` holds a reply to send instead.
 /// Every command line lands in `log`. Live Tor is overlay-functional.
 struct FakeTor {
     addr: SocketAddr,
     methods: Arc<Mutex<&'static str>>,
+    add_onion: Arc<Mutex<Option<String>>>,
     log: Arc<Mutex<Vec<String>>>,
     /// Lines written back to the controller, including `250-ServiceID=`.
     replies: Arc<Mutex<Vec<String>>>,
@@ -2961,18 +3129,30 @@ fn fake_onion_service_id(n: usize) -> String {
     name.trim_end_matches(".onion:0").to_string()
 }
 
+/// A well-formed onion key: `ED25519-V3:` and Base64 of 64 bytes.
+fn fake_onion_key(n: usize) -> String {
+    use base64::Engine;
+    let raw = [u8::try_from(n + 1).unwrap(); 64];
+    format!(
+        "ED25519-V3:{}",
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    )
+}
+
 impl FakeTor {
     async fn start() -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tor = Self {
             addr: listener.local_addr().unwrap(),
             methods: Arc::new(Mutex::new("SAFECOOKIE")),
+            add_onion: Arc::default(),
             log: Arc::default(),
             replies: Arc::default(),
             minted: Arc::default(),
         };
-        let (methods, log, replies, minted) = (
+        let (methods, add_onion, log, replies, minted) = (
             Arc::clone(&tor.methods),
+            Arc::clone(&tor.add_onion),
             Arc::clone(&tor.log),
             Arc::clone(&tor.replies),
             Arc::clone(&tor.minted),
@@ -2982,6 +3162,7 @@ impl FakeTor {
                 tokio::spawn(fake_tor_session(
                     s,
                     Arc::clone(&methods),
+                    Arc::clone(&add_onion),
                     Arc::clone(&log),
                     Arc::clone(&replies),
                     Arc::clone(&minted),
@@ -3003,6 +3184,7 @@ impl FakeTor {
 async fn fake_tor_session(
     s: TcpStream,
     methods: Arc<Mutex<&'static str>>,
+    add_onion: Arc<Mutex<Option<String>>>,
     log: Arc<Mutex<Vec<String>>>,
     replies: Arc<Mutex<Vec<String>>>,
     minted: Arc<Mutex<Vec<String>>>,
@@ -3044,12 +3226,18 @@ async fn fake_tor_session(
             .to_string()
         } else if line == "GETINFO version" {
             "250-version=0.4.8.10\r\n250 OK\r\n".to_string()
+        } else if let Some(forged) = line
+            .starts_with("ADD_ONION ")
+            .then(|| add_onion.lock().unwrap().clone())
+            .flatten()
+        {
+            forged
         } else if let Some(rest) = line.strip_prefix("ADD_ONION ") {
             let spec = rest.split_once(" Port=").map_or(rest, |(s, _)| s);
             let mut minted = minted.lock().unwrap();
             if spec == "NEW:ED25519-V3" {
                 let n = minted.len();
-                minted.push(format!("ED25519-V3:key{n}"));
+                minted.push(fake_onion_key(n));
                 format!(
                     "250-ServiceID={}\r\n250-PrivateKey={}\r\n250 OK\r\n",
                     fake_onion_service_id(n),
@@ -3219,6 +3407,21 @@ async fn tor_control_onion_lifecycle() {
         assert!(err.contains("--tor-control") && err.contains(want), "{err}");
     }
 
+    // A code that is not three digits is no reply, wherever a wide char falls.
+    // A 5xx code is still the refusal it names.
+    for (reply, want) in [
+        ("25\u{e9} x\r\n", "unexpected reply"),
+        ("250\u{e9} x\r\n", "unexpected reply"),
+        ("2x0 OK\r\n", "unexpected reply"),
+        ("550\u{e9} x\r\n", "tor control: 550\u{e9} x"),
+    ] {
+        let mut cfg = listen_and_exit_cfg(&dir);
+        cfg.tor.control = Some(wedged_tor(Some(reply.as_bytes())).await);
+        cfg.tor.password = Some(TOR_PASSWORD.into());
+        let err = start_and_exit(cfg).await.expect_err(reply).to_string();
+        assert!(err.contains(want), "{reply:?}: {err}");
+    }
+
     // A cookie from another Tor, a truncated cookie, and a Tor that only
     // offers plain COOKIE all refuse the start, and none sends AUTHENTICATE:
     // the node never hands the raw cookie to whatever owns the port.
@@ -3250,13 +3453,81 @@ async fn tor_control_onion_lifecycle() {
         starts_with_any(&refused, "ADD_ONION ").is_empty(),
         "{refused:?}"
     );
+
+    // A control port that answers ADD_ONION with a service ID that is not a
+    // v3 onion address, with no service ID, or with a key that would split
+    // the next ADD_ONION, stops the start. Nothing is saved or advertised.
+    *tor.methods.lock().unwrap() = "HASHEDPASSWORD";
+    let onion_cfg = || {
+        let mut cfg = listen_and_exit_cfg(&dir);
+        cfg.tor.control = Some(tor.addr);
+        cfg.tor.password = Some(TOR_PASSWORD.into());
+        cfg.listen.listen_onion = true;
+        cfg
+    };
+    let p2p_key = dir.join("onion").join("p2p.priv");
+    let mut bad_id = fake_onion_service_id(0);
+    bad_id.replace_range(..1, if bad_id.starts_with('a') { "b" } else { "a" });
+    let (id, key) = (fake_onion_service_id(0), fake_onion_key(0));
+    for (reply, want) in [
+        (
+            format!("250-ServiceID={bad_id}\r\n250-PrivateKey={key}\r\n250 OK\r\n"),
+            "invalid ServiceID",
+        ),
+        (
+            format!("250-PrivateKey={key}\r\n250 OK\r\n"),
+            "missing ServiceID",
+        ),
+        (
+            format!("250-ServiceID={id}\r\n250-PrivateKey={key} Flags=Detach\r\n250 OK\r\n"),
+            "malformed PrivateKey",
+        ),
+        (
+            format!("250-ServiceID={id}\r\n250-PrivateKey=ED25519-V3:AAAA\r\n250 OK\r\n"),
+            "malformed PrivateKey",
+        ),
+    ] {
+        *tor.add_onion.lock().unwrap() = Some(reply);
+        let err = start_and_exit(onion_cfg())
+            .await
+            .expect_err(want)
+            .to_string();
+        assert!(err.contains(want), "{err}");
+        assert!(!p2p_key.exists(), "{want}: key saved");
+    }
+    *tor.add_onion.lock().unwrap() = None;
+
+    // A saved key that would add arguments to ADD_ONION, or frame a second
+    // control command, is refused before it reaches the control port. The
+    // error names the file to remove.
+    std::fs::create_dir_all(p2p_key.parent().unwrap()).unwrap();
+    let _ = tor.take_log();
+    for poisoned in [
+        format!("{key} Flags=Detach"),
+        format!("{key}\r\nSETCONF ControlPort=0"),
+    ] {
+        std::fs::write(&p2p_key, &poisoned).unwrap();
+        let err = start_and_exit(onion_cfg())
+            .await
+            .expect_err("poisoned onion key")
+            .to_string();
+        assert!(
+            err.contains("malformed") && err.contains(&p2p_key.display().to_string()),
+            "{err}"
+        );
+        let sent = tor.take_log();
+        assert!(starts_with_any(&sent, "ADD_ONION ").is_empty(), "{sent:?}");
+        assert!(starts_with_any(&sent, "SETCONF ").is_empty(), "{sent:?}");
+    }
+    std::fs::remove_file(&p2p_key).unwrap();
+
     // Those boots also wrote control replies. The password boot's replies
     // are the ones the datadir and getnetworkinfo must match.
     let _ = tor.take_replies();
+    let _ = tor.take_log();
 
     // Password auth. Each service gets a fresh onion key, saved 0600 under
     // the datadir, and an I2P destination; getnetworkinfo lists them all.
-    *tor.methods.lock().unwrap() = "HASHEDPASSWORD";
     std::fs::write(dir.join("rpc.token"), "pass").unwrap();
     #[cfg(unix)]
     {
@@ -3282,6 +3553,10 @@ async fn tor_control_onion_lifecycle() {
         cfg.shindex = true;
         cfg.listen.electrum = Some(electrum);
         cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora));
+        cfg.electrum_onion = true;
+        cfg.esplora_onion = true;
+        cfg.electrum_i2p = true;
+        cfg.esplora_i2p = true;
         cfg
     };
     let mut cfg = services_cfg();
@@ -3385,12 +3660,73 @@ async fn tor_control_onion_lifecycle() {
         assert!(creates.iter().any(|c| c.contains(&needle)), "{creates:?}");
     }
 
+    // Each wallet service's onion and I2P switch is its own: a service
+    // switched off is not published on that overlay, and the others still are.
+    // All off (the default) leaves only P2P on Tor and I2P.
+    for (electrum_on, esplora_on) in [(false, true), (true, false), (false, false)] {
+        let mut cfg = services_cfg();
+        cfg.tor.cookie = Some(cookie.clone());
+        cfg.electrum_onion = electrum_on;
+        cfg.esplora_onion = esplora_on;
+        cfg.electrum_i2p = esplora_on;
+        cfg.esplora_i2p = electrum_on;
+        start_and_exit(cfg).await.expect("wallet overlay switches");
+        let onion_lines = starts_with_any(&tor.take_log(), "ADD_ONION ");
+        let onions: Vec<&str> = onion_lines
+            .iter()
+            .map(|l| l.rsplit(' ').next().unwrap())
+            .collect();
+        let want: Vec<&str> = [true, electrum_on, esplora_on]
+            .into_iter()
+            .zip(&targets)
+            .filter(|(on, _)| *on)
+            .map(|(_, t)| t.as_str())
+            .collect();
+        assert_eq!(
+            onions, want,
+            "electrum_onion={electrum_on} esplora_onion={esplora_on}"
+        );
+        let forwards = starts_with_any(&sam.take_log(), "STREAM FORWARD");
+        for (on, port) in [
+            (true, p2p.port()),
+            (esplora_on, electrum.port()),
+            (electrum_on, esplora.port()),
+        ] {
+            let found = forwards
+                .iter()
+                .any(|f| f.contains(&format!("PORT={port} ")));
+            assert_eq!(found, on, "i2p forward to {port}: {forwards:?}");
+        }
+        let _ = (tor.take_replies(), sam.take_replies());
+    }
+
+    // The wallet I2P switches need SAM, not --i2p-accept-incoming, which
+    // forwards P2P only.
+    let mut cfg = services_cfg();
+    cfg.tor.cookie = Some(cookie.clone());
+    cfg.listen.i2p_accept_incoming = false;
+    start_and_exit(cfg)
+        .await
+        .expect("wallet i2p without accept-incoming");
+    let forwards = starts_with_any(&sam.take_log(), "STREAM FORWARD");
+    for (on, port) in [
+        (false, p2p.port()),
+        (true, electrum.port()),
+        (true, esplora.port()),
+    ] {
+        let found = forwards
+            .iter()
+            .any(|f| f.contains(&format!("PORT={port} ")));
+        assert_eq!(found, on, "i2p forward to {port}: {forwards:?}");
+    }
+    let _ = (tor.take_log(), tor.take_replies(), sam.take_replies());
+
     // A saved Electrum onion key Tor refuses, then an Electrum I2P
     // destination that cannot be read, ends the start after Electrum bound.
     // The run still tears down, so that port is closed once run_p2p returns.
     let onion_key = dir.join("onion").join("electrum.priv");
     let saved_key = std::fs::read(&onion_key).unwrap();
-    std::fs::write(&onion_key, "ED25519-V3:revoked").unwrap();
+    std::fs::write(&onion_key, fake_onion_key(99)).unwrap();
     let mut cfg = services_cfg();
     cfg.tor.cookie = Some(cookie.clone());
     let err = start_and_exit(cfg)
@@ -3714,7 +4050,15 @@ async fn sv2_tp_bootstrap() {
     assert_eq!(sent["result"], tx.compute_txid().to_string(), "{sent}");
     // An identical resend does not rebuild; a changed budget does.
     c.coinbase_output_constraints(0, 1).await.unwrap();
-    let t2 = sv2_template(sv2_recv(&mut c).await);
+    // When the hold check builds `t` before the tip event, that event rebuilds
+    // once on the same prev hash from the empty mempool, queued before the
+    // spend. Skip it.
+    let mut t2 = sv2_template(sv2_recv(&mut c).await);
+    if t2.merkle_path.is_empty() {
+        assert!(!t2.future_template, "tip rebuild: same prev hash");
+        assert_eq!(t2.value_remaining, t.value_remaining, "tip rebuild: no txs");
+        t2 = sv2_template(sv2_recv(&mut c).await);
+    }
     assert!(!t2.future_template, "same prev hash: no new SetNewPrevHash");
     assert!(t2.template_id > t.template_id);
     assert_eq!(t2.value_remaining, t.value_remaining + fee);

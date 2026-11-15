@@ -6,6 +6,7 @@ use sha3::{Digest, Sha3_256};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
+use std::sync::{Mutex, OnceLock};
 
 #[doc(hidden)]
 pub const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
@@ -48,6 +49,7 @@ impl OnlyNet {
             NetAddr::Onion { .. } => Self::Onion,
             NetAddr::I2p { .. } => Self::I2p,
             NetAddr::Cjdns { .. } => Self::Cjdns,
+            NetAddr::Name { .. } => Self::Ipv4,
         }
     }
 
@@ -170,7 +172,7 @@ pub fn ipv4_unroutable(v: Ipv4Addr) -> bool {
         || v.is_loopback()
         || v.is_private()
         || v.is_link_local()
-        || v.is_broadcast()
+        // `is_broadcast` is only `255.255.255.255`, already in `240.0.0.0/4`.
         || v.is_multicast()
         || v.is_documentation()
         || ipv4_shared(v)
@@ -191,7 +193,7 @@ pub fn clearnet_unroutable(ip: IpAddr) -> bool {
                 return ipv4_unroutable(v4);
             }
             v.is_unspecified()
-                || v.is_loopback()
+                // `::1` is IPv4-compatible `0.0.0.1`, which is this-network.
                 || v.is_unicast_link_local()
                 || v.is_unique_local()
                 || v.is_multicast()
@@ -208,6 +210,7 @@ pub fn netaddr_unroutable_gossip(addr: NetAddr) -> bool {
     match addr {
         NetAddr::Ip(s) => clearnet_unroutable(s.ip()),
         NetAddr::Onion { .. } | NetAddr::I2p { .. } | NetAddr::Cjdns { .. } => false,
+        NetAddr::Name { .. } => true,
     }
 }
 
@@ -230,9 +233,71 @@ pub fn addrv2_skip_relay(msg: &AddrV2Message) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NetAddr {
     Ip(SocketAddr),
-    Onion { pk: [u8; 32], port: u16 },
-    I2p { dest: [u8; 32], port: u16 },
-    Cjdns { ip: Ipv6Addr, port: u16 },
+    Onion {
+        pk: [u8; 32],
+        port: u16,
+    },
+    I2p {
+        dest: [u8; 32],
+        port: u16,
+    },
+    Cjdns {
+        ip: Ipv6Addr,
+        port: u16,
+    },
+    /// A hostname the `--proxy` resolves. It keys a live session and a pin, and
+    /// never reaches the address book or gossip.
+    Name {
+        id: NameId,
+        port: u16,
+    },
+}
+
+/// A hostname interned for the life of the process, so [`NetAddr`] stays `Copy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NameId(u32);
+
+const MAX_NAMES: usize = 1024;
+static NAMES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+impl NameId {
+    /// `None` once [`MAX_NAMES`] distinct names are held.
+    pub fn intern(host: &str) -> Option<Self> {
+        let host = host.to_ascii_lowercase();
+        let mut names = NAMES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = names.iter().position(|n| *n == host) {
+            return Some(Self(at as u32));
+        }
+        if names.len() >= MAX_NAMES {
+            return None;
+        }
+        names.push(host);
+        Some(Self(names.len() as u32 - 1))
+    }
+
+    /// The id of a name already interned; never takes a slot.
+    pub fn get(host: &str) -> Option<Self> {
+        let host = host.to_ascii_lowercase();
+        let names = NAMES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        names
+            .iter()
+            .position(|n| *n == host)
+            .map(|at| Self(at as u32))
+    }
+
+    pub fn host(self) -> String {
+        NAMES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())[self.0 as usize]
+            .clone()
+    }
 }
 
 /// BIP155 / Core: CJDNS overlay is `fc00::/8`, not RFC4193 `fc00::/7`.
@@ -251,6 +316,7 @@ impl fmt::Display for NetAddr {
                 write!(f, "{}{I2P_SUFFIX}:{port}", encode_i2p_name(&dest))
             }
             NetAddr::Cjdns { ip, port } => write!(f, "{}", SocketAddr::from((ip, port))),
+            NetAddr::Name { id, port } => write!(f, "{}:{port}", id.host()),
         }
     }
 }
@@ -294,7 +360,18 @@ impl NetAddr {
             NetAddr::Onion { pk, .. } => AddrV2::TorV3(pk),
             NetAddr::I2p { dest, .. } => AddrV2::I2p(dest),
             NetAddr::Cjdns { ip, .. } => AddrV2::Cjdns(ip),
+            NetAddr::Name { .. } => AddrV2::Unknown(u8::MAX, Vec::new()),
         }
+    }
+
+    pub fn name(host: &str, port: u16) -> Option<Self> {
+        NameId::intern(host).map(|id| NetAddr::Name { id, port })
+    }
+
+    /// [`Self::name`] for a name that must already be known: a question about
+    /// it does not take an interner slot.
+    pub fn known_name(host: &str, port: u16) -> Option<Self> {
+        NameId::get(host).map(|id| NetAddr::Name { id, port })
     }
 
     pub fn from_socket(s: SocketAddr) -> Self {
@@ -311,15 +388,20 @@ impl NetAddr {
         match self {
             NetAddr::Ip(s) => Some(s),
             NetAddr::Cjdns { ip, port } => Some(SocketAddr::from((ip, port))),
-            NetAddr::Onion { .. } | NetAddr::I2p { .. } => None,
+            NetAddr::Onion { .. } | NetAddr::I2p { .. } | NetAddr::Name { .. } => None,
         }
+    }
+
+    /// Onion or I2P: an overlay row the dial picker keeps a slot for.
+    pub fn is_overlay(self) -> bool {
+        matches!(self, NetAddr::Onion { .. } | NetAddr::I2p { .. })
     }
 
     pub fn is_ipv6(self) -> bool {
         match self {
             NetAddr::Ip(s) => s.is_ipv6(),
             NetAddr::Cjdns { .. } => true,
-            NetAddr::Onion { .. } | NetAddr::I2p { .. } => false,
+            NetAddr::Onion { .. } | NetAddr::I2p { .. } | NetAddr::Name { .. } => false,
         }
     }
 
@@ -328,7 +410,8 @@ impl NetAddr {
             NetAddr::Ip(s) => s.port(),
             NetAddr::Onion { port, .. }
             | NetAddr::I2p { port, .. }
-            | NetAddr::Cjdns { port, .. } => port,
+            | NetAddr::Cjdns { port, .. }
+            | NetAddr::Name { port, .. } => port,
         }
     }
 
@@ -338,6 +421,7 @@ impl NetAddr {
             NetAddr::Cjdns { ip, .. } => ip.to_string(),
             NetAddr::Onion { pk, .. } => format!("{}.onion", encode_onion_name(&pk)),
             NetAddr::I2p { dest, .. } => format!("{}{I2P_SUFFIX}", encode_i2p_name(&dest)),
+            NetAddr::Name { id, .. } => id.host(),
         }
     }
 
@@ -391,7 +475,8 @@ pub fn encode_i2p_name(dest: &[u8; 32]) -> String {
     let mut acc = 0u32;
     let mut bits = 0u32;
     for &b in dest {
-        acc = (acc << 8) | u32::from(b);
+        // The shift cleared the low 8 bits, so adding the byte is the same as or.
+        acc = (acc << 8) + u32::from(b);
         bits += 8;
         while bits >= 5 {
             bits -= 5;

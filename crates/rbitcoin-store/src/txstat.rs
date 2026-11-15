@@ -18,7 +18,9 @@
 
 use crate::error::StoreError;
 use crate::file::{GrowPolicy, TableFile, FILE_HEADER_LEN};
-use rbitcoin_primitives::{read_uleb128, uleb128_len, write_uleb128, Fk, TableKind};
+use rbitcoin_primitives::{
+    le_u32, le_u64, read_uleb128, uleb128_len, write_uleb128, Fk, TableKind,
+};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -430,18 +432,17 @@ impl TxStat {
             Some(b) if !b.is_empty() => decode_ovf_blob(b)?,
             _ => Vec::new(),
         };
+        let (cells, _) = raw.as_chunks::<{ TXSTAT_ENTRY_LEN as usize }>();
         let mut out = Vec::with_capacity(count);
-        for i in 0..count {
-            let s = i * TXSTAT_ENTRY_LEN as usize;
-            let cell: [u8; 8] = raw[s..s + 8].try_into().unwrap();
-            match parse_cell(cell)? {
+        for (i, cell) in cells.iter().enumerate() {
+            match parse_cell(*cell)? {
                 CellParse::Unstamped => out.push(None),
                 CellParse::Complete(row) => out.push(Some(row)),
                 CellParse::NeedTail => {
                     let idx = u16::try_from(i)
                         .map_err(|_| StoreError::Corrupt("txstat overflow index"))?;
                     let rest = tail_for_index(&tails, idx)?;
-                    out.push(Some(parse_with_tail(cell, rest)?));
+                    out.push(Some(parse_with_tail(*cell, rest)?));
                 }
             }
         }
@@ -589,8 +590,8 @@ impl TxStat {
         }
         let mut slot = [0u8; 16];
         self.blk.read_at(slot_off, &mut slot)?;
-        let off = u64::from_le_bytes(slot[0..8].try_into().unwrap());
-        let len = u32::from_le_bytes(slot[8..12].try_into().unwrap()) as usize;
+        let off = le_u64!(slot, 0);
+        let len = le_u32!(slot, 8) as usize;
         if len == 0 {
             return Ok(Vec::new());
         }

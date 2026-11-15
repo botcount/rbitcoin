@@ -16,7 +16,7 @@
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
-use rbitcoin_primitives::{Fk, TableKind};
+use rbitcoin_primitives::{bytes, le_u64, Fk, TableKind};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -39,6 +39,12 @@ use crate::open_address::{self, MAX_LOAD_DEN, MAX_LOAD_NUM};
 pub const SLOTS_PER_CHUNK: u64 = 128;
 
 pub type HeadKey = [u8; HEAD_KEY_LEN];
+
+fn slot_at(buf: &[u8], off: usize) -> [u8; SLOT_SIZE] {
+    let mut rec = [0u8; SLOT_SIZE];
+    rec.copy_from_slice(&buf[off..off + SLOT_SIZE]);
+    rec
+}
 
 #[inline]
 pub fn head_key_prefix(full: &[u8; 32]) -> HeadKey {
@@ -250,10 +256,7 @@ impl MultiList {
         }
         let mut buf = [0u8; MULTI_REC_LEN];
         self.file.read_at(Self::offset(id), &mut buf)?;
-        Ok((
-            Fk(u64::from_le_bytes(buf[0..8].try_into().unwrap())),
-            Fk(u64::from_le_bytes(buf[8..16].try_into().unwrap())),
-        ))
+        Ok((Fk(le_u64!(buf, 0)), Fk(le_u64!(buf, 8))))
     }
 
     #[doc(hidden)]
@@ -382,14 +385,9 @@ impl HashHead {
             let off = FILE_HEADER_LEN as u64 + slot * SLOT_SIZE as u64;
             let bytes = n * SLOT_SIZE;
             file.read_at(off, &mut buf[..bytes])?;
-            for i in 0..n {
-                let base = i * SLOT_SIZE;
-                let k: HeadKey = buf[base..base + HEAD_KEY_LEN].try_into().unwrap();
-                let packed = u64::from_le_bytes(
-                    buf[base + HEAD_KEY_LEN..base + SLOT_SIZE]
-                        .try_into()
-                        .unwrap(),
-                );
+            for rec in buf[..bytes].as_chunks::<SLOT_SIZE>().0 {
+                let k = bytes!(rec, 0, 16);
+                let packed = le_u64!(rec, 16);
                 if !is_empty_slot(&k, packed) {
                     occupied += 1;
                 }
@@ -599,12 +597,9 @@ impl HashHead {
             let mut placed = false;
             for _ in 0..slots {
                 let off = (slot as usize) * SLOT_SIZE;
-                let slot_key: HeadKey = table[off..off + HEAD_KEY_LEN].try_into().unwrap();
-                let packed = u64::from_le_bytes(
-                    table[off + HEAD_KEY_LEN..off + SLOT_SIZE]
-                        .try_into()
-                        .unwrap(),
-                );
+                let rec = slot_at(&table, off);
+                let slot_key = bytes!(rec, 0, 16);
+                let packed = le_u64!(rec, 16);
                 if is_empty_slot(&slot_key, packed) {
                     table[off..off + HEAD_KEY_LEN].copy_from_slice(&key);
                     table[off + HEAD_KEY_LEN..off + SLOT_SIZE]
@@ -684,14 +679,9 @@ impl HashHead {
             let off = FILE_HEADER_LEN as u64 + slot * SLOT_SIZE as u64;
             let bytes = n * SLOT_SIZE;
             self.file.read_at(off, &mut buf[..bytes])?;
-            for i in 0..n {
-                let base = i * SLOT_SIZE;
-                let k: HeadKey = buf[base..base + HEAD_KEY_LEN].try_into().unwrap();
-                let packed = u64::from_le_bytes(
-                    buf[base + HEAD_KEY_LEN..base + SLOT_SIZE]
-                        .try_into()
-                        .unwrap(),
-                );
+            for rec in buf[..bytes].as_chunks::<SLOT_SIZE>().0 {
+                let k = bytes!(rec, 0, 16);
+                let packed = le_u64!(rec, 16);
                 if !is_empty_slot(&k, packed) {
                     entries.push((k, packed));
                 }
@@ -842,12 +832,9 @@ impl<'a> SlotPageCache<'a> {
     pub fn read_slot(&mut self, slot: u64) -> Result<(HeadKey, u64), StoreError> {
         let chunk = self.ensure_chunk(slot)?;
         let rel = ((slot - chunk.base_slot) as usize) * SLOT_SIZE;
-        let k: HeadKey = chunk.data[rel..rel + HEAD_KEY_LEN].try_into().unwrap();
-        let packed = u64::from_le_bytes(
-            chunk.data[rel + HEAD_KEY_LEN..rel + SLOT_SIZE]
-                .try_into()
-                .unwrap(),
-        );
+        let rec = slot_at(&chunk.data, rel);
+        let k = bytes!(rec, 0, 16);
+        let packed = le_u64!(rec, 16);
         Ok((k, packed))
     }
 

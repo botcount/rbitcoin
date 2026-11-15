@@ -174,3 +174,50 @@ fn seqsigwit_past_the_published_end_is_corrupt() {
     expect_published(read_index_window(&t, &one_child(true)));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn tweak_window_reads_the_parent_txid() {
+    let mut script = vec![0x51, 0x20];
+    script.extend_from_slice(&[0xab; 32]);
+    let dir = tmp("parent-txid");
+    let t = TxTable::create_tiny(&dir).unwrap();
+    t.put_full_batch_indexed(
+        &[
+            (
+                tx(1),
+                vec![spend(Fk(2))],
+                vec![OutputRecord::unspent(1, script)],
+            ),
+            (
+                tx(2),
+                vec![InputRecord::coinbase(u32::MAX, vec![2], vec![])],
+                vec![OutputRecord::unspent(50, vec![0x51])],
+            ),
+        ],
+        true,
+    )
+    .unwrap();
+    let window = read_index_window(&t, &one_child(true)).unwrap();
+    let mut expect = [0u8; 32];
+    expect[0] = 2;
+    assert_eq!(window.txid(Fk(2)), Some(expect));
+    let txid_path = t.txids.file.path().to_path_buf();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&txid_path)
+        .unwrap()
+        .set_len(
+            rbitcoin_store::txid_body::TXID_BODY_HEADER
+                + rbitcoin_store::txid_body::TXID_ENTRY_LEN
+                + 8,
+        )
+        .unwrap();
+    match read_index_window(&t, &one_child(true)) {
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(msg.contains("short"), "{msg}");
+        }
+        Ok(_) => panic!("a short txid body was read"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

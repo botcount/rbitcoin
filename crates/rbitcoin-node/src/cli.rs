@@ -9,6 +9,7 @@ use rbitcoin_log::{self, error, info, warn, Level};
 use rbitcoin_primitives::Network;
 use rbitcoin_store::HeadScale;
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -64,6 +65,19 @@ pub struct ParsedOperatorFlags {
     pub kvs: Vec<(String, String)>,
 }
 
+/// Requested output on stdout. A reader that closed the pipe (`| head -1`)
+/// is not an error; any other write error is exit 1.
+fn print_stdout(text: &str) -> Result<(), ExitCode> {
+    match writeln!(std::io::stdout().lock(), "{text}") {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => {
+            eprintln!("error: stdout: {e}");
+            Err(ExitCode::from(1))
+        }
+    }
+}
+
 #[doc(hidden)]
 pub fn parse_operator_flags(args: &[OsString]) -> Result<OperatorFlagEnd, ExitCode> {
     let mut i = 1usize;
@@ -76,11 +90,11 @@ pub fn parse_operator_flags(args: &[OsString]) -> Result<OperatorFlagEnd, ExitCo
         let a = args[i].to_string_lossy();
         match a.as_ref() {
             "--help" | "-h" => {
-                eprintln!("{}", operator_usage());
+                print_stdout(&operator_usage())?;
                 return Ok(OperatorFlagEnd::Help);
             }
             "--version" | "-V" => {
-                eprintln!("rbitcoin-node {}", env!("CARGO_PKG_VERSION"));
+                print_stdout(concat!("rbitcoin-node ", env!("CARGO_PKG_VERSION")))?;
                 return Ok(OperatorFlagEnd::Version);
             }
             "--smoke" => {
@@ -345,9 +359,9 @@ pub fn operator_usage() -> String {
     [--listen ADDR] [--no-listen] [--connect ADDR]... [--trust-peer ADDR] [--seed-node HOST]... [--proxy HOST:PORT] [--onion HOST:PORT] [--proxy-randomize[=0|1]] [--only-net NET]... \\\n\
     [--tor-control [HOST:PORT]] [--tor-control-cookie PATH] [--tor-control-password PASS] \\\n\
     [--i2p-sam [HOST:PORT]] [--i2p-accept-incoming] \\\n\
-    [--electrum-listen ADDR] [--esplora-listen ADDR] [--esplora-onion[=0|1]] [--health-listen [ADDR]] [--metrics] \\\n\
+    [--electrum-listen ADDR] [--esplora-listen ADDR] [--electrum-onion[=0|1]] [--esplora-onion[=0|1]] [--electrum-i2p[=0|1]] [--esplora-i2p[=0|1]] [--health-listen [ADDR]] [--metrics] \\\n\
     [--sv2-tp-listen ADDR] [--sv2-tp-authority-sec KEY] [--sv2-tp-authority-sec-file PATH] [--sv2-tp-cert-validity SECS] [--sv2-tp-stale-grace SECS] [--sv2-tp-idle-timeout SECS] [--sv2-tp-fee-delta SATS] [--sv2-tp-template-interval SECS] \\\n\
-    [--sh-index] [--block-filter-index] [--prune-seqsigwit] [--prune-seqsigwit-ram-threshold-bytes N] [--datadir-hdd] [--store-read-budget N] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--heavy-sh-creates N] [--electrum-max-subs N] [--esplora-max-inflight N] [--esplora-block-template] \\\n\
+    [--sh-index] [--block-filter-index] [--prune-seqsigwit] [--prune-seqsigwit-ram-threshold-bytes N] [--datadir-hdd] [--store-read-budget N] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--heavy-sh-creates N] [--electrum-max-subs N] [--electrum-max-sp-subs N] [--esplora-max-inflight N] [--esplora-block-template] \\\n\
     [--rpc] [--rpc-listen [ADDR]] [--rest] [--rpc-socket PATH] [--rpc-token-file PATH] [--rpc-cookie-file PATH] [--rpc-cookie-perms owner|group|all] [--rpc-work-queue N] [--rpc-client-version N] \\\n\
     [--milestone HEIGHT] \\\n\
     [--max-outbound N] [--max-inbound N] \\\n\
@@ -360,8 +374,8 @@ pub fn operator_usage() -> String {
     [--min-chain-work HEX] [--max-tip-age SECS] [--check-blocks N] [--mock-time UNIX] \\\n\
     [--block-version N] [--block-min-tx-fee BTC] [--bytes-per-sigop N] [--block-reserved-sigops N] [--alert-notify CMD] [--startup-notify CMD] \\\n\
     [--max-run-secs N] [--log-level LEVEL] [--api-log PATH] [--asmap PATH] \\\n\
-    [--no-seeds] [--no-listen] [--no-discover] [--listen-onion] [--cjdns-reachable] [--smoke] [--inhibit-suspend]\n\n\
-Networks: mainnet|testnet|testnet4|signet|regtest.\n\
+    [--no-seeds] [--no-listen] [--no-discover] [--discover-from-peers] [--listen-onion] [--cjdns-reachable] [--smoke] [--inhibit-suspend]\n\n\
+Networks: mainnet|testnet|testnet4|testnet5|signet|regtest.\n\
 Custom Signet: --signet-challenge HEX [--signet-block-time SECS].\n\
 Log level: error|warn|info|debug|trace|off (CLI > conf log_level > RBITCOIN_LOG / RUST_LOG).\n\
 API log: --api-log PATH writes one JSON line per Electrum/Esplora/RPC call (also TRACE `api:`).\n\
@@ -370,7 +384,7 @@ Milestone: skip script/sig checks at/below HEIGHT.\n\
   Defaults: mainnet {main_height} anchored to block {MAINNET_MILESTONE_HASH},\n\
   testnet {testnet_height} anchored to block {TESTNET_MILESTONE_HASH}\n\
   (skip only on that header path; chain work is not the script gate),\n\
-  signet 0, testnet4 0 (testnet4 still ships Core's min chain work), regtest 0.\n\
+  signet 0, testnet4 0 (testnet4 still ships Core's min chain work), testnet5 0, regtest 0.\n\
   Explicit HEIGHT is height-only. Use 0 for full scripts.\n\
 Check-blocks: --check-blocks N revalidates the last N confirmed heights on open (default 6; 0 = all).\n\
 Mempool: --mempool-size-mb (default 300 → 300e6 WU; N × 1_000_000 weight, not MiB).\n\
@@ -387,9 +401,11 @@ Trust-peer: --trust-peer ADDR (conf trustpeer=) dials only that address, the sam
   failed AUTH is a start error. Unset: no control connection.\n\
   --tor-control-cookie PATH (default /run/tor/control.authcookie). --tor-control-password PASS.\n\
   --i2p-sam [HOST:PORT] SAM v3 to system i2pd (default 127.0.0.1:7656). --only-net=i2p requires it.\n\
-  --i2p-accept-incoming persist {{datadir}}/i2p/p2p.priv and STREAM FORWARD to the P2P bind. Needs --listen.\n\
+  --i2p-accept-incoming persist {{datadir}}/i2p/p2p.priv and STREAM FORWARD to the P2P bind. Needs --listen. P2P only.\n\
   --listen-onion ADD_ONION the P2P port (loopback bind even with --no-listen). Needs --tor-control and --max-inbound > 0.\n\
   --cjdns-reachable treat fc00::/8 as CJDNS (dial and advertise). --only-net=cjdns requires it.\n\
+  --discover-from-peers (default off) announce the IP outbound clearnet peers report reaching us at; needs a non-loopback --listen.\n\
+  A clearnet --external-ip wins. Never sent over Tor, I2P or CJDNS. --no-discover turns it off.\n\
   --trusted / --always-relay / --relay are inbound permission knobs.\n\
   --net-permission / --net-permission-bind are CIDR or bind grants (noban, relay, …; IPv4 and IPv6).\n\
   --net-permission-bind v1,noban@127.0.0.1:PORT also takes plain v1 P2P there for a wallet indexer: own port, private address.\n\
@@ -397,22 +413,32 @@ Trust-peer: --trust-peer ADDR (conf trustpeer=) dials only that address, the sam
 Scripthash: --sh-index (default off) builds Class B for Electrum/Esplora address history.\n\
 Block filters: --block-filter-index (default off) builds BIP158 basic filters. Independent of --sh-index.\n\
   Electrum/Esplora start without it; scripthash/address methods fail closed.\n\
-  --prune-seqsigwit refuse seqsigwit reconstruct below tip-288 heights; advertise NETWORK_LIMITED.\n\
-    Kept heights are store/seqsigwit.window/{{height}}.bin plus a RAM cache. Unpruned nodes read seqsigwit.body.\n\
+  --prune-seqsigwit keep witness only for the last 288 heights, in store/seqsigwit.window/{{height}}.bin plus a RAM cache.\n\
+    seqsigwit.body stays a header. Enabling the flag on an archive copies that window out and cuts the stem. Advertise NETWORK_LIMITED.\n\
+    Unpruned nodes read seqsigwit.body. txout, input, txstat, and filters are not pruned.\n\
   --prune-seqsigwit-ram-threshold-bytes N RAM cap for that cache (default 268435456; 0 keeps nothing in RAM).\n\
   --max-sh-creates N refuses an unpaged Electrum/Esplora join with more than N creates (default 10000; 0 = unlimited). A paged history request is still served.\n\
   --heavy-sh-creates N runs unpaged Electrum/Esplora joins with more than N creates one at a time across the node (default 10000; 0 = no limit). Lighter joins stay parallel.\n\
   --electrum-max-subs N caps blockchain.scripthash.subscribe per Electrum connection (default 10000; >= 1). Wallets subscribe every address up to their gap limit.\n\
-  --esplora-max-inflight N caps Esplora requests in flight across the whole listener (default 256; >= 1). Further requests wait for a slot; the wait counts against the request timeout (408).\n\
+  --electrum-max-sp-subs N caps blockchain.silentpayments.subscribe addresses per Electrum connection (default 16; >= 1). Each address scans every new block.\n\
+  --esplora-max-inflight N caps Esplora requests in flight across the whole listener (default 256; >= 1). Accepted TCP is 8× that, and a further socket is closed. A socket that sends no headers is closed at the idle timeout. A request that finds the in-flight cap full waits; the wait counts against the request timeout (408).\n\
   --store-read-budget N caps concurrent API store reads across RPC, REST, Electrum, Esplora, and BlindBit (N >= 1). Omitted or 0 uses the default: 1 when --datadir-hdd is set, otherwise one less than the core count, minimum 1. An explicit N overrides --datadir-hdd. Waiters do not hold a blocking-pool thread.\n\
   --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
-  --esplora-onion (default on) ADD_ONION for --esplora-listen when --tor-control is set.\n\
+  --electrum-onion (default off) ADD_ONION for --electrum-listen. Needs --tor-control and a TCP listen on 127.0.0.1 or 0.0.0.0.\n\
+  --esplora-onion (default off) ADD_ONION for --esplora-listen. Needs --tor-control and a TCP listen on 127.0.0.1 or 0.0.0.0.\n\
+  --electrum-i2p / --esplora-i2p (default off) I2P destination and STREAM FORWARD for that listener. Need --i2p-sam and the same TCP listen.\n\
 Silent payments: --sp-tweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
-  Not with --prune-seqsigwit (tweaks read scriptSig and witness).\n\
-  --sp-tweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
+  With --prune-seqsigwit, turn it on before taproot, or later once every\n\
+  height from that origin through the dropped range is sealed or still in\n\
+  the last 288 blocks. Turning prune on after the index is built is allowed\n\
+  when the index covers every height the cut will drop. Sealed rows stay served.\n\
+  Omitting --sp-tweaks while those files exist and prune is on logs how many\n\
+  blocks remain before the index cannot be enabled again.\n\
+  --sp-tweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 545 = Cake electrs floor of 546).\n\
 Health: --health-listen [ADDR] serves GET /healthz, GET /readyz, and GET /progress (JSON:\n\
   the running index build, rebuild, or backfill stage, at any log level) from the first\n\
-  second of startup (default 127.0.0.1:9332). Unauthenticated; keep it on loopback or a\n\
+  second of startup (default 127.0.0.1:9332). At most 64 connections; one that sends\n\
+  nothing is closed after 5s. Unauthenticated; keep it on loopback or a\n\
   probe-only network. --metrics adds Prometheus GET /metrics there (needs --health-listen).\n\
 SV2: --sv2-tp-listen ADDR serves the Stratum v2 Template Distribution Protocol (Noise over TCP; default off).\n\
   Requires --sv2-tp-authority-sec KEY (secp256k1 secret, 64 hex or key-utils base58check; argv exposes it) or --sv2-tp-authority-sec-file PATH\n\
@@ -427,16 +453,18 @@ RPC: --rpc unix socket {{datadir}}/rpc.sock; --rpc-listen [ADDR] adds TCP (defau
 Cold files: --datadir-cold PATH puts append-only IBD files under PATH/store\n\
   (seqsigwit, txstat, input, and blockfilter / sp_tweaks once enabled).\n\
   Default (flag omitted): those files live under --datadir. --prune-seqsigwit\n\
-  is separate: it drops old seqsigwit and keeps a 288-height window on the hot store.\n\
+  is separate: witness lives only in the 288 hot height files, and seqsigwit.body stays a header.\n\
   --datadir-hdd says the main datadir is rotating media. The node does not probe the device. When --store-read-budget is omitted or 0, API store reads are limited to 1.\n\
   Default off keeps the SSD confirm schedule.\n\
 Conf: --conf FILE (snake_case key=value; CLI kebab overrides conf). See OPERATOR.md and docs/rpc.md.\n\
 Advanced debug/IO knobs remain RBITCOIN_* env (not required for normal sync; preserved if CLI omits).\n\
-IBD densify: up to 1024 concurrent getdata, max 16 in transit per peer.\n\
+IBD densify: up to {ibd_window} concurrent getdata, max {per_peer} in transit per peer.\n\
   Relay / RPC initialblockdownload after catch-up: --min-chain-work + --max-tip-age (24h).",
         env!("CARGO_PKG_VERSION"),
         main_height = default_milestone_height(Network::Mainnet),
         testnet_height = default_milestone_height(Network::Testnet),
+        ibd_window = rbitcoin_ibd::DEFAULT_IBD_WINDOW,
+        per_peer = rbitcoin_ibd::DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER,
     )
 }
 
@@ -474,7 +502,10 @@ pub fn is_bool_key(key: &str) -> bool {
             | "datadir_hdd"
             | "sp_tweaks"
             | "esplora_block_template"
+            | "electrum_onion"
             | "esplora_onion"
+            | "electrum_i2p"
+            | "esplora_i2p"
             | "blocks_only"
             | "prefill_compact"
             | "persist_mempool"
@@ -483,6 +514,7 @@ pub fn is_bool_key(key: &str) -> bool {
             | "no_seeds"
             | "no_listen"
             | "no_discover"
+            | "discover_from_peers"
             | "listen_onion"
             | "cjdns_reachable"
             | "proxy_randomize"

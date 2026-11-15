@@ -11,8 +11,8 @@ Open the row that matches the change. Leave the other owners closed.
 | Change | Read |
 |--------|------|
 | Shipped HTTP surface | [`COMPAT.md`](../../COMPAT.md) |
-| Flags, listen, SH tradeoffs | [`OPERATOR.md`](../../OPERATOR.md) |
-| `/internal/*` and unix listen | [`COMPAT.md`](../../COMPAT.md), [`OPERATOR.md`](../../OPERATOR.md) |
+| Flags, listen, SH tradeoffs | [`docs/operator/interfaces.md`](../../docs/operator/interfaces.md), [`docs/operator/storage.md`](../../docs/operator/storage.md) |
+| `/internal/*` and unix listen | [`COMPAT.md`](../../COMPAT.md), [`docs/operator/interfaces.md`](../../docs/operator/interfaces.md) |
 | JSON-RPC overlap (broadcast, unix `rpc.sock`) | [`docs/rpc.md`](../../docs/rpc.md) |
 
 ## Where

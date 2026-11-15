@@ -1,16 +1,23 @@
 //! Missing-parent GETDATA tracker.
 //!
 //! One mutex owns the hash map and a per-peer time index. A heartbeat walks
-//! only that peer's due entries. Caps are announcements, not a new knob.
+//! only that peer's due entries. The cap is announcements per peer, as Core
+//! `MAX_PEER_TX_ANNOUNCEMENTS`. There is no process-wide cap, so one peer's
+//! rows never refuse another peer's. The table is at most the cap times the
+//! live sessions, because `forget_peer` runs when a session unregisters.
+//!
+//! Every live peer can therefore wait on the same hashes. When a request
+//! ends early, the work is a pass over that hash's rows and one index move
+//! per waiter, with no scan of a waiter's other rows. A heartbeat reads one
+//! index entry per due row of a hash another peer is being asked for.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::num::NonZeroU64;
 
 use super::{GETDATA_TX_INTERVAL_SECS, MAX_PARENTS_PER_PARK};
 
 /// Announcements one peer may add. Past this the map does not grow.
 pub const MAX_PARENT_ANN_PER_PEER: usize = 5_000;
-/// Process-wide announcements. A few hundred thousand, not tens of millions.
-pub const MAX_PARENT_ANN_GLOBAL: usize = 200_000;
 
 /// One parent GETDATA the sweep should send.
 pub struct DueParent {
@@ -28,8 +35,6 @@ pub enum ParentNote {
     Deferred,
     /// This peer's own counter is full.
     PeerCapped,
-    /// The process-wide table is full. The announcement is skipped.
-    GlobalFull,
 }
 
 #[doc(hidden)]
@@ -49,17 +54,126 @@ pub struct ParentAnn {
 #[doc(hidden)]
 pub struct ParentSlot {
     pub anns: Vec<ParentAnn>,
+    /// The earliest `requested_until` in `anns`. `take_due` skips a hash
+    /// whose request is still in flight without reading its rows.
+    pub inflight_until: Option<NonZeroU64>,
 }
+
+impl ParentSlot {
+    /// Call after a row's `requested_until` changes or a row leaves.
+    fn sync_inflight(&mut self) {
+        self.inflight_until = self
+            .anns
+            .iter()
+            .filter_map(|a| a.requested_until)
+            .min()
+            .and_then(NonZeroU64::new);
+    }
+}
+
+/// The slots by hash. Code in this file reaches a hash's rows only through
+/// this type. Each fetch of a slot is charged that slot's row count, so a
+/// test can pin how often a call fetches the rows of one hash. A loop that
+/// scans one fetched slot more than once is not counted.
+mod slots {
+    use super::{ParentAnn, ParentSlot};
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::num::NonZeroU64;
+
+    #[derive(Default)]
+    pub struct Slots {
+        map: HashMap<[u8; 32], ParentSlot>,
+        steps: Cell<u64>,
+    }
+
+    impl Slots {
+        fn count(&self, rows: usize) {
+            self.steps.set(self.steps.get().wrapping_add(rows as u64));
+        }
+
+        /// Charges since the last call: a slot's row count per fetch or
+        /// removal, one per [`Self::inflight_until`], and for
+        /// [`Self::push`] one plus the rescan of a requested row.
+        pub fn take_steps(&self) -> u64 {
+            self.steps.replace(0)
+        }
+
+        pub fn get(&self, hash: &[u8; 32]) -> Option<&ParentSlot> {
+            let slot = self.map.get(hash)?;
+            self.count(slot.anns.len());
+            Some(slot)
+        }
+
+        pub fn get_mut(&mut self, hash: &[u8; 32]) -> Option<&mut ParentSlot> {
+            let slot = self.map.get_mut(hash)?;
+            self.steps
+                .set(self.steps.get().wrapping_add(slot.anns.len() as u64));
+            Some(slot)
+        }
+
+        /// The slot's earliest request expiry, without its rows.
+        pub fn inflight_until(&self, hash: &[u8; 32]) -> Option<NonZeroU64> {
+            self.count(1);
+            self.map.get(hash)?.inflight_until
+        }
+
+        /// Append a row. The slot is not handed out. A requested row
+        /// rescans the slot for its earliest request and is charged for it.
+        pub fn push(&mut self, hash: [u8; 32], ann: ParentAnn) {
+            let requested = ann.requested_until.is_some();
+            let slot = self.map.entry(hash).or_insert_with(|| ParentSlot {
+                anns: Vec::with_capacity(1),
+                inflight_until: None,
+            });
+            slot.anns.push(ann);
+            let mut rows = 1;
+            if requested {
+                slot.sync_inflight();
+                rows += slot.anns.len();
+            }
+            self.count(rows);
+        }
+
+        pub fn remove(&mut self, hash: &[u8; 32]) -> Option<ParentSlot> {
+            let slot = self.map.remove(hash)?;
+            self.count(slot.anns.len());
+            Some(slot)
+        }
+
+        pub fn contains_key(&self, hash: &[u8; 32]) -> bool {
+            self.map.contains_key(hash)
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.map.is_empty()
+        }
+
+        pub fn iter(&self) -> impl Iterator<Item = (&[u8; 32], &ParentSlot)> {
+            self.map.iter()
+        }
+    }
+}
+pub use slots::Slots;
+
+/// One peer's rows by time: `(time, hash, wtxid)`, so a row is removed
+/// without a scan. The kind is in the key because one peer can hold a txid
+/// row and a wtxid row for the same hash at the same time.
+pub type TimeIndex = HashMap<u64, BTreeSet<(u64, [u8; 32], bool)>>;
 
 /// Hash map plus per-peer due and in-flight indexes. The indexes are one
 /// entry per announcement and stop at the same caps (extra RAM, not a scan
 /// of every peer on the heartbeat).
 pub struct ParentTracker {
-    pub by_hash: HashMap<[u8; 32], ParentSlot>,
-    pub due_by_peer: HashMap<u64, BTreeMap<u64, Vec<[u8; 32]>>>,
-    pub inflight_by_peer: HashMap<u64, BTreeMap<u64, Vec<[u8; 32]>>>,
+    pub by_hash: Slots,
+    pub due_by_peer: TimeIndex,
+    pub inflight_by_peer: TimeIndex,
     pub hashes_by_peer: HashMap<u64, HashSet<[u8; 32]>>,
     pub ann_per_peer: HashMap<u64, usize>,
+    /// Peers that took a row and have not been forgotten. Only these take a
+    /// row as another transaction's announcer, so a row added after
+    /// `forget_peer` cannot outlive its session.
+    pub sessions: HashSet<u64>,
     pub announcements: usize,
 }
 
@@ -72,11 +186,12 @@ impl Default for ParentTracker {
 impl ParentTracker {
     pub fn new() -> Self {
         Self {
-            by_hash: HashMap::new(),
+            by_hash: Slots::default(),
             due_by_peer: HashMap::new(),
             inflight_by_peer: HashMap::new(),
             hashes_by_peer: HashMap::new(),
             ann_per_peer: HashMap::new(),
+            sessions: HashSet::new(),
             announcements: 0,
         }
     }
@@ -84,11 +199,6 @@ impl ParentTracker {
     #[doc(hidden)]
     pub fn peer_at_cap(&self, peer: u64) -> bool {
         self.ann_per_peer.get(&peer).copied().unwrap_or(0) >= MAX_PARENT_ANN_PER_PEER
-    }
-
-    #[doc(hidden)]
-    pub fn global_full(&self) -> bool {
-        self.announcements >= MAX_PARENT_ANN_GLOBAL
     }
 
     pub fn note_inv(
@@ -104,9 +214,6 @@ impl ParentTracker {
         }
         if self.peer_at_cap(peer) {
             return ParentNote::PeerCapped;
-        }
-        if self.global_full() {
-            return ParentNote::GlobalFull;
         }
         let exp = now.saturating_add(GETDATA_TX_INTERVAL_SECS);
         // Same-kind in-flight stays the one request. This announcer waits
@@ -143,7 +250,7 @@ impl ParentTracker {
         {
             return;
         }
-        if self.peer_at_cap(peer) || self.global_full() {
+        if self.peer_at_cap(peer) {
             return;
         }
         self.add_ann(
@@ -186,32 +293,31 @@ impl ParentTracker {
             let due_at = slot.anns[pos].due_at;
             slot.anns[pos].requested_until = Some(exp);
             slot.anns[pos].due_at = None;
+            slot.sync_inflight();
             (due_at, exp)
         };
         if let Some(t) = due_at.0 {
-            unindex(&mut self.due_by_peer, peer, t, &hash);
+            unindex(&mut self.due_by_peer, peer, t, &hash, wtxid);
         }
-        index_at(&mut self.inflight_by_peer, peer, due_at.1, hash);
+        index_at(&mut self.inflight_by_peer, peer, due_at.1, hash, wtxid);
         Some(ParentNote::RequestNow)
     }
 
     #[doc(hidden)]
     pub fn add_ann(&mut self, hash: [u8; 32], ann: ParentAnn) {
         let peer = ann.peer;
+        let wtxid = ann.wtxid;
         let due_at = ann.due_at;
         let exp = ann.requested_until;
-        let slot = self
-            .by_hash
-            .entry(hash)
-            .or_insert_with(|| ParentSlot { anns: Vec::new() });
-        slot.anns.push(ann);
+        self.by_hash.push(hash, ann);
+        self.sessions.insert(peer);
         *self.ann_per_peer.entry(peer).or_default() += 1;
         self.announcements += 1;
         self.hashes_by_peer.entry(peer).or_default().insert(hash);
         if let Some(exp) = exp {
-            index_at(&mut self.inflight_by_peer, peer, exp, hash);
+            index_at(&mut self.inflight_by_peer, peer, exp, hash, wtxid);
         } else if let Some(t) = due_at {
-            index_at(&mut self.due_by_peer, peer, t, hash);
+            index_at(&mut self.due_by_peer, peer, t, hash, wtxid);
         }
     }
 
@@ -230,12 +336,13 @@ impl ParentTracker {
             })
             .unwrap_or_default();
         for (exp, wtxid) in inflight {
-            self.fail_inflight(&hash, peer, exp);
+            self.fail_inflight(&hash, peer, exp, wtxid);
             self.release_waiters(&hash, wtxid);
         }
     }
 
     pub fn forget_peer(&mut self, peer: u64) {
+        self.sessions.remove(&peer);
         self.due_by_peer.remove(&peer);
         self.inflight_by_peer.remove(&peer);
         let Some(hashes) = self.hashes_by_peer.remove(&peer) else {
@@ -268,8 +375,8 @@ impl ParentTracker {
                 continue;
             }
             let inflight = self.inflight_peers(&hash);
-            for (peer, exp) in inflight {
-                self.fail_inflight(&hash, peer, exp);
+            for (peer, exp, wtxid) in inflight {
+                self.fail_inflight(&hash, peer, exp, wtxid);
             }
             if self.slot_all_failed(&hash) {
                 self.remove_hash(&hash);
@@ -290,6 +397,15 @@ impl ParentTracker {
         for hash in due_hashes {
             if out.len() >= MAX_PARENTS_PER_PARK {
                 break;
+            }
+            // A request that has not ended blocks every row of this hash,
+            // and nothing below would change one.
+            if self
+                .by_hash
+                .inflight_until(&hash)
+                .is_some_and(|until| until.get() > now)
+            {
+                continue;
             }
             if !seen.insert(hash) {
                 continue;
@@ -316,12 +432,10 @@ impl ParentTracker {
 
     #[doc(hidden)]
     pub fn due_hashes(&self, peer: u64, now: u64) -> Vec<[u8; 32]> {
-        let Some(tree) = self.due_by_peer.get(&peer) else {
+        let Some(rows) = self.due_by_peer.get(&peer) else {
             return Vec::new();
         };
-        tree.range(..=now)
-            .flat_map(|(_, v)| v.iter().copied())
-            .collect()
+        rows.range(..=through(now)).map(|(_, h, _)| *h).collect()
     }
 
     /// When this kind is already in flight, the time that request ends.
@@ -359,10 +473,11 @@ impl ParentTracker {
             let due_at = ann.due_at.unwrap_or(ann.reqtime);
             ann.requested_until = Some(exp);
             ann.due_at = None;
+            slot.sync_inflight();
             (due_at, wtxid)
         };
-        unindex(&mut self.due_by_peer, peer, due_at, hash);
-        index_at(&mut self.inflight_by_peer, peer, exp, *hash);
+        unindex(&mut self.due_by_peer, peer, due_at, hash, wtxid);
+        index_at(&mut self.inflight_by_peer, peer, exp, *hash, wtxid);
         Some(wtxid)
     }
 
@@ -371,14 +486,10 @@ impl ParentTracker {
         let expired = self
             .inflight_by_peer
             .get(&peer)
-            .map(|tree| {
-                tree.range(..=now)
-                    .flat_map(|(t, v)| v.iter().map(|h| (*t, *h)))
-                    .collect::<Vec<_>>()
-            })
+            .map(|rows| rows.range(..=through(now)).copied().collect::<Vec<_>>())
             .unwrap_or_default();
-        for (exp, hash) in expired {
-            self.fail_inflight(&hash, peer, exp);
+        for (exp, hash, wtxid) in expired {
+            self.fail_inflight(&hash, peer, exp, wtxid);
             if self.slot_all_failed(&hash) {
                 self.remove_hash(&hash);
             }
@@ -388,9 +499,9 @@ impl ParentTracker {
     #[doc(hidden)]
     pub fn expire_hash_inflight(&mut self, hash: &[u8; 32], now: u64) {
         let expired = self.inflight_peers(hash);
-        for (peer, exp) in expired {
+        for (peer, exp, wtxid) in expired {
             if exp <= now {
-                self.fail_inflight(hash, peer, exp);
+                self.fail_inflight(hash, peer, exp, wtxid);
             }
         }
         if self.slot_all_failed(hash) {
@@ -399,33 +510,34 @@ impl ParentTracker {
     }
 
     #[doc(hidden)]
-    pub fn inflight_peers(&self, hash: &[u8; 32]) -> Vec<(u64, u64)> {
+    pub fn inflight_peers(&self, hash: &[u8; 32]) -> Vec<(u64, u64, bool)> {
         self.by_hash
             .get(hash)
             .map(|slot| {
                 slot.anns
                     .iter()
-                    .filter_map(|a| a.requested_until.map(|exp| (a.peer, exp)))
+                    .filter_map(|a| a.requested_until.map(|exp| (a.peer, exp, a.wtxid)))
                     .collect()
             })
             .unwrap_or_default()
     }
 
     #[doc(hidden)]
-    pub fn fail_inflight(&mut self, hash: &[u8; 32], peer: u64, exp: u64) {
+    pub fn fail_inflight(&mut self, hash: &[u8; 32], peer: u64, exp: u64, wtxid: bool) {
         // Expire the ann whose window is `exp`. A same-peer txid parent is a
         // different row and must stay eligible once this window ends.
         if let Some(slot) = self.by_hash.get_mut(hash) {
             if let Some(ann) = slot
                 .anns
                 .iter_mut()
-                .find(|a| a.peer == peer && a.requested_until == Some(exp))
+                .find(|a| a.peer == peer && a.wtxid == wtxid && a.requested_until == Some(exp))
             {
                 ann.requested_until = None;
                 ann.failed = true;
+                slot.sync_inflight();
             }
         }
-        unindex(&mut self.inflight_by_peer, peer, exp, hash);
+        unindex(&mut self.inflight_by_peer, peer, exp, hash, wtxid);
     }
 
     #[doc(hidden)]
@@ -471,7 +583,11 @@ impl ParentTracker {
                     .anns
                     .iter()
                     .position(|a| a.peer == peer && kind.is_none_or(|k| a.wtxid == k))?;
-                Some(slot.anns.swap_remove(pos))
+                let ann = slot.anns.swap_remove(pos);
+                if ann.requested_until.is_some() {
+                    slot.sync_inflight();
+                }
+                Some(ann)
             }) else {
                 return;
             };
@@ -511,10 +627,10 @@ impl ParentTracker {
             }
         }
         if let Some(exp) = ann.requested_until {
-            unindex(&mut self.inflight_by_peer, ann.peer, exp, hash);
+            unindex(&mut self.inflight_by_peer, ann.peer, exp, hash, ann.wtxid);
         }
         if let Some(t) = ann.due_at {
-            unindex(&mut self.due_by_peer, ann.peer, t, hash);
+            unindex(&mut self.due_by_peer, ann.peer, t, hash, ann.wtxid);
         }
         if ann.requested_until.is_some() {
             self.release_waiters(hash, ann.wtxid);
@@ -528,68 +644,44 @@ impl ParentTracker {
         if self.kind_inflight_until(hash, wtxid).is_some() {
             return;
         }
-        let waiters: Vec<(u64, u64, u64)> = self
-            .by_hash
-            .get(hash)
-            .map(|slot| {
-                slot.anns
-                    .iter()
-                    .filter(|a| a.wtxid == wtxid && !a.failed)
-                    .filter_map(|a| a.due_at.map(|due| (a.peer, due, a.reqtime)))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for (peer, due_at, reqtime) in waiters {
-            if due_at <= reqtime {
+        let Some(slot) = self.by_hash.get_mut(hash) else {
+            return;
+        };
+        let mut moved = Vec::new();
+        for ann in &mut slot.anns {
+            if ann.wtxid != wtxid || ann.failed {
                 continue;
             }
-            unindex(&mut self.due_by_peer, peer, due_at, hash);
-            if let Some(ann) = self.by_hash.get_mut(hash).and_then(|slot| {
-                slot.anns
-                    .iter_mut()
-                    .find(|a| a.peer == peer && a.wtxid == wtxid && a.due_at == Some(due_at))
-            }) {
-                ann.due_at = Some(reqtime);
-            }
-            index_at(&mut self.due_by_peer, peer, reqtime, *hash);
+            let Some(due_at) = ann.due_at.filter(|due| *due > ann.reqtime) else {
+                continue;
+            };
+            ann.due_at = Some(ann.reqtime);
+            moved.push((ann.peer, due_at, ann.reqtime));
+        }
+        for (peer, due_at, reqtime) in moved {
+            unindex(&mut self.due_by_peer, peer, due_at, hash, wtxid);
+            index_at(&mut self.due_by_peer, peer, reqtime, *hash, wtxid);
         }
     }
 }
 
-#[doc(hidden)]
-pub fn index_at(
-    tree: &mut HashMap<u64, BTreeMap<u64, Vec<[u8; 32]>>>,
-    peer: u64,
-    time: u64,
-    hash: [u8; 32],
-) {
-    tree.entry(peer)
-        .or_default()
-        .entry(time)
-        .or_default()
-        .push(hash);
+/// Upper bound of every index entry at or before `now`.
+fn through(now: u64) -> (u64, [u8; 32], bool) {
+    (now, [u8::MAX; 32], true)
 }
 
 #[doc(hidden)]
-pub fn unindex(
-    tree: &mut HashMap<u64, BTreeMap<u64, Vec<[u8; 32]>>>,
-    peer: u64,
-    time: u64,
-    hash: &[u8; 32],
-) {
-    let Some(by_time) = tree.get_mut(&peer) else {
+pub fn index_at(index: &mut TimeIndex, peer: u64, time: u64, hash: [u8; 32], wtxid: bool) {
+    index.entry(peer).or_default().insert((time, hash, wtxid));
+}
+
+#[doc(hidden)]
+pub fn unindex(index: &mut TimeIndex, peer: u64, time: u64, hash: &[u8; 32], wtxid: bool) {
+    let Some(rows) = index.get_mut(&peer) else {
         return;
     };
-    let Some(v) = by_time.get_mut(&time) else {
-        return;
-    };
-    if let Some(i) = v.iter().position(|h| h == hash) {
-        v.swap_remove(i);
-    }
-    if v.is_empty() {
-        by_time.remove(&time);
-    }
-    if by_time.is_empty() {
-        tree.remove(&peer);
+    rows.remove(&(time, *hash, wtxid));
+    if rows.is_empty() {
+        index.remove(&peer);
     }
 }

@@ -507,6 +507,13 @@ async fn full_lane_parks_instead_of_spinning() {
     });
     let releases = filler.join().expect("filler queued");
 
+    // Senders in other tests park on a full lane with no listener here.
+    let stale = send_parked_notify().notified();
+    tokio::pin!(stale);
+    assert!(
+        !stale.as_mut().enable(),
+        "an earlier park left a stored send_parked signal"
+    );
     FULL_QUEUE_SPINS.store(0, Ordering::Relaxed);
     let parked_note = send_parked_notify().notified();
     tokio::pin!(parked_note);

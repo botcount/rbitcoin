@@ -11,10 +11,11 @@ where that window, further hardening, and signed release binaries are
 planned. In-tree is **0.9.99** (pre-0.10.0). **0.9.x** (tag 0.9.0) is the
 published line. **`v0.9.x`** is the patch line.
 Occupied **0.6.x** stores refuse
-(wipe and sync again). Schema 24 and 25 open in place and rewrite to 26.
-A published 0.8 directory is already schema 26. The runbook is
+(wipe and sync again). Schema 24 and 25 open in place. A published 0.8
+directory is schema 26. This binary rewrites that `meta` to 28, and a 0.9.0
+binary then refuses the directory. The runbook is
 [`docs/operator/mainnet.md`](./docs/operator/mainnet.md). Day-to-day flags
-are [`OPERATOR.md`](./OPERATOR.md).
+are [`docs/operator/`](./docs/operator/).
 
 `--trust-peer` stores and serves a chain rbitcoin considers invalid. Do not
 point a wallet at that node unless you accept that peer. The fault list is
@@ -63,28 +64,40 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   mitigations are intentional operator surface: max inbound sessions
   (`--max-inbound`, default 200; peers that relay transactions hold at
   most half), per-session message/byte
-  rate windows, misbehavior score disconnect. Peer AEAD is the
-  `chacha20-poly1305` 0.1 that `bip324` 0.11 links. That is current
-  `rust-bitcoin/bip324` master, not a local pin. `noise_sv2` already uses
-  the renamed `chacha20poly1305` crate. No version bump until upstream
-  publishes one.
+  rate windows, misbehavior score disconnect. Peer AEAD is
+  `chacha20-poly1305` 0.1, which crates.io `bip324` 0.11 links
+  (`Cargo.toml`). `noise_sv2` uses the renamed `chacha20poly1305` crate.
+  No version bump until upstream publishes one.
 - **Electrum and Esplora:** plain TCP/HTTP; TLS is an operator reverse-proxy
   concern. Wallet clients and electrs HTTP (except address-prefix)
   ([`COMPAT.md`](./COMPAT.md)).
-  The node is **internet-facing capable**: application DoS limits
-  (`ServeLimits` — REST in-flight semaphore, request size, idle timeout, plus
-  Electrum scripthash-sub / broadcast-hex caps) are **always enforced**, not
-  only when bound to localhost. The REST cap is concurrent requests, not an
-  accepted-socket cap. Excess connections and oversize
-  lines/bodies fail closed without hanging accept. Esplora is
+  Application DoS limits apply on every bind, including a public address.
+  The caps are request size, idle timeout, Electrum scripthash subscriptions,
+  and broadcast hex length (`ServeLimits`). Electrum rejects a connection
+  past the cap at accept, and retries a transient accept error instead of
+  dropping the listener. Esplora caps requests in flight
+  (`--esplora-max-inflight`) and accepted TCP at 8× that cap. A further
+  TCP connection is closed.
+  A connection that never sends headers is closed at the idle timeout. A
+  request that finds the in-flight cap full waits. That wait counts against
+  the request timeout and the answer is then 408 (`admit_connection`,
+  `TimeoutLayer`). Health, Esplora, Electrum, and inbound P2P leave a
+  descriptor reserve so the store and RPC can still open files. That reserve
+  is Unix; Windows does not count descriptors and does not apply it. The numbers are
+  [`docs/operator/interfaces.md`](docs/operator/interfaces.md). Esplora is
   opt-in (`--esplora-listen`). Internal electrs HTTP (`/internal/*`) is unix
-  listen only, not the public TCP bind. Edge TLS, multi-tenant metering, and API keys
-  are still out of process (see [`OPERATOR.md`](./OPERATOR.md)).
+  listen only, not the public TCP bind. Its address and scripthash totals skip
+  `--max-sh-creates`, so a process that can open the socket can start a large
+  join (one at a time under `--heavy-sh-creates`). Edge TLS, multi-tenant metering, and API keys
+  are still out of process (see [`docs/operator/interfaces.md`](./docs/operator/interfaces.md)).
 - **Health listener:** `--health-listen` is opt-in, read-only, and
   unauthenticated (`/healthz`, `/readyz`, `/progress`, and `/metrics` with
-  `--metrics`). It binds before the store opens. Requests carry no body and
-  time out; `/readyz` and `/metrics` run a capped number of blocking reads
-  and answer 503 past the cap rather than queue. `/progress` is uncapped: it
+  `--metrics`). It binds before the store opens. At most 64 connections are
+  accepted; a further one is closed, and one that sends no headers is closed
+  at the 5s request timeout. Requests carry no body and time out; `/readyz`
+  and `/metrics` run a capped number of blocking reads and answer 503 past
+  the cap rather than queue. `/readyz` is 503 while the Electrum listener
+  has stopped. `/progress` is uncapped: it
   reads in-memory counters under one short lock and reveals the bring-up
   phase (as `/readyz` does) and stage names, counts, and timings.
   `/metrics` reveals peer counts and mempool size; keep the port on

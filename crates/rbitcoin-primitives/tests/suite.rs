@@ -1,3 +1,4 @@
+mod array_le;
 mod compact;
 mod hex;
 mod loc_simd;

@@ -44,12 +44,24 @@ impl LocPack {
     }
 }
 
+/// One pack's create-id span, ordered by `base` then height.
+#[derive(Clone, Copy, Debug)]
+struct LocCover {
+    base: u64,
+    len: u64,
+    height: u32,
+    /// Highest id covered by this cover or any cover earlier in `(base, height)` order.
+    max_id_through: u64,
+}
+
 /// Write-owned loc window. Note after append; prune after that write batch
-/// (and later overlapping batches) finish.
+/// (and later overlapping batches) finish. A read takes the lowest pack whose
+/// create range covers that id.
 #[derive(Debug, Default)]
 pub struct WriteCreateLocRam {
     pub by_height: BTreeMap<u32, LocPack>,
     pub approx_bytes: u64,
+    covers: Vec<LocCover>,
 }
 
 impl WriteCreateLocRam {
@@ -73,16 +85,68 @@ impl WriteCreateLocRam {
             self.approx_bytes = self.approx_bytes.saturating_sub(old.approx_bytes);
         }
         self.approx_bytes = self.approx_bytes.saturating_add(bytes);
+        self.rebuild_covers();
     }
 
     pub fn get(&self, fk: Fk) -> Option<CreateLocPair> {
         let id = fk.get()?;
-        for pack in self.by_height.values() {
-            if let Some(p) = pack.get(id) {
-                return Some(p);
+        let height = self.covering_height(id)?;
+        self.by_height.get(&height)?.get(id)
+    }
+
+    /// Height of the pack [`Self::get`] would read for `fk`.
+    #[doc(hidden)]
+    pub fn cover_height(&self, fk: Fk) -> Option<u32> {
+        self.covering_height(fk.get()?)
+    }
+
+    /// Lowest height whose range covers `id`.
+    ///
+    /// A lower height can start later and still overlap, so the rightmost
+    /// base is not the owner. Walk left while an earlier cover's highest id
+    /// still reaches `id`. The span is the same offset check as [`LocPack::get`].
+    fn covering_height(&self, id: u64) -> Option<u32> {
+        let right = self.covers.partition_point(|cover| cover.base <= id);
+        let mut index = right.checked_sub(1)?;
+        let mut best: Option<u32> = None;
+        loop {
+            let cover = self.covers[index];
+            if id
+                .checked_sub(cover.base)
+                .is_some_and(|off| off < cover.len)
+            {
+                best = Some(best.map_or(cover.height, |height| height.min(cover.height)));
             }
+            if index == 0 || self.covers[index - 1].max_id_through < id {
+                break;
+            }
+            index -= 1;
         }
-        None
+        best
+    }
+
+    fn rebuild_covers(&mut self) {
+        let mut covers = Vec::with_capacity(self.by_height.len());
+        for (&height, pack) in &self.by_height {
+            let len = pack.pairs.len() as u64;
+            if len == 0 {
+                continue;
+            }
+            covers.push(LocCover {
+                base: pack.base,
+                len,
+                height,
+                max_id_through: 0,
+            });
+        }
+        covers.sort_unstable_by(|a, b| a.base.cmp(&b.base).then(a.height.cmp(&b.height)));
+        let mut max_id = 0u64;
+        for cover in &mut covers {
+            let last = cover.base.saturating_add(cover.len - 1);
+            max_id = max_id.max(last);
+            cover.max_id_through = max_id;
+        }
+        self.covers = covers;
     }
 
     /// Drop packs whose last-started-at-note height has finished write.
@@ -101,6 +165,7 @@ impl WriteCreateLocRam {
                 self.approx_bytes = self.approx_bytes.saturating_sub(p.approx_bytes);
             }
         }
+        self.rebuild_covers();
     }
 
     /// Disconnect: drop packs at/above `height`. Remaining keep-until cannot
@@ -116,6 +181,7 @@ impl WriteCreateLocRam {
                 p.keep_until = cap;
             }
         }
+        self.rebuild_covers();
     }
 
     /// Packs, pair count, approx bytes (IBD `wloc=`).
@@ -137,7 +203,7 @@ pub fn publish(ram: &WriteCreateLocRam) {
 }
 
 /// Drop this thread's loc window (Query open / test isolation). Does not publish
-/// zeros — `wloc=` atomics are process-wide like `iflight=`.
+/// zeros — `wloc=` atomics are process-wide.
 pub fn clear() {
     RAM.with(|c| {
         *c.borrow_mut() = WriteCreateLocRam::default();

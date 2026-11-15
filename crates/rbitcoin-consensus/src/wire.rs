@@ -78,7 +78,8 @@ pub fn decode_tx(bytes: &[u8], try_no_witness: bool, try_witness: bool) -> Optio
 
 /// Core `CheckTxScriptsSanity`: every output script, and every input script
 /// of a non-coinbase, passes [`has_valid_ops`].
-fn scripts_parse(tx: &Transaction) -> bool {
+#[doc(hidden)]
+pub fn scripts_parse(tx: &Transaction) -> bool {
     let inputs = tx
         .input
         .iter()

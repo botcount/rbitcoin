@@ -343,7 +343,6 @@ pub async fn batch_reads_time_themselves_and_keep_the_join(q: Arc<Query>) {
     )
     .await;
     let trace = batch_trace_snapshot();
-    batch_trace_clear();
     let took = |i: usize| {
         trace
             .iter()
@@ -910,6 +909,54 @@ fn unconfirmed_until_sh_visible() {
     );
     assert_eq!(stats.tx_count, 1);
     assert_eq!(stats.funded_txo_sum, (SUBSIDY - FEE_A) as i64);
+
+    let sh_hex = electrum_scripthash_hex(&[0x51]);
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let asof = format!("asof:{}", block_b.block_hash());
+    let mut header_sub = false;
+    let mut subs = HashSet::new();
+    let live_hist = dispatch(
+        "blockchain.scripthash.get_history",
+        &json!([&sh_hex]),
+        &q,
+        &cfg,
+        &params,
+        Some(&hub),
+        &mut header_sub,
+        &mut subs,
+    )
+    .unwrap();
+    assert!(
+        live_hist.to_string().contains(&hex_a),
+        "the pooled spend is history until an asof pin: {live_hist}"
+    );
+    let asof_hist = dispatch(
+        "blockchain.scripthash.get_history",
+        &json!([&sh_hex, &asof]),
+        &q,
+        &cfg,
+        &params,
+        Some(&hub),
+        &mut header_sub,
+        &mut subs,
+    )
+    .unwrap();
+    assert!(
+        !asof_hist.to_string().contains(&hex_a),
+        "asof history omits the pool: {asof_hist}"
+    );
+    let asof_bal = dispatch(
+        "blockchain.scripthash.get_balance",
+        &json!([&sh_hex, &asof]),
+        &q,
+        &cfg,
+        &params,
+        Some(&hub),
+        &mut header_sub,
+        &mut subs,
+    )
+    .unwrap();
+    assert_eq!(asof_bal["unconfirmed"], 0, "{asof_bal}");
 
     let height_a = maturity + 3;
     let block_a = connect_spend(tip, tip_time, height_a, spend_a, false);

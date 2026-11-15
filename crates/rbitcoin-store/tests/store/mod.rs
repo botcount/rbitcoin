@@ -744,6 +744,66 @@ fn open_schema24_occupied_creates_zero_txstat() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn poke_logical_len(path: &Path, logical: u64) {
+    let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    use std::io::{Seek, SeekFrom, Write};
+    f.seek(SeekFrom::Start(8)).unwrap();
+    f.write_all(&logical.to_le_bytes()).unwrap();
+}
+
+/// Schema 27 is master without the spend log. Opening it here rewrites meta
+/// to 28 so that build refuses the directory instead of writing under the log.
+#[test]
+fn schema_27_rewrites_meta_so_an_older_build_refuses() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    write_store_meta_ver(&dir, 27);
+    let s = Store::open_tiny(&dir).unwrap();
+    drop(s);
+    assert_eq!(read_store_meta_ver(&dir), 28);
+    assert_eq!(SCHEMA_VERSION, 28);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A 26 datadir whose witness locator is already the finished cut must open,
+/// keep the creates, and rewrite meta to 28. A 26 binary wipes that layout.
+#[test]
+fn pruned_schema_26_rewrites_meta_before_the_creates_are_read() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        let item = coinbase_item([0x27u8; 32], vec![OutputRecord::unspent(50, vec![0x51])]);
+        s.put_tx_full_batch_indexed(&[item], true).unwrap();
+        s.flush().unwrap();
+    }
+    write_store_meta_ver(&dir, 26);
+    let header = rbitcoin_store::file::FILE_HEADER_LEN as u64;
+    for name in [
+        "seqsigwit.loc",
+        "seqsigwit.off",
+        "seqsigwit.loc.ovf",
+        "seqsigwit.body",
+    ] {
+        poke_logical_len(&dir.join(name), header);
+    }
+    std::fs::write(dir.join("seqsigwit.prune"), u32::MAX.to_le_bytes()).unwrap();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 1, "schema 26 prune open must keep creates");
+    drop(s);
+    assert_eq!(read_store_meta_ver(&dir), 28);
+    assert_eq!(SCHEMA_VERSION, 28);
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    assert!(
+        synced.iter().any(|p| p == dir.path()),
+        "the meta rewrite must be durable before the witness cut; synced {synced:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn check_meta_refuses_schema_past_this_binary() {
     let dir = tmp();
@@ -2290,5 +2350,387 @@ fn get_tx_outputs_at_past_end_read_still_rejects_a_corrupt_row() {
         matches!(s.get_tx_outputs_at(fk, &[2]), Err(StoreError::Corrupt(_))),
         "a past-end read of a corrupt row is corrupt, not empty"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn shard_mphf_val(head: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let mut mphf = None;
+    let mut val = None;
+    for ent in std::fs::read_dir(head).unwrap() {
+        let p = ent.unwrap().path();
+        match p.extension().and_then(|e| e.to_str()) {
+            Some("mphf") => mphf = Some(p),
+            Some("val") => val = Some(p),
+            _ => {}
+        }
+    }
+    (
+        mphf.expect("packed shard mphf"),
+        val.expect("packed shard val"),
+    )
+}
+
+fn empty_header() -> HeaderRecord {
+    HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x1d00ffff,
+        nonce: 1,
+        merkle_root: [1u8; 32],
+        hash: [2u8; 32],
+        size: 0,
+        weight: 0,
+    }
+}
+
+#[test]
+fn kill_first_start_interrupted_creation_reopens_empty_chain() {
+    let torn = tmp();
+    std::fs::create_dir_all(&torn).unwrap();
+    let mut meta = STORE_MAGIC.to_vec();
+    meta.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
+    std::fs::write(torn.join("meta"), &meta).unwrap();
+    std::fs::create_dir_all(torn.join("scripthash.body")).unwrap();
+    std::fs::write(torn.join("scripthash.body").join("00"), b"torn").unwrap();
+    let s = Store::open_or_create_tiny(&torn).unwrap();
+    assert_eq!(s.header_count(), 0);
+    assert!(s.tip_height().is_none());
+    let hdr = empty_header();
+    let hfk = s.put_header(&hdr).unwrap();
+    s.flush().unwrap();
+    drop(s);
+    let s = Store::open_or_create_tiny(&torn).unwrap();
+    assert_eq!(s.headers.get(hfk).unwrap().hash, hdr.hash);
+    assert!(s.tip_height().is_none());
+    drop(s);
+    let _ = std::fs::remove_dir_all(&torn);
+
+    let mid = tmp();
+    {
+        let s = Store::create_tiny(&mid).unwrap();
+        s.flush().unwrap();
+    }
+    std::fs::remove_file(mid.join("confirmed.body")).unwrap();
+    let s = Store::open_or_create_tiny(&mid).unwrap();
+    assert!(s.tip_height().is_none());
+    assert_eq!(s.header_count(), 0);
+    drop(s);
+    let s = Store::open_or_create_tiny(&mid).unwrap();
+    assert!(s.tip_height().is_none());
+    drop(s);
+    let _ = std::fs::remove_dir_all(&mid);
+
+    let ingest = tmp();
+    {
+        let s = Store::create_tiny(&ingest).unwrap();
+        s.flush().unwrap();
+    }
+    let ingest_path = ingest.join("scripthash.ovf").join("ingest");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&ingest_path)
+        .unwrap()
+        .set_len(8)
+        .unwrap();
+    let s = Store::open_or_create_tiny(&ingest).unwrap();
+    assert!(s.tip_height().is_none());
+    drop(s);
+    Store::open_or_create_tiny(&ingest).unwrap();
+    let _ = std::fs::remove_dir_all(&ingest);
+
+    let root = tmp();
+    let hot = root.join("hot");
+    let cold = root.join("cold");
+    {
+        let s = Store::create_layout(StoreLayout::tiny(&hot).with_cold_dir(&cold)).unwrap();
+        s.flush().unwrap();
+    }
+    std::fs::remove_file(hot.join("meta")).unwrap();
+    let s = Store::open_or_create_layout(StoreLayout::tiny(&hot).with_cold_dir(&cold)).unwrap();
+    assert!(s.tip_height().is_none());
+    assert!(cold.join("seqsigwit.body").is_file());
+    drop(s);
+    let s = Store::open_or_create_layout(StoreLayout::tiny(&hot).with_cold_dir(&cold)).unwrap();
+    assert!(s.tip_height().is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A finished empty store whose table is unreadable is not an incomplete
+/// create. Replacing it would delete `store.secret`.
+#[cfg(unix)]
+#[test]
+fn kill_first_start_unreadable_empty_store_is_not_replaced() {
+    use std::os::unix::fs::PermissionsExt;
+    let locked = tmp();
+    {
+        let s = Store::create_tiny(&locked).unwrap();
+        s.flush().unwrap();
+    }
+    let confirmed = locked.join("confirmed.body");
+    let secret = locked.join("store.secret");
+    assert!(secret.is_file());
+    std::fs::set_permissions(&confirmed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    match Store::open_or_create_tiny(&locked) {
+        Err(StoreError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Ok(_) => panic!("permission denied must not replace the datadir"),
+        Err(other) => panic!("permission denied must not replace the datadir: {other}"),
+    }
+    assert!(locked.join("meta").is_file());
+    assert!(secret.is_file());
+    assert!(confirmed.is_file());
+    std::fs::set_permissions(&confirmed, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let _ = std::fs::remove_dir_all(&locked);
+}
+
+/// Hot meta and hot chain bodies are gone. The cold directory already holds
+/// a prior chain, so that cold store stays.
+#[test]
+fn kill_first_start_cold_chain_without_hot_meta_is_kept() {
+    let chained = tmp();
+    let hot_chain = chained.join("hot");
+    let cold_chain = chained.join("cold");
+    let layout = StoreLayout::tiny(&hot_chain).with_cold_dir(&cold_chain);
+    {
+        let s = Store::create_layout(layout.clone()).unwrap();
+        let item = coinbase_item([12u8; 32], vec![OutputRecord::unspent(50, vec![0x53])]);
+        s.put_tx_full_batch_indexed(std::slice::from_ref(&item), false)
+            .unwrap();
+        s.flush().unwrap();
+    }
+    let seq_path = cold_chain.join("seqsigwit.body");
+    let seq_bytes = std::fs::read(&seq_path).unwrap();
+    assert!(
+        seq_bytes.len() > rbitcoin_store::file::FILE_HEADER_LEN,
+        "the cold chain must already hold seqsigwit payload"
+    );
+    std::fs::remove_file(hot_chain.join("meta")).unwrap();
+    for name in [
+        "txid.body",
+        "txout.body",
+        "header.body",
+        "confirmed.body",
+        "spent.body",
+    ] {
+        let path = hot_chain.join(name);
+        if path.exists() {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    match Store::open_or_create_layout(layout) {
+        Err(StoreError::Corrupt("store meta missing")) => {}
+        Ok(_) => panic!("a cold chain with no hot meta must stay closed"),
+        Err(other) => panic!("a cold chain with no hot meta stays closed: {other}"),
+    }
+    assert_eq!(std::fs::read(&seq_path).unwrap(), seq_bytes);
+    assert!(hot_chain.join("store.secret").is_file());
+    let _ = std::fs::remove_dir_all(&chained);
+}
+
+/// Every chain body fails to open, and each file is still one small create.
+/// Bytes past the header are the chain. Open must not replace the directory.
+#[test]
+fn kill_first_start_torn_small_chain_bodies_stay() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        let item = coinbase_item([14u8; 32], vec![OutputRecord::unspent(50, vec![0x55])]);
+        s.put_tx_full_batch_indexed(std::slice::from_ref(&item), false)
+            .unwrap();
+        s.flush().unwrap();
+    }
+    let header_len = rbitcoin_store::file::FILE_HEADER_LEN;
+    let names = [
+        "txid.body",
+        "txout.body",
+        "header.body",
+        "confirmed.body",
+        "seqsigwit.body",
+        "spent.body",
+        "input.body",
+    ];
+    let mut saw_payload = false;
+    let mut snapshots = Vec::new();
+    for name in names {
+        let path = dir.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert!(
+            bytes.len() <= 4096,
+            "{name} is {} bytes; this pin is the small torn body",
+            bytes.len()
+        );
+        let header = if name == "txid.body" { 32 } else { header_len };
+        if bytes.len() > header && bytes[header..].iter().any(|b| *b != 0) {
+            saw_payload = true;
+        }
+        assert!(bytes.len() >= 4, "{name} has no magic to tear");
+        bytes[..4].copy_from_slice(b"XXXX");
+        std::fs::write(&path, &bytes).unwrap();
+        snapshots.push((path, bytes));
+    }
+    assert!(
+        saw_payload,
+        "one published create must leave a non-zero byte past a chain header"
+    );
+    match Store::open_or_create_tiny(&dir) {
+        Err(_) => {}
+        Ok(_) => panic!("torn chain bodies must not reopen as an empty store"),
+    }
+    for (path, bytes) in &snapshots {
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            *bytes,
+            "{} was replaced",
+            path.display()
+        );
+    }
+    assert!(dir.join("meta").is_file());
+    assert!(dir.join("store.secret").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Empty-create slack is zeros past the header. A torn magic on that file
+/// is still an incomplete first create.
+#[test]
+fn kill_first_start_torn_empty_txid_still_reopens() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    let txid_path = dir.join("txid.body");
+    let mut bytes = std::fs::read(&txid_path).unwrap();
+    assert!(bytes.len() <= 4096);
+    assert!(bytes.len() > 32);
+    assert!(
+        bytes[32..].iter().all(|b| *b == 0),
+        "an empty txid create is zeros past the header"
+    );
+    bytes[..4].copy_from_slice(b"XXXX");
+    std::fs::write(&txid_path, &bytes).unwrap();
+    let s = Store::open_or_create_tiny(&dir).unwrap();
+    assert_eq!(s.header_count(), 0);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `txid.body` fails to open, but `txout.body` already has a create.
+#[test]
+fn kill_first_start_torn_txid_keeps_txout() {
+    let torn_txid = tmp();
+    {
+        let s = Store::create_tiny(&torn_txid).unwrap();
+        let item = coinbase_item([13u8; 32], vec![OutputRecord::unspent(50, vec![0x54])]);
+        s.put_tx_full_batch_indexed(std::slice::from_ref(&item), false)
+            .unwrap();
+        s.flush().unwrap();
+    }
+    let txout_path = torn_txid.join("txout.body");
+    let txout_bytes = std::fs::read(&txout_path).unwrap();
+    let txid_path = torn_txid.join("txid.body");
+    let mut txid_bytes = std::fs::read(&txid_path).unwrap();
+    txid_bytes[..4].copy_from_slice(b"XXXX");
+    std::fs::write(&txid_path, &txid_bytes).unwrap();
+    let opened = Store::open_or_create_tiny(&torn_txid);
+    assert_eq!(
+        std::fs::read(&txout_path).unwrap(),
+        txout_bytes,
+        "a torn txid must not delete the published txout body"
+    );
+    assert_eq!(std::fs::read(&txid_path).unwrap(), txid_bytes);
+    assert!(torn_txid.join("meta").is_file());
+    assert!(torn_txid.join("store.secret").is_file());
+    assert!(
+        opened.is_err(),
+        "a torn txid beside a published txout is not a fresh empty chain"
+    );
+    let _ = std::fs::remove_dir_all(&torn_txid);
+}
+
+#[test]
+fn kill_first_start_leftover_oa_without_flag_opens_and_with_flag_materializes() {
+    let dir = tmp();
+    let txid = [10u8; 32];
+    let script = vec![0x51];
+    let fk = {
+        let s = Store::create_tiny(&dir).unwrap();
+        let item = coinbase_item(txid, vec![OutputRecord::unspent(50, script.clone())]);
+        let fks = s
+            .put_tx_full_batch_indexed(std::slice::from_ref(&item), true)
+            .unwrap();
+        s.flush().unwrap();
+        fks[0]
+    };
+    let txid_bytes = std::fs::read(dir.join("txid.body")).unwrap();
+    std::fs::write(dir.join("scripthash.head"), b"leftover-oa").unwrap();
+    std::fs::write(dir.join("scripthash.ovf").join("000000"), b"not-shsr").unwrap();
+
+    let s = Store::open_or_create_tiny(&dir).unwrap();
+    assert_eq!(std::fs::read(dir.join("txid.body")).unwrap(), txid_bytes);
+    assert_eq!(s.get_tx_full(fk).unwrap().0.txid, txid);
+    assert!(dir.join("scripthash.body").is_dir());
+    assert!(!dir.join("scripthash.head").exists());
+    assert!(!dir.join("scripthash.ovf").join("000000").exists());
+    drop(s);
+    let s = Store::open_or_create_tiny(&dir).unwrap();
+    assert_eq!(s.get_tx_full(fk).unwrap().0.txid, txid);
+    assert_eq!(std::fs::read(dir.join("txid.body")).unwrap(), txid_bytes);
+
+    rbitcoin_store::materialize_sh_unsorted_from_class_a(&s, 1, 1, None).unwrap();
+    let sh = rbitcoin_store::script_hash(&script);
+    assert!(!s.scripthash.entries(&sh).unwrap().is_empty());
+    assert_eq!(std::fs::read(dir.join("txid.body")).unwrap(), txid_bytes);
+    s.flush().unwrap();
+    drop(s);
+    let s = Store::open_or_create_tiny(&dir).unwrap();
+    assert_eq!(s.get_tx_full(fk).unwrap().0.txid, txid);
+    assert_eq!(std::fs::read(dir.join("txid.body")).unwrap(), txid_bytes);
+    assert!(!s.scripthash.entries(&sh).unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kill_first_start_finished_index_survives_reopen() {
+    let dir = tmp();
+    let txid = [11u8; 32];
+    let script = vec![0x52];
+    let fk = {
+        let s = Store::create_tiny(&dir).unwrap();
+        let item = coinbase_item(txid, vec![OutputRecord::unspent(50, script.clone())]);
+        let fks = s
+            .put_tx_full_batch_indexed(std::slice::from_ref(&item), true)
+            .unwrap();
+        s.flush().unwrap();
+        rbitcoin_store::materialize_sh_unsorted_from_class_a(&s, 1, 1, None).unwrap();
+        assert!(s.scripthash.has_durable_index());
+        s.flush().unwrap();
+        fks[0]
+    };
+    let txid_bytes = std::fs::read(dir.join("txid.body")).unwrap();
+    let head = dir.join("scripthash.head");
+    let (mphf_path, val_path) = shard_mphf_val(&head);
+    let mphf = std::fs::read(&mphf_path).unwrap();
+    let val = std::fs::read(&val_path).unwrap();
+    std::fs::write(dir.join("scripthash.ovf").join("000001"), b"not-shsr").unwrap();
+
+    let s = Store::open_or_create_tiny(&dir).unwrap();
+    assert_eq!(std::fs::read(dir.join("txid.body")).unwrap(), txid_bytes);
+    assert_eq!(std::fs::read(&mphf_path).unwrap(), mphf);
+    assert_eq!(std::fs::read(&val_path).unwrap(), val);
+    assert!(!dir.join("scripthash.ovf").join("000001").exists());
+    assert_eq!(s.get_tx_full(fk).unwrap().0.txid, txid);
+    assert!(s.scripthash.has_durable_index());
+    let sh = rbitcoin_store::script_hash(&script);
+    assert!(!s.scripthash.entries(&sh).unwrap().is_empty());
+    drop(s);
+    let s = Store::open_or_create_tiny(&dir).unwrap();
+    assert_eq!(std::fs::read(dir.join("txid.body")).unwrap(), txid_bytes);
+    assert_eq!(std::fs::read(&mphf_path).unwrap(), mphf);
+    assert_eq!(std::fs::read(&val_path).unwrap(), val);
+    assert_eq!(s.get_tx_full(fk).unwrap().0.txid, txid);
     let _ = std::fs::remove_dir_all(&dir);
 }

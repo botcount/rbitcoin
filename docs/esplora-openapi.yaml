@@ -16,11 +16,18 @@ info:
     optional `0x` or `0X` prefix. A malformed hash in a path or in `?asof=`
     returns **404** `Not Found`.
 
+    ## Stored block reads
+    Hash-addressed block routes admit active blocks and blocks disconnected
+    during the current process. Header-only and never-connected bodies are 404.
+    Restart forgets disconnected membership: reopened stale blocks are 404
+    until reconnected and disconnected again. This does not relax `?asof=`.
+
     ## Chain-view headers
     Pinned responses carry `X-Bitcoin-Chain-Tip` (block hash) and
     `X-Bitcoin-Chain-Tip-Height`. Both are CORS-exposed. Block, tx, and header
-    routes stamp the live tip. `/address/*`, `/scripthash/*`, `/addresses/*`, and
-    `/scripthashes/*` stamp the scripthash-index watermark, so the JSON matches
+    routes stamp the live tip. `/address/*`, `/scripthash/*`, `/addresses/*`,
+    `/scripthashes/*`, `/internal/address/*`, and `/internal/scripthash/*` stamp
+    the scripthash-index watermark, so the JSON matches
     the join that produced it, except `/address/{address}/txs/mempool` and
     `/scripthash/{scripthash}/txs/mempool`, which are not stamped. With `?asof=`,
     the stamp is the as-of block. Public `/mempool`, `/mempool/txids`, and
@@ -48,7 +55,8 @@ info:
     - Accepted only on the routes that declare the `asof` parameter below:
       `/tx/{txid}/status`, `/tx/{txid}/outspend/{vout}`, `/tx/{txid}/outspends`,
       and address/scripthash `/`, `/utxo`, `/txs`, `/txs/chain[/{last}]`,
-      `/txs/summary[/{last}]`.
+      `/txs/summary[/{last}]`, plus the unix-socket `/internal/address/{address}`
+      and `/internal/scripthash/{scripthash}`.
     - On any other route, `?asof=` is **404** (for example `/tx/{txid}`,
       `/mempool`, `/address/{addr}/txs/mempool`, and the POST multi-script routes).
     - An empty value, bad hex, an unknown hash, a hash that is not on the best
@@ -64,7 +72,9 @@ info:
     ## Scripthash index
     Address and scripthash routes need `--sh-index`. Without it they return
     **503** `scripthash index disabled`. Unpaged stats and `/utxo` above
-    `--max-sh-creates` are **503**; paged history is still served.
+    `--max-sh-creates` are **503**; paged history is still served. On the unix
+    socket, `/internal/address/{address}` and `/internal/scripthash/{scripthash}`
+    answer those stats without the `--max-sh-creates` 503.
 
     ## Errors
     Error bodies are `text/plain`. Unknown paths are **404** `Not Found`.
@@ -135,7 +145,8 @@ paths:
   /block/{hash}:
     get:
       tags: [blocks]
-      summary: Block summary (best chain only)
+      summary: Block summary (active or disconnected by this process)
+      description: Height resolution walks at most 10,000 headers to an active ancestor or genesis; beyond that, 404. Median time uses this branch. Stale summaries require complete txstat rows; unstamped stale summaries are 404 without witness reconstruction.
       parameters: [{ $ref: "#/components/parameters/BlockHash" }]
       responses:
         "200":
@@ -149,6 +160,7 @@ paths:
     get:
       tags: [blocks]
       summary: 80-byte block header as hex
+      description: Requires an active block or a body disconnected during this process.
       parameters: [{ $ref: "#/components/parameters/BlockHash" }]
       responses:
         "200": { $ref: "#/components/responses/PlainHex" }
@@ -157,6 +169,7 @@ paths:
     get:
       tags: [blocks]
       summary: Whether the block is on the best chain
+      description: Blocks disconnected during this process retain their original height and have null next_best. A stored header without an archived body is 404. Height resolution is limited to 10,000 headers; beyond that, 404.
       parameters: [{ $ref: "#/components/parameters/BlockHash" }]
       responses:
         "200":
@@ -209,6 +222,25 @@ paths:
       parameters: [{ $ref: "#/components/parameters/BlockHash" }]
       responses:
         "200": { $ref: "#/components/responses/TxList" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /block/{hash}/txs/summary:
+    get:
+      tags: [blocks]
+      summary: Txid, fee, weight, and value of every tx in the block (rbitcoin dialect)
+      description: |
+        Not in Blockstream Esplora API.md. One array row per tx in block order,
+        coinbase first (fee 0). Same 404s as `/txids`; this static segment wins
+        over `/txs/{start_index}`. No `--sh-index`. A pruned block whose
+        `txstat` rows predate schema 25 is 404 `pruned` on the active chain.
+        An unstamped stale block is 404 without reconstruction.
+      parameters: [{ $ref: "#/components/parameters/BlockHash" }]
+      responses:
+        "200":
+          description: Rows
+          headers: { X-Bitcoin-Chain-Tip: { $ref: "#/components/headers/ChainTip" }, X-Bitcoin-Chain-Tip-Height: { $ref: "#/components/headers/ChainTipHeight" }, X-Powered-By: { $ref: "#/components/headers/PoweredBy" } }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/BlockTxSummaryRow" } }
         "404": { $ref: "#/components/responses/NotFound" }
   /block/{hash}/txs/{start_index}:
     get:
@@ -366,6 +398,8 @@ paths:
           description: |
             Comma-separated txids, at most 50. A missing list or more than 50 ids is 400.
             A token that is not a hash is an empty array for that slot, not 400.
+            The output counts of every listed txid (repeats included) may sum to at
+            most 250,000; over that is 400 `Too many outputs requested`.
           schema: { type: string }
       responses:
         "200":
@@ -850,6 +884,10 @@ paths:
     post:
       tags: [internal]
       summary: "Outspends per txid (unknown txid → `[]`)"
+      description: |
+        At most 1,000 txids (more is 400 `Too many txids requested`). The output
+        counts of every listed txid (repeats included) may sum to at most 250,000;
+        over that is 400 `Too many outputs requested`.
       requestBody: { $ref: "#/components/requestBodies/TxidArray" }
       responses:
         "200":
@@ -878,6 +916,35 @@ paths:
             application/json:
               schema: { type: array, items: { $ref: "#/components/schemas/Outspend" } }
         "400": { $ref: "#/components/responses/BadRequest" }
+  /internal/address/{address}:
+    get:
+      tags: [internal]
+      summary: "`/address/{address}` stats without `--max-sh-creates`"
+      description: |
+        Same body, `?asof=`, and chain-tip headers as `/address/{address}`, but
+        a script above `--max-sh-creates` is answered instead of 503.
+        `--heavy-sh-creates` still applies. The public routes keep the cap on
+        this socket too. Probe: `/internal/scripthash/` followed by 64 zeros is
+        200 with zero counters here and 404 on a node without the route.
+      parameters:
+        - { $ref: "#/components/parameters/Address" }
+        - { $ref: "#/components/parameters/AsOf" }
+      responses:
+        "200": { $ref: "#/components/responses/AddressStats" }
+        "404": { $ref: "#/components/responses/AsOfNotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /internal/scripthash/{scripthash}:
+    get:
+      tags: [internal]
+      summary: "`/scripthash/{scripthash}` stats without `--max-sh-creates`"
+      description: See `/internal/address/{address}`.
+      parameters:
+        - { $ref: "#/components/parameters/Scripthash" }
+        - { $ref: "#/components/parameters/AsOf" }
+      responses:
+        "200": { $ref: "#/components/responses/AddressStats" }
+        "404": { $ref: "#/components/responses/AsOfNotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
 
 components:
   headers:
@@ -1062,7 +1129,7 @@ components:
       required: [in_best_chain, height, next_best]
       properties:
         in_best_chain: { type: boolean }
-        height: { type: [integer, "null"] }
+        height: { type: integer }
         next_best:
           oneOf: [{ $ref: "#/components/schemas/Hash" }, { type: "null" }]
     TxStatus:
@@ -1172,6 +1239,16 @@ components:
         height: { type: integer }
         time: { type: integer, description: confirming header timestamp, 0 if the header is missing }
         tx_position: { type: integer, description: index of the tx in its block }
+    BlockTxSummaryRow:
+      type: array
+      description: "`[txid, fee, weight, value]`: fee in sats (coinbase 0), BIP141 weight units (not sigop-adjusted), sum of the tx's output values in sats."
+      prefixItems:
+        - { $ref: "#/components/schemas/Hash" }
+        - { type: integer, minimum: 0 }
+        - { type: integer, minimum: 0 }
+        - { type: integer, minimum: 0 }
+      minItems: 4
+      maxItems: 4
     MempoolInfo:
       type: object
       required: [count, vsize, total_fee, fee_histogram]
@@ -1191,7 +1268,7 @@ components:
         allowed: { type: boolean }
         vsize:
           type: integer
-          description: Present when `allowed` is true. `floor(weight / 4)`, not the ceiling Core uses.
+          description: Present when `allowed` is true. The sigop-adjusted admission weight divided by 4, rounded up, as `testmempoolaccept` reports it.
         fees:
           type: object
           description: Present when `allowed` is true.

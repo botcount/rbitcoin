@@ -5,7 +5,7 @@ in [`CHANGELOG.md`](../CHANGELOG.md). Peer-node notes:
 [`peer-clients.md`](./peer-clients.md) (do not copy here).
 
 **Last reaudit:** 2026-10-08. Live schema: [`SCHEMA.md`](../SCHEMA.md)
-(`SCHEMA_VERSION = 26`). **Q-64**, **Q-71**, and **Q-72** are off this list:
+(`SCHEMA_VERSION = 28`). **Q-64**, **Q-71**, and **Q-72** are off this list:
 SV2 plans A–C are in tree, and the Talip and Livera indexes are fully
 dispositioned.
 Core functional inventory: [`core-functional.md`](./core-functional.md).
@@ -80,11 +80,11 @@ stay out.
 ### Parked (not now; promote to Open with a rank to revisit)
 
 Wallet-backing extras from the 2026-09 node survey. Not Won't-fix forever —
-just not the current product. COMPAT/OPERATOR stay the shipped contract.
+just not the current product. COMPAT and `docs/operator/` stay the shipped contract.
 
 | ID | Item | Why parked | Reopen when |
 |----|------|------------|-------------|
-| **Q-63** | Electrum TLS (50002) + Tor onion **in the binary** | Home Sparrow/phone off-LAN today uses nginx (`OPERATOR.md`). Node stays plain TCP. | Operators refuse a reverse proxy, or a first-class onion listener is the 1.0 install. |
+| **Q-63** | Electrum TLS (50002) + Tor onion **in the binary** | Home Sparrow/phone off-LAN today uses nginx ([`docs/operator/interfaces.md`](./operator/interfaces.md)). Node stays plain TCP. | Operators refuse a reverse proxy, or a first-class onion listener is the 1.0 install. |
 
 ---
 
@@ -94,7 +94,7 @@ Do not “improve” these away. Design owners are linked; this is the
 checklist.
 
 - **Thesis:** relational archive, pure-Rust scripts, in-process
-  Electrum/Esplora, Linux map-free IO + optional io_uring, reproducible
+  Electrum/Esplora, optional io_uring, reproducible
   musl. Not a Core clone. [`architecture.md`](./architecture.md).
 - **No silent consensus/store fallback.** Missing promised fact →
   `StoreError::Corrupt("invariant: …")`. Confirm dual-path kill. TxApply →

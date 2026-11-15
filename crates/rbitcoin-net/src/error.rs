@@ -4,6 +4,11 @@ use std::io;
 #[derive(Debug)]
 pub enum NetError {
     Io(io::Error),
+    /// A P2P listen socket could not bind `addr` (Core's bind InitError).
+    Bind {
+        addr: std::net::SocketAddr,
+        source: io::Error,
+    },
     Encode(String),
     Protocol(&'static str),
     /// Peer does not speak BIP324 v2 (or closed during v2 handshake).
@@ -52,6 +57,7 @@ impl fmt::Display for NetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             NetError::Io(e) => write!(f, "io: {e}"),
+            NetError::Bind { addr, source } => write!(f, "bind {addr}: {source}"),
             NetError::Encode(s) => write!(f, "encode: {s}"),
             NetError::Protocol(s) => write!(f, "protocol: {s}"),
             NetError::V1Peer => f.write_str("peer does not speak BIP324 v2"),
@@ -79,7 +85,7 @@ impl fmt::Display for NetError {
 impl std::error::Error for NetError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            NetError::Io(e) => Some(e),
+            NetError::Io(e) | NetError::Bind { source: e, .. } => Some(e),
             _ => None,
         }
     }

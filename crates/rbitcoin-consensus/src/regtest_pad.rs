@@ -66,15 +66,11 @@ pub fn regtest_mine_fits_one_nonce_span(bits: CompactTarget) -> bool {
     let sign = 1u32 << 23;
     let limit_mant = u64::from(limit & (sign - 1));
     let got_mant = u64::from(got & (sign - 1));
-    if limit_mant == 0 || got_mant == 0 {
-        return false;
-    }
     let limit_exp = limit >> 24;
     let got_exp = got >> 24;
-    if got_exp > limit_exp {
+    let Some(delta) = limit_exp.checked_sub(got_exp) else {
         return true;
-    }
-    let delta = limit_exp - got_exp;
+    };
     if delta >= 8 {
         return false;
     }
@@ -107,9 +103,6 @@ pub fn grind_header_midstate(header: &Header, target: Target, start: u32) -> Opt
             .unwrap_or(1)
             .clamp(1, 4)
     };
-    if workers == 1 {
-        return grind_header_midstate_one(&raw, target, start, 1, None);
-    }
     let stop = std::sync::atomic::AtomicBool::new(false);
     let hit = std::sync::atomic::AtomicBool::new(false);
     let found = std::sync::atomic::AtomicU32::new(u32::MAX);
@@ -159,12 +152,10 @@ pub fn grind_header_midstate_one(
     let mut tail = [0u8; 16];
     tail.copy_from_slice(&raw[64..80]);
     let mut nonce = start;
-    let mut spins: u32 = 0;
     loop {
-        if spins == 0 && stop.is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed)) {
+        if stop.is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed)) {
             return None;
         }
-        spins = spins.wrapping_add(1) % 1024;
         tail[12..16].copy_from_slice(&nonce.to_le_bytes());
         let mut second = sha256::HashEngine::from_midstate(mid, 64);
         second.input(&tail);

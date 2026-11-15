@@ -8,15 +8,7 @@ use rbitcoin_store::tx_table::TxTable;
 use rbitcoin_store::tx_table::{InputRecord, OutputRecord, TxRecord};
 
 fn tmp() -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "rbitcoin-point-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&p);
+    let p = rbitcoin_store::testutil::fresh_path("point");
     std::fs::create_dir_all(&p).unwrap();
     p
 }

@@ -48,7 +48,7 @@ jobs:
     name: core-functional
     needs: [detect]
     if: needs.detect.outputs.run == 'true'
-    uses: ./.github/workflows/core-functional.yml
+    uses: $/.github/workflows/core-functional.yml
     with:
       gate: true
 
@@ -56,7 +56,7 @@ jobs:
     name: overlay-functional
     needs: [detect]
     if: needs.detect.outputs.run == 'true'
-    uses: ./.github/workflows/overlay-functional.yml
+    uses: $/.github/workflows/overlay-functional.yml
     with:
       gate: true
 
@@ -64,7 +64,7 @@ jobs:
     name: warnet-example
     needs: [detect]
     if: needs.detect.outputs.run == 'true'
-    uses: ./.github/workflows/warnet-example.yml
+    uses: $/.github/workflows/warnet-example.yml
     with:
       gate: true
 

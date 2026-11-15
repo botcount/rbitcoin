@@ -292,6 +292,61 @@ fn delta_loc_append_and_batch_order() {
     assert_eq!(got[4], None);
 }
 
+/// Create 1025 starts at the checkpoint open read from `seqsigwit.off`.
+#[test]
+fn delta_loc_open_reads_the_next_window() {
+    let dir = TempDir::labeled("delta-next-window").unwrap();
+    let loc = DeltaLoc::create(dir.path(), "seqsigwit").unwrap();
+    let mut starts = Vec::with_capacity(1025);
+    let mut lens = Vec::with_capacity(1025);
+    let mut cursor = FILE_HEADER_LEN as u64;
+    for _ in 0..1025 {
+        starts.push(cursor);
+        lens.push(8);
+        cursor += 8;
+    }
+    loc.append(&starts, &lens).unwrap();
+    drop(loc);
+    let loc = DeltaLoc::open(dir.path(), "seqsigwit").unwrap();
+    let start = FILE_HEADER_LEN as u64 + 1024 * 8;
+    assert_eq!(loc.range_batch(&[Fk(1025)]).unwrap()[0], Some((start, 8)));
+    let cps = loc.checkpoints.read().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(cps.as_slice(), &[start]);
+}
+
+#[test]
+fn delta_loc_open_reads_the_overflow_row() {
+    let dir = TempDir::labeled("delta-ovf-row").unwrap();
+    let loc = DeltaLoc::create(dir.path(), "seqsigwit").unwrap();
+    let fat = 65536 * IDX_STRIDE;
+    loc.append(&[FILE_HEADER_LEN as u64], &[fat]).unwrap();
+    drop(loc);
+    let loc = DeltaLoc::open(dir.path(), "seqsigwit").unwrap();
+    let rows = loc
+        .ovf_rows
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(rows, vec![(1, 65536)]);
+    assert_eq!(
+        loc.range_batch(&[Fk(1)]).unwrap()[0],
+        Some((FILE_HEADER_LEN as u64, fat))
+    );
+
+    let ragged = TempDir::labeled("delta-ovf-ragged").unwrap();
+    let loc = DeltaLoc::create(ragged.path(), "seqsigwit").unwrap();
+    loc.ovf.set_logical_len(FILE_HEADER_LEN as u64 + 4).unwrap();
+    drop(loc);
+    let err = match DeltaLoc::open(ragged.path(), "seqsigwit") {
+        Ok(_) => panic!("open accepted a ragged overflow file"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, StoreError::Corrupt(m) if m.contains("loc ovf size")),
+        "{err:?}"
+    );
+}
+
 #[test]
 fn delta_loc_u16_overflow_and_missing() {
     let dir = TempDir::labeled("delta-ovf").unwrap();
@@ -318,4 +373,28 @@ fn pack_u16_seqsigwit_overflow_at_512kib() {
     let (d, ovf) = pack_u16_strides_seqsigwit(65536).unwrap();
     assert_eq!(d, 0);
     assert_eq!(ovf, Some(65536));
+}
+
+#[test]
+fn range_batch_returns_appended_spans() {
+    let dir = TempDir::labeled("delta-range-typed").unwrap();
+    let loc = DeltaLoc::create(dir.path(), "seqsigwit").unwrap();
+    let fat = 65536 * IDX_STRIDE;
+    let mut starts = Vec::new();
+    let mut lens = Vec::new();
+    let mut cursor = FILE_HEADER_LEN as u64;
+    for len in [8u64, 16, fat] {
+        starts.push(cursor);
+        lens.push(len);
+        cursor = cursor.saturating_add(len);
+    }
+    loc.append(&starts, &lens).unwrap();
+    let rows = loc
+        .range_batch(&[Fk(1), Fk(3), Fk(2), Fk(0), Fk(9)])
+        .unwrap();
+    assert_eq!(rows[0], Some((starts[0], lens[0])));
+    assert_eq!(rows[1], Some((starts[2], lens[2])));
+    assert_eq!(rows[2], Some((starts[1], lens[1])));
+    assert_eq!(rows[3], None);
+    assert_eq!(rows[4], None);
 }

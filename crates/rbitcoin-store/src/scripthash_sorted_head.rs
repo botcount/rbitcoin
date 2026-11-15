@@ -13,6 +13,7 @@ use crate::scripthash_layout::{
     pack8_bytes, unpack8_bytes, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN, SH_HEAD_SLOT_SIZE,
     SH_HEAD_VALUE_LEN,
 };
+use rbitcoin_primitives::{bytes, le_u16, le_u32, le_u64};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -116,13 +117,13 @@ impl SortedHead {
         if header[0..4] != *DATA_MAGIC {
             return Err(StoreError::BadMagic);
         }
-        let ver = u16::from_le_bytes(header[4..6].try_into().unwrap());
+        let ver = le_u16!(header, 4);
         if ver != FORMAT_VER {
             return Err(StoreError::Corrupt(
                 "scripthash sorted head: unsupported version",
             ));
         }
-        let count = u64::from_le_bytes(header[6..14].try_into().unwrap());
+        let count = le_u64!(header, 6);
         let idx = read_idx(&idx_path(&path))?;
         let fuse = Some(SealedFuse8::read_from(&fuse_path(&path))?);
         Ok(Self {
@@ -195,8 +196,8 @@ impl SortedHead {
             let off = DATA_HEADER_LEN + slot * SH_HEAD_SLOT_SIZE as u64;
             pread_file_exact(&self.file, off, &mut rec)
                 .map_err(|e| StoreError::io(&self.path, e))?;
-            let k: ShHeadKey = rec[0..SH_HEAD_KEY_LEN].try_into().unwrap();
-            let val = unpack8_bytes(&rec[SH_HEAD_KEY_LEN..].try_into().unwrap())?;
+            let k = bytes!(rec, 0, 16);
+            let val = unpack8_bytes(&bytes!(rec, 16, 8))?;
             if !val.is_empty() {
                 f(k, val)?;
             }
@@ -225,14 +226,11 @@ impl SortedHead {
         self.preads.fetch_add(1, Ordering::Relaxed);
         pread_file_exact(&self.file, page_off, &mut page)
             .map_err(|e| StoreError::io(&self.path, e))?;
-        for s in 0..n {
-            let rec = &page[s * SH_HEAD_SLOT_SIZE..(s + 1) * SH_HEAD_SLOT_SIZE];
-            let k: ShHeadKey = rec[0..SH_HEAD_KEY_LEN].try_into().unwrap();
+        for (s, rec) in page.as_chunks::<SH_HEAD_SLOT_SIZE>().0.iter().enumerate() {
+            let k = bytes!(rec, 0, 16);
             match k.cmp(key) {
                 std::cmp::Ordering::Equal => {
-                    let mut out = [0u8; SH_HEAD_SLOT_SIZE];
-                    out.copy_from_slice(rec);
-                    return Ok(Some((page_slot0 + s as u64, out)));
+                    return Ok(Some((page_slot0 + s as u64, *rec)));
                 }
                 std::cmp::Ordering::Greater => return Ok(None),
                 std::cmp::Ordering::Less => {}
@@ -308,18 +306,16 @@ pub fn read_idx(path: &Path) -> Result<Vec<(ShHeadKey, u64)>, StoreError> {
     if buf.len() < IDX_HEADER_LEN || buf[0..4] != *IDX_MAGIC {
         return Err(StoreError::Corrupt("scripthash sorted head: bad idx"));
     }
-    let n = u32::from_le_bytes(buf[6..10].try_into().unwrap()) as usize;
+    let mut hdr = [0u8; IDX_HEADER_LEN];
+    hdr.copy_from_slice(&buf[..IDX_HEADER_LEN]);
+    let n = le_u32!(hdr, 6) as usize;
     if buf.len() < IDX_HEADER_LEN + n * IDX_ENT_LEN {
         return Err(StoreError::Corrupt("scripthash sorted head: short idx"));
     }
+    let ents = &buf[IDX_HEADER_LEN..IDX_HEADER_LEN + n * IDX_ENT_LEN];
     let mut out = Vec::with_capacity(n);
-    let mut off = IDX_HEADER_LEN;
-    for _ in 0..n {
-        let k: ShHeadKey = buf[off..off + SH_HEAD_KEY_LEN].try_into().unwrap();
-        off += SH_HEAD_KEY_LEN;
-        let rec_off = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
-        off += 8;
-        out.push((k, rec_off));
+    for row in ents.as_chunks::<IDX_ENT_LEN>().0 {
+        out.push((bytes!(row, 0, 16), le_u64!(row, 16)));
     }
     Ok(out)
 }

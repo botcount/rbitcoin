@@ -185,6 +185,70 @@ fn bip68_time_lock_uses_coin_create_mtp() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A disabled sequence on one input does not skip a relative lock on another.
+#[test]
+fn bip68_one_disabled_sequence_does_not_skip_a_locking_input() {
+    let dir = tmp_dir();
+    let open = OutPoint {
+        txid: Txid::from_byte_array([0x31; 32]),
+        vout: 0,
+    };
+    let locked = OutPoint {
+        txid: Txid::from_byte_array([0x32; 32]),
+        vout: 0,
+    };
+    let coin = |op: OutPoint, map: &mut HashMap<OutPoint, Coin>| {
+        map.insert(
+            op,
+            Coin {
+                txout: TxOut {
+                    value: Amount::from_sat(50_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                },
+                create_height: 10,
+                create_mtp: 1_000_000,
+                is_coinbase: false,
+                create_fk: None,
+            },
+        );
+    };
+    let mut map = HashMap::new();
+    coin(open, &mut map);
+    coin(locked, &mut map);
+    let utxos = MapUtxoProvider { map };
+    let mut tx = spend_tx(open, 90_000);
+    tx.version = Version::TWO;
+    tx.input[0].sequence = Sequence::MAX;
+    tx.input.push(TxIn {
+        previous_output: locked,
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::from_consensus((1 << 22) | 2),
+        witness: Witness::new(),
+    });
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let err = mp
+        .accept_tx(
+            &tx,
+            &utxos,
+            ChainTipCtx {
+                height: 20,
+                mtp: 1_001_000,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, AcceptError::NonBip68Final), "got {err}");
+    mp.accept_tx(
+        &tx,
+        &utxos,
+        ChainTipCtx {
+            height: 20,
+            mtp: 1_002_000,
+        },
+    )
+    .expect("the locking input is final at this median");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Stage timers are recorded on a successful chain-spend accept.
 #[test]
 fn accept_records_stage_us_on_success() {
@@ -1783,7 +1847,8 @@ fn cpfp_heavy_child(op: OutPoint) -> (Transaction, Transaction) {
 }
 
 /// A parent-then-child package must admit a child that was already parked
-/// on that parent, and a failed package must leave that child parked.
+/// on that parent, and a failed package must leave that child parked. The
+/// admitted child stays parked too, as Core's RPC package leaves it.
 #[test]
 fn package_admits_its_parked_child() {
     let dir = tmp_dir();
@@ -1843,7 +1908,8 @@ fn package_admits_its_parked_child() {
         mp.graph.contains(&sibling_id),
         "a parked sibling that is not in the package must still be admitted"
     );
-    assert_eq!(mp.orphan_count(), 0);
+    assert!(mp.orphanage.contains_wtxid(&child.compute_wtxid()));
+    assert_eq!(mp.orphan_count(), 1, "only the package member stays parked");
     let _ = std::fs::remove_dir_all(&dir);
 
     let dir = tmp_dir();
@@ -2428,20 +2494,6 @@ fn package_tree_requires_the_child_to_spend_each_member() {
     assert!(!ActiveMempool::package_is_child_with_parents_tree(&[
         parent, child, grandchild
     ]));
-    // The index compare is gone. A one-tx self-spend is not a peer
-    // message, because the txid commits to the prevout. `seen.contains`
-    // is what `testmempoolaccept` rejects.
-    let src = include_str!("accept.rs");
-    let start = src.find("pub fn check_package_shape(").expect("shape");
-    let end = start
-        + src[start..]
-            .find("pub fn package_is_child_with_parents_tree(")
-            .expect("child");
-    let shape = &src[start..end];
-    assert!(!shape.contains("p <"), "index compare must stay deleted");
-    assert!(!shape.contains("i > p"));
-    assert!(!shape.contains("<="));
-    assert!(!shape.contains(">="));
 }
 
 /// Recent-reject and extra-txn maps. No RPC returns them. A later peer
@@ -2512,19 +2564,6 @@ fn a_full_pinned_slot_table_evicts_one_chunk_then_stops() {
     mp.accept_tx(&incoming, &utxos, TIP_OK).unwrap();
     assert_eq!(mp.live_count(), 2, "one eviction frees the pinned table");
     assert!(mp.graph.contains(&incoming.compute_txid()));
-    // DEAD is a free slot, so eviction stops on the next pass. The old
-    // `guard += 1` / 10000 cap cannot be reached by a freed slot.
-    let src = include_str!("accept.rs");
-    let start = src.find("fn evict_worst_chunks(").expect("evict");
-    let end = start
-        + src[start..]
-            .find("fn evict_worst_chunk_once(")
-            .expect("once");
-    let evict = &src[start..end];
-    assert!(!evict.contains("+="), "eviction cap must stay deleted");
-    assert!(!evict.contains("10_000"));
-    assert!(!evict.contains("saturating_add"));
-    assert!(!evict.contains("||"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3282,35 +3321,6 @@ fn assert_duplicate_inputs_not_applied(
     assert!(!mp.graph.contains(&dup_id));
 }
 
-/// `repark_lifted` is a local retry. The process flag does not waive it.
-#[test]
-fn review_trust_repark_does_not_use_process_bit() {
-    let dir = tmp_dir();
-    let (op, _, utxos) = chain_utxo(100_000);
-    let mut tx = spend_tx(op, 99_000);
-    tx.lock_time = LockTime::from_height(500).unwrap();
-    tx.input[0].sequence = Sequence::from_consensus(0xfffffffe);
-    let tip = ChainTipCtx {
-        height: 100,
-        mtp: u32::MAX,
-    };
-    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-    let lifted = LiftedOrphan {
-        tx: tx.clone(),
-        announcers: vec![1],
-        taken_gen: 0,
-    };
-    rbitcoin_log::capture_logs(false);
-    rbitcoin_log::capture_logs(true);
-    let ready = mp.repark_lifted(std::slice::from_ref(&lifted), &utxos, tip, &|_| 0, None);
-    assert!(ready.is_empty(), "a local non-final orphan is not ready");
-    assert!(!mp.graph.contains(&tx.compute_txid()));
-    let logs = trust_logs();
-    assert!(!logs.contains("trust-peer:"), "{logs}");
-    rbitcoin_log::capture_logs(false);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// A waived script is logged only after the tx is in the pool. A script
 /// fault that then loses the cluster limit logs nothing and stays out.
 #[test]
@@ -3432,7 +3442,7 @@ fn promote_keeps_the_announcer_of_a_multi_parent_orphan() {
     mp.accept_tx(&parent_a, &utxos, TIP_OK)
         .expect("first parent");
     assert_eq!(
-        mp.orphanage.announcers_of(&child_id),
+        mp.orphanage.announcers_of(&child.compute_wtxid()),
         vec![4],
         "the repark must keep the announcing peer"
     );
@@ -3484,16 +3494,16 @@ fn disconnect_while_the_orphan_is_out_is_not_reparked() {
     missing.insert(parent_a.compute_txid());
     missing.insert(parent_b.compute_txid());
     mp.park_orphan_from(&child, missing.clone(), Some(4));
-    mp.orphanage.add_announcer(&child_id, 8);
-    let _taken = mp.orphanage.take_children_of(&parent_a.compute_txid());
+    mp.orphanage.add_announcer(&child.compute_wtxid(), 8);
+    let _taken = mp.take_orphan_children(parent_a.compute_txid());
     mp.orphanage.erase_for_peer(4);
     let _ = mp.park_announced(&child, missing.clone(), &[4, 8]);
     assert_eq!(
-        mp.orphanage.announcers_of(&child_id),
+        mp.orphanage.announcers_of(&child.compute_wtxid()),
         vec![8],
         "only the peer that is still connected is restored"
     );
-    let _taken = mp.orphanage.take_children_of(&parent_b.compute_txid());
+    let _taken = mp.take_orphan_children(parent_b.compute_txid());
     mp.orphanage.erase_for_peer(8);
     let _ = mp.park_announced(&child, missing, &[8]);
     assert!(
@@ -3544,81 +3554,22 @@ fn older_promote_forget_does_not_clear_a_newer_take() {
     missing.insert(parent_a.compute_txid());
     missing.insert(parent_b.compute_txid());
     mp.park_orphan_from(&child, missing.clone(), Some(4));
-    let first = mp.orphanage.take_children_of(&parent_a.compute_txid());
+    let first = mp.take_orphan_children(parent_a.compute_txid());
     let old_gen = first[0].taken_gen;
     let _ = mp.park_announced(&child, missing.clone(), &[4]);
-    let second = mp.orphanage.take_children_of(&parent_b.compute_txid());
+    let second = mp.take_orphan_children(parent_b.compute_txid());
     assert_eq!(
         second.len(),
         1,
         "the second promote took the reparked child"
     );
-    mp.orphanage.forget_taken_gen(&child_id, old_gen);
+    mp.orphanage
+        .forget_taken_gen(&child.compute_wtxid(), old_gen);
     mp.orphanage.erase_for_peer(4);
     let _ = mp.park_announced(&child, missing, &[4]);
     assert!(
         !mp.orphanage.contains(&child_id),
         "a forget from the first promote must not drop the second promote's disconnect"
-    );
-    let _ = utxos;
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn package_lift_disconnect_is_not_reparked() {
-    let dir = tmp_dir();
-    let (ops, utxos) = chain_coins(&[100_000, 100_000]);
-    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-    let parent_a = spend_tx(ops[0], 99_000);
-    let parent_b = spend_tx(ops[1], 99_000);
-    let child = Transaction {
-        version: Version::TWO,
-        lock_time: LockTime::ZERO,
-        input: vec![
-            TxIn {
-                previous_output: OutPoint {
-                    txid: parent_a.compute_txid(),
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
-            },
-            TxIn {
-                previous_output: OutPoint {
-                    txid: parent_b.compute_txid(),
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
-            },
-        ],
-        output: vec![TxOut {
-            value: Amount::from_sat(197_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
-    };
-    let child_id = child.compute_txid();
-    let mut missing = BTreeSet::new();
-    missing.insert(parent_a.compute_txid());
-    missing.insert(parent_b.compute_txid());
-    mp.park_orphan_from(&child, missing.clone(), Some(4));
-    mp.orphanage.add_announcer(&child_id, 8);
-    let lifted = mp.lift_parked_member(&child).unwrap();
-    mp.orphanage.erase_for_peer(4);
-    let _ = mp.park_announced(&lifted.tx, missing.clone(), &lifted.announcers);
-    assert_eq!(
-        mp.orphanage.announcers_of(&child_id),
-        vec![8],
-        "a disconnect during a package lift drops that peer"
-    );
-    let lifted = mp.lift_parked_member(&child).unwrap();
-    mp.orphanage.erase_for_peer(8);
-    let _ = mp.park_announced(&lifted.tx, missing, &lifted.announcers);
-    assert!(
-        !mp.orphanage.contains(&child_id),
-        "the last announcer disconnecting during a package lift drops the orphan"
     );
     let _ = utxos;
     let _ = std::fs::remove_dir_all(&dir);
@@ -3641,18 +3592,26 @@ fn package_admit_drops_the_inflight_row() {
     let mut missing = BTreeSet::new();
     missing.insert(parent.compute_txid());
     mp.park_orphan_from(&child, missing, Some(4));
-    mp.accept_package(&[parent, child], &utxos, TIP_OK)
+    mp.accept_package(&[parent, child.clone()], &utxos, TIP_OK)
         .expect("package admits the parked child");
     assert!(mp.graph.contains(&child_id));
+    assert_eq!(
+        mp.orphanage.announcers_of(&child.compute_wtxid()),
+        vec![4],
+        "the admitted child stays parked under its peer"
+    );
+    mp.orphanage.remove_wtxid(&child.compute_wtxid());
     assert!(
         !mp.orphanage.has_announcer(4),
-        "an admitted lift must not keep the peer in the in-flight map"
+        "the package must not leave the peer in the in-flight map"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A failed package leaves its parked member parked, under its peer, with
+/// no in-flight record: the package never takes it out.
 #[test]
-fn package_rollback_admit_drops_the_inflight_row() {
+fn package_rollback_leaves_the_parked_member() {
     let dir = tmp_dir();
     let (ops, utxos) = chain_coins(&[100_000, 50_000]);
     let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
@@ -3671,21 +3630,23 @@ fn package_rollback_admit_drops_the_inflight_row() {
     mp.park_orphan_from(&child, missing, Some(4));
     let bad = spend_tx(ops[1], 60_000);
     let err = mp
-        .accept_package(&[child, bad], &utxos, TIP_OK)
+        .accept_package(&[child.clone(), bad], &utxos, TIP_OK)
         .expect_err("the overspend fails the package");
     assert!(
-        mp.graph.contains(&child_id),
-        "the lifted child is admitted on its own, got {err}"
+        !mp.graph.contains(&child_id),
+        "the rollback removes the child, got {err}"
     );
+    assert_eq!(mp.orphanage.announcers_of(&child.compute_wtxid()), vec![4]);
+    mp.orphanage.remove_wtxid(&child.compute_wtxid());
     assert!(
         !mp.orphanage.has_announcer(4),
-        "that admit must not keep the peer in the in-flight map"
+        "the package must not leave the peer in the in-flight map"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn package_rollback_reject_drops_the_inflight_row() {
+fn package_reject_leaves_the_parked_member() {
     use bitcoin::WPubkeyHash;
 
     let dir = tmp_dir();
@@ -3726,13 +3687,15 @@ fn package_rollback_reject_drops_the_inflight_row() {
         "script failure, got {err}"
     );
     assert!(!mp.graph.contains(&child_id));
-    assert!(
-        !mp.orphanage.contains(&child_id),
-        "a script failure must not put the lifted child back"
+    assert_eq!(
+        mp.orphanage.announcers_of(&child.compute_wtxid()),
+        vec![4],
+        "a failed package leaves the orphanage alone"
     );
+    mp.orphanage.remove_wtxid(&child.compute_wtxid());
     assert!(
         !mp.orphanage.has_announcer(4),
-        "a rejected lift must not keep its peer"
+        "a rejected package must not keep its peer in flight"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

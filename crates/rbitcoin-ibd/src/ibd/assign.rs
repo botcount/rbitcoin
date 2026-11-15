@@ -54,10 +54,16 @@ pub const STUCK_GATE_AFTER: Duration = Duration::from_secs(30);
 
 /// True when confirm cannot advance and there is no valid body still worth fetching.
 pub fn download_gate_closed(st: &IbdWorkState, hub: &ChainHub) -> bool {
+    download_gate_closed_at(st, hub, Instant::now())
+}
+
+/// [`download_gate_closed`] at `now`. Equal to [`STUCK_GATE_AFTER`] is closed.
+#[doc(hidden)]
+pub fn download_gate_closed_at(st: &IbdWorkState, hub: &ChainHub, now: Instant) -> bool {
     let Some(since) = st.confirm_stuck_since else {
         return false;
     };
-    if since.elapsed() < STUCK_GATE_AFTER {
+    if now.saturating_duration_since(since) < STUCK_GATE_AFTER {
         return false;
     }
     !need_any_valid_body_download(st, hub)
@@ -106,8 +112,33 @@ pub fn need_body_in_hand(st: &IbdWorkState, hub: &ChainHub, h: &BlockHash) -> bo
         || hub.query.block_queue_has_hash(&h.to_byte_array())
 }
 
+/// Occupant of `path_lo` when that hash still needs a body and `hash_height`
+/// still records it there.
+///
+/// `None` leaves the question open. The caller scans `hash_height` for a
+/// competitor: no occupant, the map moved that hash, or the occupant is
+/// dead or already in hand.
+#[doc(hidden)]
+pub fn path_lo_occupant_needs_body(
+    st: &IbdWorkState,
+    hub: &ChainHub,
+    path_lo: u32,
+) -> Option<BlockHash> {
+    let h = *st.height_to_hash.get(&path_lo)?;
+    if st.hash_height.get(&h) != Some(&path_lo) {
+        return None;
+    }
+    if need_body_dead(st, &h) || need_body_in_hand(st, hub, &h) {
+        return None;
+    }
+    Some(h)
+}
+
 #[doc(hidden)]
 pub fn need_path_lo_alt(st: &IbdWorkState, hub: &ChainHub, path_lo: u32) -> bool {
+    if path_lo_occupant_needs_body(st, hub, path_lo).is_some() {
+        return true;
+    }
     for (&h, &ht) in &st.hash_height {
         if ht != path_lo {
             continue;
@@ -285,16 +316,6 @@ pub fn assign_work_ordered(
     st.intake_queued = bq_bytes;
 
     if download_gate_closed(st, hub) {
-        static GATE_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = GATE_LOG.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 3 || n.is_multiple_of(50) {
-            rbitcoin_log::warn!(
-                "ibd: download gate closed (confirm stuck {:?}, no valid body to fetch, n={n})",
-                st.confirm_stuck_since
-                    .map(|t| t.elapsed())
-                    .unwrap_or_default()
-            );
-        }
         finish_assign(loop_stats, t0, 0);
         return;
     }
@@ -381,10 +402,7 @@ fn retire_header_timeout_frontier_owners(st: &mut IbdWorkState, hash: BlockHash)
         .get(&hash)
         .map(|request| {
             request
-                .peers
-                .iter()
-                .chain(&request.retired)
-                .copied()
+                .holder_ids()
                 .filter(|peer| st.header_walk.header_timeout_peers.contains(peer))
                 .collect()
         })
@@ -605,15 +623,17 @@ pub fn collect_height_band(
         return out;
     }
     let hi = hi.min(st.max_ordered_height.max(lo));
+    let span_hi = hi.min(lo.saturating_add(FAR_SCAN_BUDGET as u32 - 1));
+    let mut span = super::progress::QueuedHashSpan::load(hub, lo, span_hi);
     let mut prefix = lo;
     let mut tracking = true;
     for (walked, ht) in (lo..=hi).enumerate() {
         if out.len() >= cap || walked >= FAR_SCAN_BUDGET {
             break;
         }
-        let need = need_hash_at(st, hub, ht, room);
+        let need = need_hash_at_in(st, hub, ht, room, &mut span);
         if tracking {
-            if need.is_none() && densify_prefix_filled(st, hub, ht) {
+            if need.is_none() && densify_prefix_filled_in(st, hub, ht, &mut span) {
                 prefix = ht.saturating_add(1);
             } else {
                 tracking = false;
@@ -631,9 +651,8 @@ pub fn collect_height_band(
 #[doc(hidden)]
 pub fn live_getdata_cover(st: &IbdWorkState, hash: &BlockHash) -> bool {
     st.inflight.get(hash).is_some_and(|req| {
-        req.peers
-            .iter()
-            .any(|pid| st.slots.iter().any(|s| s.id == *pid && s.alive))
+        req.racing()
+            .any(|pid| st.slots.iter().any(|s| s.id == pid && s.alive))
     })
 }
 
@@ -642,19 +661,21 @@ pub fn live_getdata_cover(st: &IbdWorkState, hash: &BlockHash) -> bool {
 /// Heights already recorded in `densify_ready_through` are not checked again.
 #[doc(hidden)]
 pub fn rewind_densify_scan_lo(st: &mut IbdWorkState, hub: &ChainHub, path_lo: u32) {
-    if st.densify_ready_through < path_lo {
-        st.densify_ready_through = path_lo;
-    }
+    st.densify_ready_through = st.densify_ready_through.max(path_lo);
     let hi = st.densify_scan_lo;
     let start = path_lo.max(st.densify_ready_through);
     if hi <= start {
         return;
     }
+    let mut span = super::progress::QueuedHashSpan::load(hub, start, hi - 1);
     for ht in start..hi {
         let Some(&hash) = st.height_to_hash.get(&ht) else {
             return;
         };
-        if !super::progress::claim_ready(hub, &mut st.body, ht, &hash) {
+        let ready = super::progress::claim_ready_queued(hub, &mut st.body, ht, &hash, || {
+            span.hash_at(hub, ht)
+        });
+        if !ready {
             st.densify_scan_lo = ht;
             return;
         }
@@ -664,10 +685,20 @@ pub fn rewind_densify_scan_lo(st: &mut IbdWorkState, hub: &ChainHub, path_lo: u3
 
 #[doc(hidden)]
 pub fn densify_prefix_filled(st: &mut IbdWorkState, hub: &ChainHub, ht: u32) -> bool {
+    let mut span = super::progress::QueuedHashSpan::load(hub, ht, ht);
+    densify_prefix_filled_in(st, hub, ht, &mut span)
+}
+
+fn densify_prefix_filled_in(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    ht: u32,
+    span: &mut super::progress::QueuedHashSpan,
+) -> bool {
     let Some(&h) = st.height_to_hash.get(&ht) else {
         return false;
     };
-    if super::progress::claim_ready(hub, &mut st.body, ht, &h) {
+    if super::progress::claim_ready_queued(hub, &mut st.body, ht, &h, || span.hash_at(hub, ht)) {
         return true;
     }
     if live_getdata_cover(st, &h) {
@@ -687,8 +718,12 @@ pub enum BqWireAt {
 
 #[doc(hidden)]
 pub fn bq_wire_for_hash(hub: &ChainHub, ht: u32, want: BlockHash) -> BqWireAt {
+    bq_wire_queued(hub, ht, want, hub.query.block_queue_hash_at_height(ht))
+}
+
+fn bq_wire_queued(hub: &ChainHub, ht: u32, want: BlockHash, queued: Option<[u8; 32]>) -> BqWireAt {
     use bitcoin::hashes::Hash as _;
-    match hub.query.block_queue_hash_at_height(ht) {
+    match queued {
         Some(bq_h) if bq_h == want.to_byte_array() => BqWireAt::Ready,
         Some(_) => {
             let _ = hub.query.block_queue_dequeue_height(ht);
@@ -706,7 +741,7 @@ pub fn bq_wire_for_hash(hub: &ChainHub, ht: u32, want: BlockHash) -> BqWireAt {
 /// cover, soft filled, conf stuck on a later hole).
 #[doc(hidden)]
 pub fn inflight_needs_racer(req: &state::InflightReq) -> bool {
-    req.peers.is_empty() && !req.retired.is_empty()
+    req.is_empty() && !req.retired_is_empty()
 }
 
 /// A free getdata window slot, or a racer for a hash whose only holders are
@@ -724,9 +759,20 @@ pub fn need_hash_at(
     ht: u32,
     room: usize,
 ) -> Option<BlockHash> {
+    let mut span = super::progress::QueuedHashSpan::load(hub, ht, ht);
+    need_hash_at_in(st, hub, ht, room, &mut span)
+}
+
+fn need_hash_at_in(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    ht: u32,
+    room: usize,
+    span: &mut super::progress::QueuedHashSpan,
+) -> Option<BlockHash> {
     use bitcoin::hashes::Hash as _;
     let &h = st.height_to_hash.get(&ht)?;
-    if super::progress::claim_ready(hub, &mut st.body, ht, &h) {
+    if super::progress::claim_ready_queued(hub, &mut st.body, ht, &h, || span.hash_at(hub, ht)) {
         return None;
     }
     if live_getdata_cover(st, &h)
@@ -743,7 +789,7 @@ pub fn need_hash_at(
     if st.body.is_known_archived(&h) {
         return None;
     }
-    if bq_wire_for_hash(hub, ht, h) == BqWireAt::Ready {
+    if bq_wire_queued(hub, ht, h, span.hash_at(hub, ht)) == BqWireAt::Ready {
         return None;
     }
     let held = st.body.is_pending(&h) && confirm_pipeline_holds(st, hub, h, ht);
@@ -908,7 +954,7 @@ pub fn issue_batch(
         .filter(|h| {
             st.inflight
                 .get(*h)
-                .is_some_and(|e| e.len() == 1 && e.retired.is_empty())
+                .is_some_and(|e| e.len() == 1 && e.retired_is_empty())
         })
         .count();
     *room = room.saturating_sub(new_unique);
@@ -920,15 +966,14 @@ pub fn issue_batch(
 /// Stops at the first **claim-ready** body (body-queue wire / confirmed) so
 /// densify priority matches operator `hole=` (fetch gap, not confirm backlog).
 pub fn contiguous_tip_holes(st: &mut IbdWorkState, hub: &ChainHub, max: usize) -> Vec<BlockHash> {
-    use super::progress::claim_ready;
     let path_lo = match hub.tip_height() {
         None => 0u32,
         Some(t) => t.saturating_add(1),
     };
     let mut holes = Vec::new();
-    let limit = path_lo
-        .saturating_add(max as u32 * 4)
-        .max(path_lo.saturating_add(max as u32));
+    // The walk breaks at `max` holes, so the last height is `path_lo + max - 1`.
+    let limit = path_lo.saturating_add(max.saturating_sub(1) as u32);
+    let mut span = super::progress::QueuedHashSpan::load(hub, path_lo, limit);
     for ht in path_lo..=limit {
         if holes.len() >= max {
             break;
@@ -939,7 +984,9 @@ pub fn contiguous_tip_holes(st: &mut IbdWorkState, hub: &ChainHub, max: usize) -
         if st.body.is_rejected(&hash) || dropped_verdict(st, &hash) {
             break;
         }
-        if claim_ready(hub, &mut st.body, ht, &hash) {
+        if super::progress::claim_ready_queued(hub, &mut st.body, ht, &hash, || {
+            span.hash_at(hub, ht)
+        }) {
             break;
         }
         holes.push(hash);
@@ -949,18 +996,20 @@ pub fn contiguous_tip_holes(st: &mut IbdWorkState, hub: &ChainHub, max: usize) -
 
 /// First non-claim-ready height in `path_lo .. path_lo+max-1` (after a ready prefix).
 pub fn first_pre_hole(st: &mut IbdWorkState, hub: &ChainHub, max: usize) -> Option<BlockHash> {
-    use super::progress::claim_ready;
     let path_lo = match hub.tip_height() {
         None => 0u32,
         Some(t) => t.saturating_add(1),
     };
     let hi = path_lo.saturating_add(max.saturating_sub(1) as u32);
+    let mut span = super::progress::QueuedHashSpan::load(hub, path_lo, hi);
     for ht in path_lo..=hi {
         let &hash = st.height_to_hash.get(&ht)?;
         if st.body.is_rejected(&hash) || dropped_verdict(st, &hash) {
             continue;
         }
-        if claim_ready(hub, &mut st.body, ht, &hash) {
+        if super::progress::claim_ready_queued(hub, &mut st.body, ht, &hash, || {
+            span.hash_at(hub, ht)
+        }) {
             continue;
         }
         return Some(hash);
@@ -975,12 +1024,12 @@ pub fn pre_hole_should_extra_racer(st: &IbdWorkState, hash: BlockHash, alive: &[
     let Some(req) = st.inflight.get(&hash) else {
         return true;
     };
-    if req.peers.is_empty() {
+    if req.is_empty() {
         return true;
     }
     let now = Instant::now();
-    let aged = req.peers.iter().all(|&pid| {
-        let since = req.owner_asked_at(pid).unwrap_or(req.started_at);
+    let aged = req.racing().all(|pid| {
+        let since = req.holder_asked_at(pid);
         now.duration_since(since) >= TIP_HOLE_RX_STALE
     });
     if aged {
@@ -993,7 +1042,7 @@ pub fn pre_hole_should_extra_racer(st: &IbdWorkState, hash: BlockHash, alive: &[
         return false;
     }
     let slow = median / 4;
-    req.peers.iter().any(|&pid| {
+    req.racing().any(|pid| {
         st.slots
             .iter()
             .find(|s| s.id == pid && s.alive)
@@ -1146,9 +1195,7 @@ pub fn fifo_blocked_owner_to_drop(
         .map(|s| (s.in_flight.len(), peer_bps(slots, s.id)))
         .min_by(|&(qa, ba), &(qb, bb)| tip_hole_drain_cmp(qa, ba, qb, bb))?;
     let now = Instant::now();
-    req.peers
-        .iter()
-        .copied()
+    req.racing()
         .filter(|&id| {
             let Some(slot) = slots.iter().find(|s| s.id == id && s.alive) else {
                 return false;
@@ -1156,9 +1203,7 @@ pub fn fifo_blocked_owner_to_drop(
             if !hole_owner_fifo_blocked(slot) {
                 return false;
             }
-            let held_long = req
-                .owner_asked_at(id)
-                .is_some_and(|t| now.duration_since(t) >= TIP_HOLE_FIFO_MIN_HOLD);
+            let held_long = now.duration_since(req.holder_asked_at(id)) >= TIP_HOLE_FIFO_MIN_HOLD;
             // free wait <= owner wait / FASTER, cross-multiplied as in tip_hole_drain_cmp.
             let free_wait = (free_q as u128 + 1)
                 .saturating_mul(TIP_HOLE_FIFO_FASTER)
@@ -1196,7 +1241,7 @@ pub fn tip_hole_owner_to_drop(
     per_peer: usize,
     estimate: u64,
 ) -> Option<usize> {
-    let owners: Vec<usize> = req.peers.iter().copied().collect();
+    let owners: Vec<usize> = req.racing().collect();
     let owners = owners.as_slice();
     if owners.is_empty() {
         return None;
@@ -1204,10 +1249,7 @@ pub fn tip_hole_owner_to_drop(
     if let Some(id) = fifo_blocked_owner_to_drop(req, hash, slots, per_peer, estimate) {
         return Some(id);
     }
-    let solo_since = owners
-        .first()
-        .and_then(|&pid| req.owner_asked_at(pid))
-        .unwrap_or(req.started_at);
+    let solo_since = req.holder_asked_at(owners[0]);
     let now_ms = ibd_mono_ms();
     let mut recent = Vec::new();
     let mut stale = Vec::new();
@@ -1274,11 +1316,9 @@ pub fn retire_hash_owner(st: &mut IbdWorkState, hash: BlockHash, pid: usize) {
 fn reask_aged_retired_owner(st: &mut IbdWorkState, hash: BlockHash) -> bool {
     let now = Instant::now();
     let Some(pid) = st.inflight.get(&hash).and_then(|req| {
-        req.retired
-            .iter()
-            .copied()
+        req.retired_ids()
             .filter_map(|pid| {
-                let asked = req.owner_asked_at(pid)?;
+                let asked = req.holder_asked_at(pid);
                 (now.duration_since(asked) >= TIP_HOLE_RX_STALE).then_some((pid, asked))
             })
             .min_by_key(|(_, asked)| *asked)
@@ -1324,11 +1364,7 @@ pub fn pack_ewma_bps(slots: &[PeerSlot], alive: &[usize]) -> (Option<u64>, bool)
     samples.sort_unstable();
     let lo = samples[0];
     let hi = samples[samples.len() - 1];
-    let tight = if lo == 0 {
-        hi == 0
-    } else {
-        hi <= lo.saturating_mul(RELATIVE_SLOW_CLUSTER_SPREAD)
-    };
+    let tight = hi <= lo.saturating_mul(RELATIVE_SLOW_CLUSTER_SPREAD);
     (Some(median_u64(&samples)), tight)
 }
 
@@ -1370,8 +1406,8 @@ pub fn steal_hung_densify(
             if ht <= tip_batch_hi {
                 return None;
             }
-            let &pid = req.peers.iter().next()?;
-            Some((*h, ht, pid, req.owner_asked_at(pid)?))
+            let pid = req.racing().next()?;
+            Some((*h, ht, pid, req.holder_asked_at(pid)))
         })
         .collect();
     let hung: Vec<BlockHash> = candidates
@@ -1392,11 +1428,7 @@ pub fn steal_hung_densify(
         .collect();
     let mut issued = 0u64;
     for h in hung {
-        let Some(owner) = st
-            .inflight
-            .get(&h)
-            .and_then(|req| req.peers.iter().copied().next())
-        else {
+        let Some(owner) = st.inflight.get(&h).and_then(|req| req.racing().next()) else {
             continue;
         };
         let owner_bps = peer_bps(&st.slots, owner);

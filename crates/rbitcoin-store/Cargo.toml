@@ -39,7 +39,7 @@ name = "model"
 path = "tests/model/main.rs"
 
 [target.'cfg(loom)'.dependencies]
-loom = "0.7"
+loom = "0.7.3"
 
 [lints]
 workspace = true

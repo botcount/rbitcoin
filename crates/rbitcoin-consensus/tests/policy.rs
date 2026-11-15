@@ -126,6 +126,43 @@ fn libre_rejects_low_feerate() {
 }
 
 #[test]
+fn dust_child_must_spend_the_dust_vout() {
+    let parent = bare_tx(0);
+    let mut child = bare_tx(1);
+    child.input[0].previous_output.txid = parent.compute_txid();
+    child.input[0].previous_output.vout = 1;
+    assert!(!spends_dust_of(&parent, &child));
+    child.input[0].previous_output.vout = 0;
+    assert!(spends_dust_of(&parent, &child));
+}
+
+#[test]
+fn libre_dust_rejects_a_zero_fee_with_a_priority_delta() {
+    let tx = bare_tx(0);
+    let weight = tx.weight().to_wu();
+    assert_eq!(
+        check_libre_admission_at(&tx, 0, 1_000, weight, 1),
+        PolicyResult::NonStandard("dust")
+    );
+}
+
+#[test]
+fn libre_negative_delta_can_miss_min_relay() {
+    let tx = bare_tx(1);
+    let weight = tx.weight().to_wu();
+    let vsize = vbytes_ceil(weight);
+    // Modified fee is 10. A `+` → `-` on the delta makes it 190. The floor
+    // sits between those two fees.
+    let rate = 1_000u64;
+    assert!(vsize.saturating_mul(rate) > 10 * 1_000);
+    assert!(vsize.saturating_mul(rate) <= 190 * 1_000);
+    assert_eq!(
+        check_libre_admission_at(&tx, 100, -90, weight, rate),
+        PolicyResult::NonStandard("min relay fee")
+    );
+}
+
+#[test]
 fn policy_result_is_ok_alias() {
     assert!(PolicyResult::Standard.is_ok());
     assert!(!PolicyResult::NonStandard("x").is_ok());
@@ -138,6 +175,10 @@ fn saturated_weight_stays_a_huge_vsize() {
     assert_eq!(
         vbytes_ceil(u64::MAX - 4),
         Weight::from_wu(u64::MAX - 4).to_vbytes_ceil()
+    );
+    assert_eq!(
+        vbytes_ceil(u64::MAX / 2),
+        Weight::from_wu(u64::MAX / 2).to_vbytes_ceil()
     );
     assert_eq!(fee_rate_sat_per_kvb(1_000, u64::MAX), 0);
 }

@@ -92,14 +92,8 @@ fn parse_named_flag_bits(s: &str) -> TxFlags {
         match part.trim().to_uppercase().as_str() {
             "P2SH" => f.p2sh = true,
             "DERSIG" => f.dersig = true,
-            "STRICTENC" => {
-                f.dersig = true;
-                f.strictenc = true;
-            }
-            "LOW_S" => {
-                f.low_s = true;
-                f.dersig = true;
-            }
+            "STRICTENC" => f.strictenc = true,
+            "LOW_S" => f.low_s = true,
             "NULLFAIL" => f.nullfail = true,
             "NULLDUMMY" => f.null_dummy = true,
             "MINIMALDATA" => f.minimal_data = true,
@@ -216,9 +210,6 @@ fn fill_implied(f: &mut TxFlags) {
     if f.witness {
         f.p2sh = true;
     }
-    if f.strictenc || f.low_s {
-        f.dersig = true;
-    }
 }
 
 fn flags_to_job(tx: Transaction, prevouts: Vec<TxOut>, flags: &TxFlags) -> ScriptCheckJob {
@@ -227,7 +218,7 @@ fn flags_to_job(tx: Transaction, prevouts: Vec<TxOut>, flags: &TxFlags) -> Scrip
         let flags = rbitcoin_consensus::block::ScriptVerifyFlags {
             bip65_active: flags.cltv,
             bip112_active: flags.csv,
-            bip66_active: flags.dersig || flags.strictenc || flags.low_s,
+            bip66_active: flags.dersig,
             bip16_active: flags.p2sh,
             taproot_active: flags.taproot,
             minimal_if: flags.minimal_if,

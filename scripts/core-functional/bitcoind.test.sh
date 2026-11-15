@@ -67,7 +67,7 @@ OUT="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest -debug 2>/dev/null)"
 if printf '%s' "$OUT" | grep -q -- "--network regtest" \
   && printf '%s' "$OUT" | grep -q -- "--datadir ${DATADIR}/regtest" \
   && printf '%s' "$OUT" | grep -q -- "--rpc-listen 127.0.0.1:28443" \
-  && printf '%s' "$OUT" | grep -q -- "--esplora-listen 127.0.0.1:38443" \
+  && printf '%s' "$OUT" | grep -q -- "--esplora-listen 127.0.0.1:61299" \
   && printf '%s' "$OUT" | grep -q -- "--listen 0.0.0.0:18444" \
   && printf '%s' "$OUT" | grep -q -- "--listen 127.0.0.1:18445" \
   && printf '%s' "$OUT" | grep -q -- "--no-seeds" \
@@ -136,7 +136,7 @@ OUT2="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest \
   -rpcport=19111 -port=19222 -v2transport=0 -disablewallet -server \
   -uacomment=testnode0 2>/dev/null)"
 if printf '%s' "$OUT2" | grep -q -- "--rpc-listen 127.0.0.1:29111" \
-  && printf '%s' "$OUT2" | grep -q -- "--esplora-listen 127.0.0.1:39111" \
+  && printf '%s' "$OUT2" | grep -q -- "--esplora-listen 127.0.0.1:61967" \
   && printf '%s' "$OUT2" | grep -q -- "--listen 0.0.0.0:19222" \
   && printf '%s' "$OUT2" | grep -q -- "--listen 127.0.0.1:19223"; then
   echo "ok - CLI ports override conf"
@@ -514,6 +514,25 @@ fi
 
 # Conf `whitebind=` (TestNode replace_in_config) must listen even when the
 # leftover bind is onion-only (`p2p_permissions.py`).
+# Core's framework writes noban_tx_relay as a conf line, not argv.
+WL_CONF="$WORKDIR/wl-conf"
+mkdir -p "$WL_CONF"
+cat >"$WL_CONF/bitcoin.conf" <<'EOF'
+regtest=1
+[regtest]
+port=11002
+rpcport=16002
+whitelist=noban,in,out@127.0.0.1
+EOF
+OUT_WLC="$("$SHIM" --print-cmd -datadir="$WL_CONF" -regtest 2>/dev/null)" || OUT_WLC=""
+if printf '%s' "$OUT_WLC" | grep -q -- "--net-permission=noban,in,out@127.0.0.1"; then
+  echo "ok - conf whitelist maps to --net-permission"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - conf whitelist maps to --net-permission (got: $OUT_WLC)"
+  FAIL=$((FAIL + 1))
+fi
+
 WB_CONF="$WORKDIR/wb-conf"
 mkdir -p "$WB_CONF"
 cat >"$WB_CONF/bitcoin.conf" <<'EOF'
@@ -575,6 +594,29 @@ elif printf '%s' "$INIT_OUT" | grep -q -- "Error: peertimeout must be a positive
   PASS=$((PASS + 1))
 else
   echo "not ok - peertimeout InitError maps to Core (got: $INIT_OUT)"
+  FAIL=$((FAIL + 1))
+fi
+
+# A real node writes `ERROR` lines itself and the pump does not copy them.
+# The shim must still show that line when the process exits 1.
+FAKE_ERR="$WORKDIR/bin/rbitcoin-node"
+mkdir -p "$WORKDIR/bin"
+printf '%s\n' '#!/bin/sh' \
+  'printf "%s\n" "2026-11-11T17:10:51.000Z ERROR runtime: boom" >>"$RBITCOIN_DEBUG_LOG"' \
+  'exit 1' >"$FAKE_ERR"
+chmod +x "$FAKE_ERR"
+ERR_DD="$WORKDIR/initerr-error-level"
+mkdir -p "$ERR_DD"
+printf 'regtest=1\n' >"$ERR_DD/bitcoin.conf"
+ERR_OUT=""
+if ERR_OUT="$(RBITCOIN_NODE="$FAKE_ERR" "$SHIM" -datadir="$ERR_DD" -regtest 2>&1)"; then
+  echo "not ok - ERROR log line surfaces on early exit (expected failure)"
+  FAIL=$((FAIL + 1))
+elif printf '%s' "$ERR_OUT" | grep -q -- "runtime: boom"; then
+  echo "ok - ERROR log line surfaces on early exit"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - ERROR log line surfaces on early exit (got: $ERR_OUT)"
   FAIL=$((FAIL + 1))
 fi
 
@@ -758,6 +800,124 @@ assert_fail_msg "-signetchallenge rejects non-hex" "Error: -signetchallenge must
   env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -signetchallenge=abc
 assert_fail_msg "-signetchallenge rejects duplicates" "Error: -signetchallenge cannot be multiple values." \
   env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -signetchallenge=51 -signetchallenge=51
+
+# Core names a custom signet's datadir signet_<message start>. The default
+# challenge, given or not, stays signet. An explicit empty challenge is custom.
+message_start() {
+  python3 - "$1" <<'PY'
+import hashlib, sys
+r = bytes.fromhex(sys.argv[1])
+n = len(r)
+if n < 0xFD:
+    size = bytes([n])
+elif n <= 0xFFFF:
+    size = b"\xfd" + n.to_bytes(2, "little")
+else:
+    size = b"\xfe" + n.to_bytes(4, "little")
+print(hashlib.sha256(hashlib.sha256(size + r).digest()).digest()[:4].hex())
+PY
+}
+SIGNET_DEFAULT_CHALLENGE="512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae"
+SIGDIR_DD="$WORKDIR/signet-dirs"
+mkdir -p "$SIGDIR_DD"
+printf 'signet=1\n' >"$SIGDIR_DD/bitcoin.conf"
+signet_dir_case() {
+  local name="$1" want_dir="$2" want_arg="$3"
+  shift 3
+  local out
+  out="$("$SHIM" --print-cmd -datadir="$SIGDIR_DD" "$@" 2>&1)" || true
+  if printf '%s' "$out" | grep -q -- "--datadir $want_dir " \
+    && { [[ -z "$want_arg" ]] || printf '%s' "$out" | grep -qE -- "$want_arg"; }; then
+    echo "ok - $name"
+    PASS=$((PASS + 1))
+  else
+    echo "not ok - $name (want --datadir $want_dir $want_arg, got: $out)"
+    FAIL=$((FAIL + 1))
+  fi
+}
+signet_dir_case "default signet datadir is signet" "$SIGDIR_DD/signet" ""
+signet_dir_case "custom -signetchallenge datadir is signet_<magic>" \
+  "$SIGDIR_DD/signet_$(message_start 51)" "--signet-challenge=51( |$)" -signetchallenge=51
+signet_dir_case "explicit default -signetchallenge datadir is signet" \
+  "$SIGDIR_DD/signet" "" -signetchallenge="$SIGNET_DEFAULT_CHALLENGE"
+signet_dir_case "empty -signetchallenge= datadir is signet_<magic>" \
+  "$SIGDIR_DD/signet_$(message_start '')" "--signet-challenge=( |$)" -signetchallenge=
+# Core's GetSignetMessageStart takes a full CompactSize length prefix.
+LONG253="$(printf '51%.0s' $(seq 253))"
+LONG300="$(printf '51%.0s' $(seq 300))"
+signet_dir_case "253-byte -signetchallenge datadir uses a CompactSize prefix" \
+  "$SIGDIR_DD/signet_$(message_start "$LONG253")" "--signet-challenge=$LONG253( |$)" \
+  -signetchallenge="$LONG253"
+signet_dir_case "300-byte -signetchallenge datadir uses a CompactSize prefix" \
+  "$SIGDIR_DD/signet_$(message_start "$LONG300")" "--signet-challenge=$LONG300( |$)" \
+  -signetchallenge="$LONG300"
+# TryParseHex skips whitespace between bytes; the node gets plain hex.
+signet_dir_case "-signetchallenge skips whitespace between bytes like TryParseHex" \
+  "$SIGDIR_DD/signet_$(message_start 5151)" "--signet-challenge=5151( |$)" \
+  "-signetchallenge= 51 51 "
+assert_fail_msg "-signetchallenge rejects whitespace inside a byte" \
+  "Error: -signetchallenge must be hex, not '5 1'." \
+  env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$SIGDIR_DD" "-signetchallenge=5 1"
+
+# bitcoin-cli looks for the cookie in the same signet directory, honors
+# -rpccookiefile, and hints at -signetchallenge when auth fails on signet.
+CLI="$ROOT/scripts/core-functional/bitcoin-cli"
+AUTH_PORT_FILE="$WORKDIR/auth-port"
+python3 - "$AUTH_PORT_FILE" <<'PY' &
+import base64, http.server, json, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Basic "):
+            self.send_response(401)
+            self.end_headers()
+            return
+        body = json.dumps({"result": base64.b64decode(auth[6:]).decode(), "error": None, "id": "cli"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[1], "w").write(str(srv.server_address[1]))
+srv.serve_forever()
+PY
+AUTH_PID=$!
+for _ in $(seq 50); do [[ -s "$AUTH_PORT_FILE" ]] && break; sleep 0.1; done
+AUTH_PORT="$(cat "$AUTH_PORT_FILE")"
+CUSTOM_DIR="$SIGDIR_DD/signet_$(message_start 51)"
+mkdir -p "$CUSTOM_DIR" "$SIGDIR_DD/signet"
+printf '__cookie__:custom\n' >"$CUSTOM_DIR/.cookie"
+printf '__cookie__:default\n' >"$SIGDIR_DD/signet/.cookie"
+printf '__cookie__:override\n' >"$WORKDIR/override.cookie"
+cli_case() {
+  local name="$1" want="$2"
+  shift 2
+  local out
+  out="$("$CLI" -datadir="$SIGDIR_DD" -rpcport="$AUTH_PORT" "$@" getblockcount 2>&1)" || true
+  if printf '%s' "$out" | grep -qF -- "$want"; then
+    echo "ok - $name"
+    PASS=$((PASS + 1))
+  else
+    echo "not ok - $name (want '$want', got: $out)"
+    FAIL=$((FAIL + 1))
+  fi
+}
+cli_case "bitcoin-cli reads the default signet cookie" '"__cookie__:default"'
+cli_case "bitcoin-cli reads the signet_<magic> cookie" '"__cookie__:custom"' -signetchallenge=51
+cli_case "bitcoin-cli honors -rpccookiefile" '"__cookie__:override"' \
+  -rpccookiefile="$WORKDIR/override.cookie"
+cli_case "bitcoin-cli hints -signetchallenge on a missing cookie" \
+  "Is your -signetchallenge correct for custom signets?" \
+  -signetchallenge=52
+cli_case "bitcoin-cli hints -signetchallenge on a missing -rpccookiefile" \
+  "Is your -signetchallenge correct for custom signets?" \
+  -rpccookiefile="$WORKDIR/nonexistent.cookie"
+kill "$AUTH_PID" 2>/dev/null || true
+wait "$AUTH_PID" 2>/dev/null || true
 
 OUT_BF="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest -blockfilterindex 2>/dev/null)"
 OUT_BF0="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest -blockfilterindex=0 2>/dev/null)"

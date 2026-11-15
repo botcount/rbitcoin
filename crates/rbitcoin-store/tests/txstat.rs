@@ -89,3 +89,27 @@ fn leftover_txfixed_body_unlinked_on_open() {
     assert!(!dir.join("txfixed.body").exists());
     assert!(dir.join("txstat.body").is_file());
 }
+
+#[test]
+fn range_reads_the_cell_and_header_blob_reads_the_slot() {
+    let dir = TempDir::labeled("txstat-slot").unwrap();
+    let t = TxStat::create(&dir).unwrap();
+    let small = tiny(1000, 110, 0);
+    let fat = tiny(u64::from(u32::MAX), 4_000_000, 4_000_000);
+    t.append_batch(0, &[small, fat]).unwrap();
+    assert_eq!(t.get_range(1, 1, None).unwrap(), vec![Some(small)]);
+    let err = match t.get_range(1, 4, None) {
+        Ok(_) => panic!("range accepted a fk past the count"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, StoreError::NotFound), "{err:?}");
+
+    assert!(t.header_blob(Fk(1)).unwrap().is_empty());
+    t.write_block_rows(Fk(1), 1, &[small, fat]).unwrap();
+    let blob = t.header_blob(Fk(1)).unwrap();
+    assert!(!blob.is_empty());
+    let got = t.get_range(1, 2, Some(&blob)).unwrap();
+    assert_eq!(got[0], Some(small));
+    assert_eq!(got[1], Some(fat));
+    assert!(t.header_blob(Fk(2)).unwrap().is_empty());
+}

@@ -8,7 +8,7 @@
 use bitcoin::bip158::{BlockFilter, FilterHash, FilterHeader, GcsFilterWriter};
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, OutPoint};
-use rbitcoin_primitives::{Fk, Height};
+use rbitcoin_primitives::{le_u64, Fk, Height};
 use rbitcoin_store::{
     read_index_window, BlockFilterRecord, BlockFilterSlot, BlockFilterTable, IndexHeight,
     IndexWindow, StoreError,
@@ -108,8 +108,8 @@ pub fn encode_basic_filter<'a>(
     block_hash: &[u8; 32],
     elements: impl Iterator<Item = &'a [u8]>,
 ) -> Result<BlockFilter, QueryError> {
-    let k0 = u64::from_le_bytes(block_hash[0..8].try_into().unwrap());
-    let k1 = u64::from_le_bytes(block_hash[8..16].try_into().unwrap());
+    let k0 = le_u64!(block_hash, 0);
+    let k1 = le_u64!(block_hash, 8);
     let mut content = Vec::new();
     let mut writer = GcsFilterWriter::new(&mut content, k0, k1, BASIC_FILTER_M, BASIC_FILTER_P);
     for e in elements {
@@ -154,8 +154,57 @@ impl Query {
     }
 
     /// Read a window of blocks and the parents they spend (completion session).
+    ///
+    /// Prune mode does not pread `seqsigwit.body`. P2TR inputs come from the
+    /// keep window: RAM, then `seqsigwit.window`.
     pub fn read_index_window(&self, heights: &[IndexHeight]) -> Result<IndexWindow, QueryError> {
-        read_index_window(&self.store.txs, heights)
+        let mut window = read_index_window(&self.store.txs, heights)?;
+        if self.prune_seqsigwit() {
+            self.fill_pruned_tweak_inputs(&mut window)?;
+        }
+        Ok(window)
+    }
+
+    fn fill_pruned_tweak_inputs(&self, window: &mut IndexWindow) -> Result<(), QueryError> {
+        for block in &mut window.blocks {
+            let mut file_wants = Vec::new();
+            // Keep this lookup. Confirm can evict the RAM row before the
+            // second pass, and the spill file is still the right copy.
+            let mut ram_hits = std::collections::HashMap::new();
+            for tx in &block.txs {
+                if !tx.need_seqsigwit {
+                    continue;
+                }
+                if let Some(ram) = self.seqsigwit_ram_inputs(tx.fk) {
+                    ram_hits.insert(tx.fk, ram);
+                } else {
+                    file_wants.push((tx.fk, tx.rec.input_count));
+                }
+            }
+            let from_file = self.read_spill_rows(block.height.0, &file_wants)?;
+            for tx in &mut block.txs {
+                if !tx.need_seqsigwit {
+                    continue;
+                }
+                let inputs = if let Some(ram) = ram_hits.remove(&tx.fk) {
+                    ram
+                } else if let Some(row) = from_file.get(&tx.fk) {
+                    row.clone()
+                } else {
+                    return Err(self.pruned_tweak_witness_miss(block.height));
+                };
+                tx.inputs = Some(inputs);
+            }
+        }
+        Ok(())
+    }
+
+    fn pruned_tweak_witness_miss(&self, height: Height) -> QueryError {
+        let dropped = self.pruneheight().is_some_and(|ph| height.0 <= ph.0);
+        if dropped {
+            return StoreError::Layout(crate::sp_tweaks::SP_TWEAKS_PRUNE_BEFORE_TAPROOT.into());
+        }
+        StoreError::Corrupt("seqsigwit window miss")
     }
 
     /// Basic filter of `window.blocks[i]`. Reads the block hash from the header.
@@ -248,22 +297,30 @@ impl Query {
     /// genesis header, or a stale branch walked back to that sealed fork
     /// point. An unsealed best-chain gap is refused before the body is
     /// rebuilt.
+    ///
+    /// `None` is a block that never connected: an unknown hash, or a header
+    /// off the best chain with no stored body. That is answered before the
+    /// parent walk, so the parent's state does not answer for it.
     pub fn basic_filter_for_hash(
         &self,
         hash: &[u8; 32],
     ) -> Result<Option<(Vec<u8>, FilterHeader)>, QueryError> {
-        if let Some(h) = self.height_of_hash(hash)? {
+        let height = self.height_of_hash(hash)?;
+        if let Some(h) = height {
             if let Some(row) = self.basic_filter_at(h.0)? {
                 return Ok(Some(row));
             }
         }
-        let Some(prev) = self.header_prev_hash(hash)? else {
+        let Some((header_fk, _)) = self.get_header_by_hash(hash)? else {
             return Ok(None);
         };
-        let parent_header = self.parent_basic_filter_header(&prev)?;
-        let Some(block) = self.block_body_for_filter(hash)? else {
+        if height.is_none() && !self.store.header_txs.has_body(header_fk)? {
             return Ok(None);
-        };
+        }
+        let parent_header = self.parent_basic_filter_header(&self.prev_header_hash(hash)?)?;
+        let block = self
+            .block_body_for_filter(hash)?
+            .ok_or(StoreError::Corrupt("invariant: blockfilter body missing"))?;
         let spent = self.spent_scripts(&block)?;
         let filter = self.basic_filter_content(&block, &spent)?;
         Ok(Some((
@@ -416,6 +473,22 @@ impl Query {
             .map(|v| v.into_iter().map(|(body, _)| body).collect()))
     }
 
+    /// Filter headers at heights 1,000, 2,000, … through `stop`.
+    /// `None` when the index is off or `stop` is past the watermark.
+    pub fn basic_filter_checkpoint_headers(
+        &self,
+        stop: u32,
+    ) -> Result<Option<Vec<FilterHeader>>, QueryError> {
+        let Some(table) = self.block_filter_table() else {
+            return Ok(None);
+        };
+        Ok(table.checkpoint_headers(Height(stop))?.map(|rows| {
+            rows.into_iter()
+                .map(FilterHeader::from_byte_array)
+                .collect()
+        }))
+    }
+
     /// Filter hash and header for `start..=end` without filter bytes.
     /// `None` when the index is off or `end` is past the watermark.
     pub fn basic_filter_hashes_and_headers(
@@ -497,6 +570,16 @@ impl Query {
     /// The write side of [`Self::index_live`]. Startup sets it; confirm does not.
     pub fn set_index_live(&self, on: bool) {
         self.index_live.store(on, Ordering::Release);
+    }
+
+    /// Pruned tweak append is on. Independent of [`Self::index_live`].
+    pub fn tweak_follow(&self) -> bool {
+        self.tweak_follow.load(Ordering::Acquire)
+    }
+
+    /// The write side of [`Self::tweak_follow`].
+    pub fn set_tweak_follow(&self, on: bool) {
+        self.tweak_follow.store(on, Ordering::Release);
     }
 
     /// Next filter height to seal (`None` when the filter index is off).

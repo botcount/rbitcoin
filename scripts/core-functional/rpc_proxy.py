@@ -800,12 +800,19 @@ def node_rpc_port(public_rpc: int) -> int:
     return _offset_port(public_rpc, 10_000)
 
 
-def esplora_port(public_rpc: int) -> int:
-    """Esplora listen for the test wallet shim (Step 18).
+# Default Linux ephemeral range is 32768-60999 (`ip_local_port_range`).
+# Core's test rpc ports plus 20000 land in 36000-41000, inside that range,
+# so the kernel can already own the port and esplora bind returns EADDRINUSE.
+_ESPLORA_LO = 61000
+_ESPLORA_SPAN = 65536 - _ESPLORA_LO
 
-    Must not sit next to ``node_rpc_port``: Core assigns consecutive
-    ``-rpcport`` values, so ``node_rpc(n) + 1 == node_rpc(n + 1)``. That
-    collision made the next node's proxy POST ``getblockcount`` at the
-    previous node's Esplora (HTTP 404).
+
+def esplora_port(public_rpc: int) -> int:
+    """Esplora listen for the test wallet shim.
+
+    Above the ephemeral range, and not ``node_rpc_port + 1``. Core assigns
+    consecutive ``-rpcport`` values, so ``node_rpc(n) + 1 == node_rpc(n + 1)``
+    made the next node's proxy POST ``getblockcount`` at the previous node's
+    Esplora (HTTP 404).
     """
-    return _offset_port(public_rpc, 20_000)
+    return _ESPLORA_LO + (public_rpc % _ESPLORA_SPAN)

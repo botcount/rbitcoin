@@ -13,22 +13,23 @@ impl LifeChain {
     }
 
     fn fund_at(&mut self, value: u64, height: u32, is_coinbase: bool) -> OutPoint {
+        let op = self.fund_paying(value, ScriptBuf::from_bytes(vec![0x51]));
+        let funded = self.unspent.get_mut(&op).expect("just funded");
+        funded.create_height = height;
+        funded.is_coinbase = is_coinbase;
+        op
+    }
+
+    fn fund_paying(&mut self, value: u64, script_pubkey: ScriptBuf) -> OutPoint {
         self.funded += 1;
         let mut id = [0xc0; 32];
         id[..4].copy_from_slice(&self.funded.to_le_bytes());
         let op = out(Txid::from_byte_array(id), 0);
         let txout = TxOut {
             value: Amount::from_sat(value),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            script_pubkey,
         };
-        self.unspent.insert(
-            op,
-            Coin {
-                create_height: height,
-                is_coinbase,
-                ..coin(txout)
-            },
-        );
+        self.unspent.insert(op, coin(txout));
         op
     }
 
@@ -750,6 +751,71 @@ fn sigop_adjusted_size_budget_and_reopen() {
     sigop_rbf_package_and_cluster(&mut life);
     sigop_block_budget(&mut life);
     sigop_reopen_and_compact(&mut life, &dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `OP_0 OP_IF <125 OP_CHECKMULTISIG> <checksigs> OP_ENDIF OP_1`: spendable
+/// with an empty scriptSig, and 2,500 BIP 54 signature operations plus one
+/// per `OP_CHECKSIG`.
+fn bip54_sigop_script(checksigs: usize) -> ScriptBuf {
+    let mut script = vec![0x00, 0x63];
+    script.extend(std::iter::repeat_n(0xae, 125));
+    script.extend(std::iter::repeat_n(0xac, checksigs));
+    script.extend([0x68, 0x51]);
+    ScriptBuf::from_bytes(script)
+}
+
+/// On a chain that enforces BIP 54 the pool refuses what no block there can
+/// hold: a 64-byte transaction, and one whose inputs carry more than 2,500
+/// signature operations. One byte or one operation away is admitted, and
+/// without BIP 54 so are both.
+#[test]
+fn bip54_refuses_what_no_block_can_hold() {
+    let dir = tmp_dir();
+    let mut life = Life {
+        mp: ActiveMempool::open_or_create(&dir).unwrap(),
+        chain: LifeChain::default(),
+        tip: ChainTipCtx {
+            height: 200,
+            mtp: u32::MAX,
+        },
+    };
+    let sized = |life: &mut Life, script_len: usize| {
+        let mut tx = spend_tx(life.chain.fund(100_000), 90_000);
+        tx.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x51; script_len]);
+        tx
+    };
+    let spending = |life: &mut Life, checksigs: usize| {
+        let coin = life.chain.fund_paying(100_000, bip54_sigop_script(checksigs));
+        spend_tx(coin, 90_000)
+    };
+
+    life.mp.set_enforce_bip54(true);
+    let small = sized(&mut life, 4);
+    assert_eq!(small.base_size(), 64);
+    let err = life.accept(&small).unwrap_err();
+    assert!(
+        matches!(&err, AcceptError::CheckTransaction(reason) if reason == "txn-size-64"),
+        "{err}"
+    );
+    for script_len in [3, 5] {
+        let tx = sized(&mut life, script_len);
+        life.accept(&tx).expect("63 and 65 bytes");
+    }
+    let over = spending(&mut life, 1);
+    let err = life.accept(&over).unwrap_err();
+    assert!(
+        matches!(&err, AcceptError::CheckTransaction(reason) if reason == "bad-txns-legacy-sigops"),
+        "{err}"
+    );
+    let at_limit = spending(&mut life, 0);
+    life.accept(&at_limit).expect("2,500 signature operations");
+    assert_eq!(life.mp.live_count(), 3);
+
+    life.mp.set_enforce_bip54(false);
+    life.accept(&small).expect("64 bytes without BIP 54");
+    life.accept(&over).expect("2,501 signature operations without BIP 54");
+    assert_eq!(life.mp.live_count(), 5);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

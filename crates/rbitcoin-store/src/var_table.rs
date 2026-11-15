@@ -47,6 +47,36 @@ pub fn next_aligned_tx_start(cursor: u64) -> u64 {
     cursor.saturating_add(7) & !7u64
 }
 
+/// File starts for an exact body image. `cursor` is the spent file end.
+pub fn exact_body_starts(
+    cursor: u64,
+    record_lens: &[u64],
+    blob_len: usize,
+) -> Result<Vec<u64>, StoreError> {
+    if !cursor.is_multiple_of(8) {
+        return Err(StoreError::Corrupt("spent body cursor"));
+    }
+    let mut starts = Vec::with_capacity(record_lens.len());
+    let mut sum = 0u64;
+    for &len in record_lens {
+        if len == 0 || !len.is_multiple_of(8) {
+            return Err(StoreError::Corrupt("spent overlay n_out"));
+        }
+        starts.push(
+            cursor
+                .checked_add(sum)
+                .ok_or(StoreError::Corrupt("spent overlay n_out"))?,
+        );
+        sum = sum
+            .checked_add(len)
+            .ok_or(StoreError::Corrupt("spent overlay n_out"))?;
+    }
+    if sum != blob_len as u64 {
+        return Err(StoreError::Corrupt("spent overlay n_out"));
+    }
+    Ok(starts)
+}
+
 pub struct VarTable {
     pub body: TableFile,
     pub count: AtomicU64,
@@ -217,6 +247,8 @@ impl VarTable {
         unsafe {
             buf.set_len(n);
         }
+        #[cfg(debug_assertions)]
+        crate::io_handle::note_test_pread();
         f(buf)
     }
 
@@ -241,6 +273,12 @@ impl VarTable {
     /// Prefer [`Self::write_body_blob_bulk`] for Class A append (bulk pwrite path).
     pub fn write_body_abs(&self, abs_offset: u64, data: &[u8]) -> Result<(), StoreError> {
         self.write_body_blob_bulk(abs_offset, data)
+    }
+
+    /// Slot patch via `pwrite`. The published end grows only, so this does not
+    /// rewrite a longer file-header mark and does not store neighbor bytes.
+    pub fn write_body_pwrite(&self, abs_offset: u64, data: &[u8]) -> Result<(), StoreError> {
+        self.body.write_at_pwrite(abs_offset, data)
     }
 
     /// Class A body payload write via bulk `WriteOp`. Falls back to plain pwrite
@@ -339,6 +377,27 @@ pub fn write_prepared_bodies_one_wave(
     Ok(())
 }
 
+/// Body read length at or under [`VarTable::BODY_READ_MAX`].
+///
+/// The cap fits in `usize`, so a failed `usize` conversion is not a second result.
+#[derive(Copy, Clone)]
+pub(crate) struct CappedBodyLen(usize);
+
+impl CappedBodyLen {
+    pub(crate) fn new(len: u64) -> Result<Self, StoreError> {
+        if len > VarTable::BODY_READ_MAX {
+            return Err(StoreError::Rejected("body read too large"));
+        }
+        Ok(Self(len as usize))
+    }
+
+    pub(crate) fn get(self) -> usize {
+        self.0
+    }
+}
+
+const _: () = assert!(VarTable::BODY_READ_MAX <= usize::MAX as u64);
+
 impl VarTable {
     /// Pre-grow body capacity so a following mega `put_batch` does not remap mid-write.
     pub fn reserve_append(&self, body_bytes: u64, _n_records: u64) -> Result<(), StoreError> {
@@ -409,6 +468,44 @@ impl VarTable {
             fks,
             base_count,
         }))
+    }
+
+    /// Prepared append whose body is `body_blob` itself.
+    ///
+    /// `cursor` must already be 8-aligned. Each record length is a non-zero
+    /// multiple of 8 and the lengths sum to `blob_len`. No pad is inserted.
+    pub fn prepare_exact_body(
+        &self,
+        record_lens: &[u64],
+        body_blob: Vec<u8>,
+    ) -> Result<PreparedAppend, StoreError> {
+        let n = record_lens.len();
+        if n == 0 {
+            return Err(StoreError::Corrupt("spent overlay n_out"));
+        }
+        let base_count = self.count.load(Ordering::Acquire);
+        let start = self.body.logical_len().max(FILE_HEADER_LEN as u64);
+        let starts = exact_body_starts(start, record_lens, body_blob.len())?;
+        if self.count.load(Ordering::Acquire) != base_count {
+            return Err(StoreError::Corrupt("var put_batch_encode race"));
+        }
+        let (_c, body_end) = self.published_meta();
+        if let Some(&s0) = starts.first() {
+            if s0 < body_end {
+                return Err(StoreError::Corrupt(
+                    "tx body starts inside published body_end \
+                     (refusing Class A double-append)",
+                ));
+            }
+        }
+        let fks = (0..n).map(|i| Fk(base_count + 1 + i as u64)).collect();
+        Ok(PreparedAppend {
+            start,
+            body_blob,
+            starts,
+            fks,
+            base_count,
+        })
     }
 
     pub fn body_write_fd(&self) -> IoHandle {
@@ -502,11 +599,9 @@ impl VarTable {
     /// Cap and published end before any buffer is grown.
     #[doc(hidden)]
     pub fn checked_body_read(published: u64, offset: u64, len: u64) -> Result<usize, StoreError> {
-        if len > Self::BODY_READ_MAX {
-            return Err(StoreError::Rejected("body read too large"));
-        }
+        let n = CappedBodyLen::new(len)?;
         Self::require_published_body(published, offset, len)?;
-        usize::try_from(len).map_err(|_| StoreError::Corrupt("body span too large"))
+        Ok(n.get())
     }
 
     /// Compare `offset + len` to the caller's published-end integer.

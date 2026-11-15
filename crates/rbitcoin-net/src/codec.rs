@@ -30,6 +30,13 @@ pub const TX_INV_BATCH: usize = 1_000;
 /// Bitcoin Core `MAX_HEADERS_RESULTS` — max headers in a `headers` message.
 pub const MAX_HEADERS_RESULTS: usize = 2_000;
 
+/// One `headers` entry: 80-byte header plus the transaction-count byte.
+pub const HEADER_WIRE_BYTES: usize = 81;
+
+/// Largest BIP324 contents of a `headers` message, long command form.
+/// A block frame longer than this is not that message.
+pub const MAX_HEADERS_CONTENTS: usize = 1 + 12 + 3 + MAX_HEADERS_RESULTS * HEADER_WIRE_BYTES;
+
 /// Bitcoin Core `MAX_LOCATOR_SZ` — max block locator hashes.
 pub const MAX_LOCATOR_SZ: usize = 101;
 
@@ -104,7 +111,9 @@ impl FramedMessage {
         if !self.is_ping() || self.payload.len() < 8 {
             return None;
         }
-        Some(u64::from_le_bytes(self.payload[..8].try_into().ok()?))
+        let mut nonce = [0u8; 8];
+        nonce.copy_from_slice(&self.payload[..8]);
+        Some(u64::from_le_bytes(nonce))
     }
 
     /// Block hash from the wire header (first 80 payload bytes) — no full deserialize.
@@ -545,9 +554,6 @@ pub fn decode_cmd_payload(
         "tx" => one(d, NetworkMessage::Tx)?,
         "ping" => one(d, NetworkMessage::Ping)?,
         "pong" => one(d, NetworkMessage::Pong)?,
-        // Bloom is off. `PartialMerkleTree` allocates `n * 8` bools from the
-        // flags compact-size before a short payload can fail the read.
-        "merkleblock" => return Ok(None),
         "filterload" => one(d, NetworkMessage::FilterLoad)?,
         "filteradd" => one(d, NetworkMessage::FilterAdd)?,
         "getcfilters" => one(d, NetworkMessage::GetCFilters)?,
@@ -599,6 +605,9 @@ pub fn decode_cmd_payload(
             }
             NetworkMessage::Headers(hs)
         }
+        // Bloom is off. `PartialMerkleTree` allocates `n * 8` bools from the
+        // flags compact-size before a short payload can fail the read, so
+        // merkleblock stays unknown with the other undecoded commands.
         _ => return Ok(None),
     }))
 }

@@ -1,14 +1,9 @@
 use rbitcoin_rpc::auth::*;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn tmp() -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("rbitcoin-rpc-auth-{n}"))
+    rbitcoin_store::testutil::fresh_path("rpc-auth")
 }
 
 #[test]
@@ -68,6 +63,23 @@ fn token_is_csprng_hex() {
 }
 
 #[test]
+fn auth_scheme_matches_in_any_case() {
+    assert_eq!(parse_bearer_auth("BEARER abc"), Some("abc"));
+    assert_eq!(parse_bearer_auth("bEaReR abc"), Some("abc"));
+    assert_eq!(
+        parse_basic_auth("BASIC dXNlcjpwYXNz").as_deref(),
+        Some("user:pass")
+    );
+    assert_eq!(
+        parse_basic_auth("BaSiC dXNlcjpwYXNz").as_deref(),
+        Some("user:pass")
+    );
+    assert!(parse_bearer_auth("Bearerabc").is_none());
+    assert!(parse_basic_auth("Basicdxnlcjpwyxnz").is_none());
+    assert!(parse_basic_auth("Bearer dXNlcjpwYXNz").is_none());
+}
+
+#[test]
 fn bearer_parse_and_token_paths() {
     assert_eq!(parse_bearer_auth("Bearer abc"), Some("abc"));
     assert_eq!(parse_bearer_auth("bearer xyz"), Some("xyz"));
@@ -122,6 +134,63 @@ fn empty_token_file_errors() {
     }
     let err = read_token_file(&path).unwrap_err();
     assert!(err.contains("empty"), "{err}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn resolve_mints_a_token_over_a_zero_length_file() {
+    let dir = tmp();
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rpc.token");
+    fs::write(&path, "").unwrap();
+    let (a, p) = resolve_rpc_auth(&dir, None).unwrap();
+    assert_eq!(p, path);
+    assert_eq!(a.token.len(), 64);
+    assert_eq!(read_token_file(&path).unwrap(), a);
+    let (again, _) = resolve_rpc_auth(&dir, None).unwrap();
+    assert_eq!(again, a);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn resolve_still_refuses_a_blank_token() {
+    let dir = tmp();
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rpc.token");
+    fs::write(&path, "  \n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let err = resolve_rpc_auth(&dir, None).unwrap_err();
+    assert!(err.contains("empty"), "{err}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "  \n");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The token is staged whole and renamed into place, so a crash leaves at
+/// most a staged file, never a prefix in `rpc.token`. The next start drops it.
+#[test]
+fn resolve_mints_a_token_past_a_staged_file_left_by_a_crash() {
+    let dir = tmp();
+    fs::create_dir_all(&dir).unwrap();
+    let staged = dir.join("rpc.token.tmp");
+    fs::write(&staged, "partial").unwrap();
+    let (a, p) = resolve_rpc_auth(&dir, None).unwrap();
+    assert_eq!(read_token_file(&p).unwrap(), a);
+    assert!(!staged.exists());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn write_token_file_refuses_an_existing_token() {
+    let dir = tmp();
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rpc.token");
+    let a = write_token_file(&path).unwrap();
+    assert!(write_token_file(&path).is_err());
+    assert_eq!(read_token_file(&path).unwrap(), a);
     let _ = fs::remove_dir_all(&dir);
 }
 

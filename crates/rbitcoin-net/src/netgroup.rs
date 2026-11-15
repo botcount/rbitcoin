@@ -1,6 +1,7 @@
 //! Outbound / inbound netgroup key: asmap ASN, or IPv4 `/16` / IPv6 `/32`.
 
 use crate::asmap::AsMap;
+use crate::NetAddr;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 
@@ -11,6 +12,23 @@ pub fn netgroup(addr: SocketAddr, asmap: Option<&AsMap>) -> u64 {
         return u64::from(m.mapped_as(addr.ip()));
     }
     prefix_group(addr.ip())
+}
+
+/// [`netgroup`] for any session net. An onion or I2P session's `addr` is the
+/// `0.0.0.0` placeholder, so these key by network and the first four address
+/// bits, as Core's `GetGroup` does. The keys sit above every prefix group and
+/// ASN, so they never collide with an IP group.
+pub fn netgroup_net(addr: NetAddr, asmap: Option<&AsMap>) -> u64 {
+    const OVERLAY: u64 = 1 << 32;
+    match addr {
+        NetAddr::Ip(sock) => netgroup(sock, asmap),
+        NetAddr::Cjdns { ip, port } => netgroup(SocketAddr::from((ip, port)), asmap),
+        // BIP155 network ids: 4 is TorV3, 5 is I2P.
+        NetAddr::Onion { pk, .. } => OVERLAY | (4 << 8) | u64::from(pk[0] >> 4),
+        NetAddr::I2p { dest, .. } => OVERLAY | (5 << 8) | u64::from(dest[0] >> 4),
+        // A `--proxy` hostname has no address bits to split on.
+        NetAddr::Name { .. } => OVERLAY | (u64::from(u8::MAX) << 8),
+    }
 }
 
 /// Walk `ranked` and prefer addrs whose group is not in `occupied` or already

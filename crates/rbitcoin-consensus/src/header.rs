@@ -15,8 +15,9 @@ pub struct ParentHeader {
     pub bits: CompactTarget,
 }
 
-/// The header that opens a difficulty period: `interval` blocks before a
-/// retarget height. A retarget reads its time, and with BIP94 its `nBits`.
+/// The header that opens a difficulty period, at
+/// [`ChainParams::period_first_height`]. A retarget reads its time, and with
+/// BIP94 its `nBits`. BIP 54 reads its time for the period's last header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PeriodFirst {
     pub time: u32,
@@ -35,8 +36,8 @@ impl PeriodFirst {
 /// Header rules from the header bytes plus caller facts. No datadir.
 ///
 /// `mtp_times` ends at the parent (up to 11 timestamps). `period_first` is the
-/// header `interval` blocks before a retarget height. `bits_at` supplies
-/// earlier `nBits` for the testnet min-difficulty walk.
+/// header at [`ChainParams::period_first_height`]. `bits_at` supplies earlier
+/// `nBits` for the testnet min-difficulty walk.
 ///
 /// On success the value is that parent median, sorted once. Genesis has no
 /// parent window and returns `0`.
@@ -85,7 +86,7 @@ pub fn check_header(
             ConsensusError::BadHeader("timestamp <= median-time-past"),
         )?;
     }
-    check_timewarp(params, height, parent.time, header)?;
+    check_period_times(params, height, parent.time, period_first, header)?;
     if let Err(e) = check_header_version_and_future_time(params, height, header) {
         crate::trust::soften_at(Some(height.0), e)?;
     }
@@ -118,12 +119,15 @@ pub fn check_header(
 }
 
 /// Validate header linkage, MTP, difficulty bits, and proof-of-work.
+/// `period_first` is the header at [`ChainParams::period_first_height`].
+#[allow(clippy::too_many_arguments)] // each argument is one caller fact
 pub fn validate_header_on_parent(
     params: &ChainParams,
     height: Height,
     header: &Header,
     parent_mtp: u32,
     parent_time: u32,
+    period_first: Option<PeriodFirst>,
     expected_bits: CompactTarget,
     hash: [u8; 32],
 ) -> Result<(), ConsensusError> {
@@ -133,7 +137,7 @@ pub fn validate_header_on_parent(
             ConsensusError::BadHeader("timestamp <= median-time-past"),
         )?;
     }
-    check_timewarp(params, height, parent_time, header)?;
+    check_period_times(params, height, parent_time, period_first, header)?;
     if let Err(e) = check_header_version_and_future_time(params, height, header) {
         crate::trust::soften_at(Some(height.0), e)?;
     }
@@ -144,22 +148,40 @@ pub fn validate_header_on_parent(
     Ok(())
 }
 
-/// Core `MAX_TIMEWARP`: how far before its parent a period's first header may be.
-pub const MAX_TIMEWARP: u32 = 600;
+/// Core `MAX_TIMEWARP_TESTNET4`: with BIP94, how far before its parent a
+/// period's first header may be. Block templates keep to it on every network.
+pub const MAX_TIMEWARP_BIP94: u32 = 600;
 
-/// BIP94: with `enforce_bip94`, the first header of a difficulty period is at
-/// most [`MAX_TIMEWARP`] seconds before its parent (`time-timewarp-attack`).
-pub fn check_timewarp(
+/// Core `MAX_TIMEWARP_BIP54`: the same bound with BIP 54.
+pub const MAX_TIMEWARP_BIP54: u32 = 2 * 60 * 60;
+
+/// Core `ContextualCheckBlockHeader` at the two ends of a difficulty period.
+/// The first header is at most [`ChainParams::max_timewarp`] seconds before
+/// its parent (`time-timewarp-attack`). With BIP 54 the last header is not
+/// before `period_first`, the period's first header
+/// (`time-negative-interval`).
+pub fn check_period_times(
     params: &ChainParams,
     height: Height,
     parent_time: u32,
+    period_first: Option<PeriodFirst>,
     header: &Header,
 ) -> Result<(), ConsensusError> {
+    if params.bip54_period_last(height.0) {
+        let first =
+            period_first.ok_or(ConsensusError::BadHeader("missing retarget first header"))?;
+        if header.time < first.time {
+            return Err(ConsensusError::BadHeader("time-negative-interval"));
+        }
+    }
     let interval = params.difficulty_adjustment_interval();
-    if !params.enforce_bip94 || interval == 0 || !height.0.is_multiple_of(interval) {
+    if interval == 0 || !height.0.is_multiple_of(interval) {
         return Ok(());
     }
-    if header.time < parent_time.saturating_sub(MAX_TIMEWARP) {
+    let Some(max_timewarp) = params.max_timewarp() else {
+        return Ok(());
+    };
+    if header.time < parent_time.saturating_sub(max_timewarp) {
         crate::trust::soften_at(
             Some(height.0),
             ConsensusError::BadHeader("time-timewarp-attack"),
@@ -184,6 +206,14 @@ pub fn pow_hash_meets_target(
     Ok(())
 }
 
+/// Core `MAX_FUTURE_BLOCK_TIME`: how far past the node clock a block time may be.
+pub const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
+
+/// Core `time-too-new`: `time` is more than [`MAX_FUTURE_BLOCK_TIME`] past `now`.
+pub fn time_too_new(time: u32, now: u64) -> bool {
+    u64::from(time) > now.saturating_add(MAX_FUTURE_BLOCK_TIME)
+}
+
 /// BIP34/66/65 `nVersion` floors and the 2-hour future-time cap (wall clock).
 ///
 /// Core `ContextualCheckBlockHeader`. Assemble uses this instead of a second
@@ -193,9 +223,7 @@ pub fn check_header_version_and_future_time(
     height: Height,
     header: &Header,
 ) -> Result<(), ConsensusError> {
-    const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
-    let now = crate::clock::current_now();
-    if u64::from(header.time) > now.saturating_add(MAX_FUTURE_BLOCK_TIME) {
+    if time_too_new(header.time, crate::clock::current_now()) {
         return Err(ConsensusError::BadHeader("timestamp too far in future"));
     }
     let ver = header.version.to_consensus();
@@ -284,16 +312,11 @@ pub fn retarget_bits(
     } else {
         prev_bits
     };
-    // A regtest retarget target times the timespan must fit 256 bits.
-    let base = match params.regtest_retarget {
-        Some(r) if Target::from_compact(base) > r.ceiling => r.ceiling.to_compact_lossy(),
-        _ => base,
-    };
     let timespan = u64::from(prev_time.saturating_sub(first.time));
     let bits = CompactTarget::from_next_work_required(base, timespan, &params.btc);
     // Integer division rounds a tiny target to zero, which no hash meets.
     match params.regtest_retarget {
-        Some(r) if Target::from_compact(bits) < r.floor => r.floor.to_compact_lossy(),
+        Some(r) if Target::from_compact(bits) <= r.floor => r.floor.to_compact_lossy(),
         _ => bits,
     }
 }

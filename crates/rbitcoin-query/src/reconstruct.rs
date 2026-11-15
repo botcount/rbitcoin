@@ -2,6 +2,10 @@
 
 use super::*;
 use crate::U64Map;
+use rbitcoin_consensus::block::{
+    check_witness_commitment_with_wtxids, coinbase_has_witness_commitment,
+    witness_commitment_script, witness_commitment_vout_index,
+};
 use std::time::Instant;
 
 #[doc(hidden)]
@@ -16,13 +20,22 @@ pub struct BlockTxStatRows {
     pub txstat_bytes: u64,
 }
 
-/// Stamped `txstat.body` rows for one confirmed block (every row non-zero).
+/// Stamped `txstat.body` rows for one stored block (every row non-zero).
 #[derive(Debug, Clone)]
 pub struct StampedTxstatBlock {
     pub rec: HeaderRecord,
     pub fks: Vec<Fk>,
     pub rows: Vec<rbitcoin_store::TxStatRow>,
     pub n_outs: Vec<u32>,
+}
+
+/// One transaction of [`Query::block_tx_summary`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockTxSummary {
+    pub txid: [u8; 32],
+    pub fee_sat: u64,
+    pub weight: u64,
+    pub value_sat: u64,
 }
 
 #[doc(hidden)]
@@ -229,14 +242,41 @@ impl Query {
 
     /// Reconstruct a consensus `Transaction` from Class A rows (no stored raw).
     pub fn reconstruct_tx(&self, tx_fk: Fk) -> Result<Transaction, QueryError> {
-        let (rec, stored_outputs, mut stored_inputs) = self.load_body_from_store(tx_fk)?;
-        let mut cache = U64Map::default();
-        self.fill_input_prev_txids_cached(&mut stored_inputs, &mut cache)?;
+        let (rec, stored_outputs, stored_inputs) = self.filled_body(tx_fk)?;
         Ok(Self::transaction_from_class_a(
             rec,
             stored_outputs,
             stored_inputs,
         ))
+    }
+
+    /// [`Self::reconstruct_tx`] plus the txid and parent edges that load already read.
+    pub fn reconstruct_tx_with_inputs(
+        &self,
+        tx_fk: Fk,
+    ) -> Result<(Transaction, [u8; 32], Vec<rbitcoin_store::InputParent>), QueryError> {
+        let (rec, stored_outputs, stored_inputs) = self.filled_body(tx_fk)?;
+        let txid = rec.txid;
+        let parents = stored_inputs.iter().map(|inp| inp.parent).collect();
+        let wire = Self::transaction_from_class_a(rec, stored_outputs, stored_inputs);
+        Ok((wire, txid, parents))
+    }
+
+    fn filled_body(
+        &self,
+        tx_fk: Fk,
+    ) -> Result<
+        (
+            TxRecord,
+            Vec<OutputRecord>,
+            Vec<rbitcoin_store::InputRecord>,
+        ),
+        QueryError,
+    > {
+        let (rec, stored_outputs, mut stored_inputs) = self.load_body_from_store(tx_fk)?;
+        let mut cache = U64Map::default();
+        self.fill_input_prev_txids_cached(&mut stored_inputs, &mut cache)?;
+        Ok((rec, stored_outputs, stored_inputs))
     }
 
     #[doc(hidden)]
@@ -257,10 +297,7 @@ impl Query {
                 },
                 script_sig: ScriptBuf::from_bytes(inp.script_sig),
                 sequence: Sequence::from_consensus(inp.sequence),
-                witness: {
-                    let refs: Vec<&[u8]> = inp.witness.iter().map(|w| w.as_slice()).collect();
-                    Witness::from_slice(&refs)
-                },
+                witness: Witness::from(inp.witness),
             });
         }
         let mut output = Vec::with_capacity(stored_outputs.len());
@@ -404,6 +441,13 @@ impl Query {
         }
         let header = self.wire_header_from_record_prev(&rec, None)?;
         let rows = self.load_class_a_rows(&tx_fks)?;
+        if let Some((first, rest)) = rows.split_first() {
+            let coinbase =
+                Self::transaction_from_class_a(first.0.clone(), first.2.clone(), first.1.clone());
+            if !rows_match_commitment(&coinbase, rest) {
+                return Ok(None);
+            }
+        }
         Ok(Some(encode_witness_block(&header, &rows)))
     }
 
@@ -443,15 +487,8 @@ impl Query {
             Err(StoreError::NotFound) | Err(StoreError::InvalidFk) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let Some((first, n)) = self.store.header_txs.get_range(header_fk)? else {
-            return Ok(None);
-        };
-        let last = first.0.saturating_add(u64::from(n) - 1);
-        if let Ok(rows) = self.store.txstat_range(header_fk, first.0, last) {
-            if rows.len() == n as usize && rows.iter().all(|row| row.is_some()) {
-                let plain: Vec<_> = rows.into_iter().flatten().collect();
-                return Ok(Some(block_size_weight_from_txstat(&plain)?));
-            }
+        if let Some(size_weight) = self.stamped_block_size_weight(header_fk)? {
+            return Ok(Some(size_weight));
         }
         let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
             return Ok(None);
@@ -463,6 +500,28 @@ impl Query {
         let weight = u32::try_from(block.weight().to_wu())
             .map_err(|_| StoreError::Corrupt("invariant: block size/weight"))?;
         Ok(Some((size, weight)))
+    }
+
+    /// BIP144 size and BIP141 weight from complete `txstat` rows only.
+    /// Missing bodies or unstamped rows return `None`; no wire reconstruction.
+    pub fn stamped_block_size_weight(
+        &self,
+        header_fk: Fk,
+    ) -> Result<Option<(u32, u32)>, QueryError> {
+        let Some((first, n)) = self.store.header_txs.get_range(header_fk)? else {
+            return Ok(None);
+        };
+        if n == 0 {
+            return Ok(None);
+        }
+        let last = first.0.saturating_add(u64::from(n) - 1);
+        if let Ok(rows) = self.store.txstat_range(header_fk, first.0, last) {
+            if rows.len() == n as usize && rows.iter().all(|row| row.is_some()) {
+                let plain: Vec<_> = rows.into_iter().flatten().collect();
+                return Ok(Some(block_size_weight_from_txstat(&plain)?));
+            }
+        }
+        Ok(None)
     }
 
     /// Wire rebuild when header row + tx fk list are already known.
@@ -494,7 +553,11 @@ impl Query {
                 stored_inputs,
             ));
         }
-        Ok(Block { header, txdata })
+        let block = Block { header, txdata };
+        if coinbase_has_witness_commitment(&block) && has_witness_reserved_value(&block) {
+            check_rebuilt_witness_commitment(&block)?;
+        }
+        Ok(block)
     }
 
     /// Reconstruct a full wire block at a confirmed height from the relational archive.
@@ -527,6 +590,14 @@ impl Query {
         let Some((header_fk, rec)) = self.header_at_height(height)? else {
             return Ok(None);
         };
+        self.stamped_txstat_header(header_fk, rec)
+    }
+
+    fn stamped_txstat_header(
+        &self,
+        header_fk: Fk,
+        rec: HeaderRecord,
+    ) -> Result<Option<StampedTxstatBlock>, QueryError> {
         let Some((first, n)) = self.store.header_txs.get_range(header_fk)? else {
             return Ok(None);
         };
@@ -559,6 +630,105 @@ impl Query {
         }))
     }
 
+    /// Txid, fee, weight, and output value of every tx in stored block
+    /// `hash`, coinbase first. Active or disconnected by this process only.
+    /// `None` for unknown, header-only, never-connected, or reopened stale blocks.
+    ///
+    /// Reads `txstat`, `create.loc`, `txout.body`, and `txid.body` over the
+    /// block's create span. An active block with unstamped `txstat` rows gives
+    /// the same rows from the reconstructed block, which needs `seqsigwit`
+    /// (`Pruned` when cut). Unstamped stale blocks return `None`. Nothing is written.
+    pub fn block_tx_summary(
+        &self,
+        hash: &[u8; 32],
+    ) -> Result<Option<Vec<BlockTxSummary>>, QueryError> {
+        let Some((header_fk, rec)) = self.connected_block_header(hash)? else {
+            return Ok(None);
+        };
+        let Some(stamped) = self.stamped_txstat_header(header_fk, rec)? else {
+            if self.published_height_of_hash(hash).is_none() {
+                return Ok(None);
+            }
+            return self.block_tx_summary_from_wire(hash);
+        };
+        let (Some(first), Some(last)) = (stamped.fks.first(), stamped.fks.last()) else {
+            return Err(StoreError::Corrupt(
+                "invariant: stamped block without creates",
+            ));
+        };
+        let txids = self.store.txs.body_txid_range(first.0, last.0)?;
+        let values = self.store.output_value_sums_in_fk_span(first.0, last.0)?;
+        if txids.len() != stamped.rows.len() || values.len() != stamped.rows.len() {
+            return Err(StoreError::Corrupt("invariant: block summary row count"));
+        }
+        let rows = stamped
+            .rows
+            .iter()
+            .zip(txids)
+            .zip(values)
+            .map(|((row, txid), value_sat)| BlockTxSummary {
+                txid,
+                fee_sat: row.fee_sat,
+                weight: row.weight(),
+                value_sat,
+            })
+            .collect();
+        Ok(Some(rows))
+    }
+
+    /// [`Self::block_tx_summary`] for a block whose `txstat` rows are
+    /// unstamped: every row comes from the one reconstructed block. The
+    /// block and its txids are read through the header `hash` names, never
+    /// through a height, so a replace at that height cannot mix two blocks.
+    #[doc(hidden)]
+    pub fn block_tx_summary_from_wire(
+        &self,
+        hash: &[u8; 32],
+    ) -> Result<Option<Vec<BlockTxSummary>>, QueryError> {
+        let Some((header_fk, _)) = self.get_header_by_hash(hash)? else {
+            return Ok(None);
+        };
+        let Some(block) = self.reconstruct_archived_block(hash)? else {
+            return Ok(None);
+        };
+        let txids = self.header_txids(header_fk)?;
+        let rows = self.txstat_rows_from_block(&block)?;
+        if txids.len() != rows.len() {
+            return Err(StoreError::Corrupt("invariant: block summary row count"));
+        }
+        Ok(Some(
+            block
+                .txdata
+                .iter()
+                .zip(txids)
+                .zip(rows)
+                .map(|((tx, txid), row)| BlockTxSummary {
+                    txid,
+                    fee_sat: row.fee_sat,
+                    weight: row.weight(),
+                    value_sat: tx.output.iter().map(|o| o.value.to_sat()).sum(),
+                })
+                .collect(),
+        ))
+    }
+
+    /// One `txstat` row per tx of a reconstructed wire block, in block order.
+    fn txstat_rows_from_block(
+        &self,
+        block: &Block,
+    ) -> Result<Vec<rbitcoin_store::TxStatRow>, QueryError> {
+        let mut same_block = std::collections::HashMap::new();
+        for tx in &block.txdata {
+            same_block.insert(tx.compute_txid().to_byte_array(), tx);
+        }
+        let mut rows = Vec::with_capacity(block.txdata.len());
+        for tx in &block.txdata {
+            let in_sum = txstat_in_sum_from_block(self, &same_block, tx)?;
+            rows.push(crate::archive::txstat_row_from_tx(tx, in_sum)?);
+        }
+        Ok(rows)
+    }
+
     /// Fill unstamped `txstat` rows from a reconstructed wire block.
     pub fn stamp_txstat_from_block(&self, height: Height, block: &Block) -> Result<(), QueryError> {
         let Some((header_fk, _)) = self.header_at_height(height)? else {
@@ -570,15 +740,7 @@ impl Query {
         if fks.len() != block.txdata.len() {
             return Err(StoreError::Corrupt("invariant: stamp txstat fk count"));
         }
-        let mut same_block = std::collections::HashMap::new();
-        for tx in &block.txdata {
-            same_block.insert(tx.compute_txid().to_byte_array(), tx);
-        }
-        let mut rows = Vec::with_capacity(fks.len());
-        for tx in &block.txdata {
-            let in_sum = txstat_in_sum_from_block(self, &same_block, tx)?;
-            rows.push(crate::archive::txstat_row_from_tx(tx, in_sum)?);
-        }
+        let rows = self.txstat_rows_from_block(block)?;
         let first = fks
             .first()
             .and_then(|fk| fk.get())
@@ -674,4 +836,53 @@ pub fn encode_class_a_tx(
         }
     }
     let _ = rec.locktime.consensus_encode(&mut *out);
+}
+
+fn has_witness_reserved_value(block: &Block) -> bool {
+    let Some(input) = block.txdata[0].input.first() else {
+        return false;
+    };
+    let mut items = input.witness.iter();
+    matches!((items.next(), items.next()), (Some(reserved), None) if reserved.len() == 32)
+}
+
+fn check_rebuilt_witness_commitment(block: &Block) -> Result<(), StoreError> {
+    let wtxids: Vec<[u8; 32]> = block
+        .txdata
+        .iter()
+        .skip(1)
+        .map(|tx| tx.compute_wtxid().to_byte_array())
+        .collect();
+    check_witness_commitment_with_wtxids(block, &wtxids)
+        .map_err(|_| StoreError::Corrupt("reconstruct: witness commitment mismatch"))
+}
+
+fn coinbase_commitment(coinbase: &Transaction) -> Option<([u8; 32], [u8; 38])> {
+    let idx = witness_commitment_vout_index(coinbase)?;
+    let mut items = coinbase.input.first()?.witness.iter();
+    let reserved = items.next()?;
+    if reserved.len() != 32 || items.next().is_some() {
+        return None;
+    }
+    let mut value = [0u8; 32];
+    value.copy_from_slice(reserved);
+    let mut committed = [0u8; 38];
+    committed.copy_from_slice(&coinbase.output[idx].script_pubkey.as_bytes()[..38]);
+    Some((value, committed))
+}
+
+type ClassARow = (TxRecord, Vec<InputRecord>, Vec<OutputRecord>);
+
+fn rows_match_commitment(coinbase: &Transaction, rows: &[ClassARow]) -> bool {
+    let Some((reserved, committed)) = coinbase_commitment(coinbase) else {
+        return true;
+    };
+    let mut wtxids = Vec::with_capacity(rows.len());
+    let mut buf = Vec::new();
+    for (rec, ins, outs) in rows {
+        buf.clear();
+        encode_class_a_tx(&mut buf, rec, ins, outs);
+        wtxids.push(bitcoin::hashes::sha256d::Hash::hash(&buf).to_byte_array());
+    }
+    witness_commitment_script(wtxids, &reserved) == committed
 }

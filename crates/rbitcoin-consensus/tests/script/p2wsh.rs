@@ -1,5 +1,6 @@
 use bitcoin::Transaction;
 use rbitcoin_consensus::block::ScriptCheckJob;
+use rbitcoin_consensus::script::classify::{program_len, ProgramLen};
 use rbitcoin_consensus::script::p2wsh::*;
 
 use bitcoin::absolute::LockTime;
@@ -54,7 +55,10 @@ fn empty_witness_and_hash_mismatch() {
         let i = job.inputs().next().unwrap();
         let spk = job.prevout_script(i).expect("spk");
         let amount = job.prevout_amount(i).expect("amount");
-        verify(&job, i, &job.tx, spk, amount)
+        let ProgramLen::N32(scripthash) = program_len(&spk[2..]) else {
+            panic!("fixture is a 32-byte program");
+        };
+        verify_with_scripthash(&job, i, &job.tx, scripthash, amount)
     }
     .is_err());
 

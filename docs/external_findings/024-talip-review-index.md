@@ -19,7 +19,7 @@ board. Each fixed row names the regression. No reproduction steps.
 | C09 / C07 / C08 / C10 | critical | Public Electrum scan, subs, scripthash join | fixed | `sh_history_caps` ([036](./036-electrum-public-surface.md)) |
 | M-2 / M-5 / M-6 / L-8 | medium | Mempool policy and orphanage | fixed | `mempool_under_pressure` ([047](./047-orphan-reserve.md)–[050](./050-cluster-once.md)) |
 | L-7 | low | RBFR direct conflict set | won't-fix | `mempool_accept_life` ([051](./051-rbfr-direct-set.md)) |
-| C12 / #09 / #10 / C13 | high | RPC body, waits, client id | fixed | `unauthorized_large_content_length_is_401_before_body` ([037](./037-rpc-esplora-limits.md)) |
+| C12 / #09 / #10 / C13 | high | RPC body, waits, client id | fixed | `unread_body_is_read_before_the_answer_up_to_the_cap` ([037](./037-rpc-esplora-limits.md)) |
 | C11 / M-1 | high | Async tip-accept lifetime | fixed | `owned_job_finishes_after_waiter_abort` ([038](./038-tip-accept-lifetime.md)) |
 | #11 / L-6 | high | I/O buffer lifetime | fixed | `enter_failure_with_pending_matches_the_hard_cap` ([039](./039-io-lifetimes.md)) |
 | C15 / #17B / #18 / L-4 | medium | Corrupt store and mmap | fixed | `read_packed_zero_modulus_or_vertices_is_corrupt` ([040](./040-corrupt-bounds.md)) |

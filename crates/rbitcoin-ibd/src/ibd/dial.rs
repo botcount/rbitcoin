@@ -163,13 +163,9 @@ pub fn mature_relative_slow_samples(slots: &[PeerSlot], now_ms: u64) -> Vec<Rela
             continue;
         };
         if bps == 0 {
-            // Chat with getdata outstanding is a real zero. A body still
-            // arriving, or a peer with nothing assigned, is not.
-            let streaming = s
-                .bytes_rx_total
-                .load(Ordering::Relaxed)
-                .saturating_sub(s.rate.bytes_at_progress);
-            if s.in_flight.is_empty() || streaming >= PROGRESS_STEP {
+            // Chat with getdata outstanding is a real zero. A block frame
+            // still arriving, or a peer with nothing assigned, is not.
+            if s.in_flight.is_empty() || s.solicited_since_progress() >= PROGRESS_STEP {
                 continue;
             }
         }
@@ -261,13 +257,15 @@ fn ibd_conn_type(connect: &[NetAddr], addr: NetAddr) -> PeerConnType {
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 /// Dial up to `count` ranked candidates from `book`. `already` is exclude
 /// (slots + cooldown). `occupied` is live addrs whose netgroups are skipped
-/// while unused-group candidates remain. A `connect` target is dialled as
-/// [`PeerConnType::Manual`].
+/// while unused-group candidates remain. `overlay_live` says an onion or I2P
+/// slot is alive, so a one-peer batch stays on clearnet. A `connect` target is
+/// dialled as [`PeerConnType::Manual`].
 pub async fn dial_batch(
     book: &AddrMan,
     count: usize,
     mut already: HashSet<rbitcoin_net::NetAddr>,
     occupied: &[SocketAddr],
+    overlay_live: bool,
     magic: Magic,
     local_addr: SocketAddr,
     tip_h: Option<u32>,
@@ -294,7 +292,7 @@ pub async fn dial_batch(
             .unwrap_or(false)
     };
 
-    let candidates = book.take_dial_candidates_net(count, &already, occupied);
+    let candidates = book.take_dial_candidates_net(count, &already, occupied, overlay_live);
     out.attempted = candidates.clone();
     let mut handles = Vec::new();
     for addr in candidates {
@@ -528,7 +526,7 @@ pub fn admit_cooldown_fallback(
     live: &HashSet<rbitcoin_net::NetAddr>,
 ) -> Option<rbitcoin_net::NetAddr> {
     if !book
-        .take_dial_candidates_net(1, exclude, occupied)
+        .take_dial_candidates_net(1, exclude, occupied, live.iter().any(|a| a.is_overlay()))
         .is_empty()
     {
         return None;
@@ -815,18 +813,14 @@ pub fn disconnect_stalled_block_peers_at(
     freed
 }
 
-/// Getdata is on the wire, block progress is stale, and the stream has not
-/// moved a body-sized chunk since that progress.
+/// Getdata is on the wire, block progress is stale, and neither a finished
+/// block nor the open block frame has moved a body-sized chunk.
 #[doc(hidden)]
 pub fn withholding_blocks(slot: &PeerSlot, now_ms: u64, stall_ms: u64) -> bool {
     if !super::peer_io::getdata_on_wire_stalled(slot, now_ms, stall_ms) {
         return false;
     }
-    let streamed = slot
-        .bytes_rx_total
-        .load(Ordering::Relaxed)
-        .saturating_sub(slot.rate.bytes_at_progress);
-    streamed < PROGRESS_STEP
+    slot.solicited_since_progress() < PROGRESS_STEP
 }
 
 /// Disconnect at most one **clear quarter-median outlier** (warm-up + cluster gate

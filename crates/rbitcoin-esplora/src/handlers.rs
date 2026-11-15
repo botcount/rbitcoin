@@ -41,51 +41,87 @@ pub const MEMPOOL_TX_PAGE: usize = 50;
 #[doc(hidden)]
 pub type JoinBag = HashMap<[u8; 32], Arc<ShJoinSlot>>;
 
-/// Best-chain wire block for Esplora (archived reconstruct; no extra PoW rehash gate).
-#[doc(hidden)]
-pub fn best_chain_block(
+/// Original height of a stored header. O(stale branch depth), capped at
+/// 10,000 headers. Callers refresh the active height index once before this walk.
+fn stored_header_height(
     query: &Query,
-    hash: &[u8; 32],
-) -> Result<(Height, bitcoin::Block), rbitcoin_query::QueryError> {
-    let Some(height) = query.height_of_hash(hash)? else {
-        return Err(rbitcoin_store::StoreError::NotFound);
-    };
-    // Prefer archived path: does not re-require stored.hash == wire block_hash
-    // (synthetic fixture headers use lab hashes; production hashes match).
-    let block = query
-        .reconstruct_archived_block(hash)?
-        .ok_or(rbitcoin_store::StoreError::NotFound)?;
-    Ok((height, block))
+    rec: &rbitcoin_store::HeaderRecord,
+) -> Result<Height, StoreError> {
+    let mut rec = rec.clone();
+    for depth in 0..10_000u32 {
+        if let Some(height) = query.published_height_of_hash(&rec.hash) {
+            return Ok(Height(height.0 + depth));
+        }
+        if rec.prev_fk.is_null() {
+            return Ok(Height(depth));
+        }
+        rec = query.get_header(rec.prev_fk)?;
+    }
+    Err(StoreError::NotFound)
 }
 
-/// Esplora `GET /block/:hash` JSON for a **best-chain** header hash.
+fn stored_header_median_time(
+    query: &Query,
+    rec: &rbitcoin_store::HeaderRecord,
+) -> Result<u32, StoreError> {
+    let mut rec = rec.clone();
+    let mut times = Vec::with_capacity(11);
+    loop {
+        times.push(rec.timestamp);
+        if times.len() == 11 || rec.prev_fk.is_null() {
+            break;
+        }
+        rec = query.get_header(rec.prev_fk)?;
+    }
+    let window = rbitcoin_primitives::MedianWindow::new(&times).map_err(StoreError::Corrupt)?;
+    Ok(rbitcoin_primitives::median_time_past_times(window))
+}
+
+fn stored_block_tx_span(query: &Query, hash: &[u8; 32]) -> Result<(Fk, u32), StoreError> {
+    let (header_fk, _) = query
+        .connected_block_header(hash)?
+        .ok_or(StoreError::NotFound)?;
+    query
+        .store()
+        .header_txs
+        .get_range(header_fk)?
+        .ok_or(StoreError::NotFound)
+}
+
+/// Esplora `GET /block/:hash` JSON for an active or archived stale block hash.
 pub fn block_summary_json(
     query: &Query,
     hash: &[u8; 32],
 ) -> Result<Value, rbitcoin_query::QueryError> {
-    let Some(height) = query.height_of_hash(hash)? else {
-        return Err(rbitcoin_store::StoreError::NotFound);
-    };
     let (header_fk, rec) = query
-        .header_at_height(height)?
-        .ok_or(rbitcoin_store::StoreError::NotFound)?;
+        .connected_block_header(hash)?
+        .ok_or(StoreError::NotFound)?;
+    let (_, tx_count) = query
+        .store()
+        .header_txs
+        .get_range(header_fk)?
+        .ok_or(StoreError::NotFound)?;
+    let best_height = query.published_height_of_hash(hash);
+    let height = match best_height {
+        Some(h) => h,
+        None => stored_header_height(query, &rec)?,
+    };
     let prev_hash = if rec.prev_fk.is_null() {
         [0u8; 32]
     } else {
         query.store().get_header(rec.prev_fk)?.hash
     };
-    let tx_count = query
-        .store()
-        .header_txs
-        .get_range(header_fk)?
-        .map(|(_, n)| n)
-        .unwrap_or(0);
-    let (size, weight) = query
-        .block_size_weight(header_fk)?
-        .ok_or(rbitcoin_store::StoreError::NotFound)?;
+    let size_weight = match best_height {
+        Some(_) => query.block_size_weight(header_fk)?,
+        None => query.stamped_block_size_weight(header_fk)?,
+    };
+    let (size, weight) = size_weight.ok_or(StoreError::NotFound)?;
     let difficulty =
         Target::from_compact(CompactTarget::from_consensus(rec.bits)).difficulty_float();
-    let mediantime = block_median_time(query, height)?;
+    let mediantime = match best_height {
+        Some(h) => block_median_time(query, h)?,
+        None => stored_header_median_time(query, &rec)?,
+    };
     Ok(json!({
         "id": block_hash_hex(hash),
         "height": height.0,
@@ -162,19 +198,33 @@ pub async fn block_raw(State(st): State<AppState>, Path(hash_hex): Path<String>)
         return not_found();
     };
     let q = std::sync::Arc::clone(&st.query);
-    spawn_join(move || match best_chain_block(&q, &hash) {
-        Ok((_h, block)) => {
-            let raw = serialize(&block);
-            (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/octet-stream")],
-                raw,
-            )
-                .into_response()
+    spawn_join(move || {
+        match q.connected_block_header(&hash) {
+            Ok(Some(_)) => {}
+            Ok(None) => return not_found(),
+            Err(e) => return store_err(e),
         }
-        Err(e) => store_err(e),
+        match q.reconstruct_archived_block(&hash) {
+            Ok(Some(block)) => {
+                let raw = serialize(&block);
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    raw,
+                )
+                    .into_response()
+            }
+            Ok(None) => not_found(),
+            Err(e) => store_err(e),
+        }
     })
     .await
+}
+
+// At the tip, `<=` looks up tip+1, which is absent, so next_best stays null.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn height_below_tip(h: u32, tip: u32) -> bool {
+    h < tip
 }
 
 pub async fn block_status(State(st): State<AppState>, Path(hash_hex): Path<String>) -> Response {
@@ -183,18 +233,23 @@ pub async fn block_status(State(st): State<AppState>, Path(hash_hex): Path<Strin
     };
     let q = std::sync::Arc::clone(&st.query);
     spawn_join(move || {
-        if q.get_header_by_hash(&hash).ok().flatten().is_none() {
-            return not_found();
-        }
-        match q.height_of_hash(&hash) {
-            Ok(None) => json_reply_here(json!({
-                "in_best_chain": false,
-                "height": null,
-                "next_best": null,
-            })),
-            Ok(Some(h)) => {
+        let (_, rec) = match q.connected_block_header(&hash) {
+            Ok(Some(header)) => header,
+            Ok(None) => return not_found(),
+            Err(e) => return store_err(e),
+        };
+        match q.published_height_of_hash(&hash) {
+            None => match stored_header_height(&q, &rec) {
+                Ok(h) => json_reply_here(json!({
+                    "in_best_chain": false,
+                    "height": h.0,
+                    "next_best": null,
+                })),
+                Err(e) => store_err(e),
+            },
+            Some(h) => {
                 let next_best = if let Some(tip) = st.query.tip_height() {
-                    if h.0 < tip.0 {
+                    if height_below_tip(h.0, tip.0) {
                         match st.query.header_at_height(Height(h.0 + 1)) {
                             Ok(Some((_fk, rec))) => json!(block_hash_hex(&rec.hash)),
                             _ => Value::Null,
@@ -211,7 +266,6 @@ pub async fn block_status(State(st): State<AppState>, Path(hash_hex): Path<Strin
                     "next_best": next_best,
                 }))
             }
-            Err(e) => store_err(e),
         }
     })
     .await
@@ -237,13 +291,19 @@ pub async fn block_txid_at(
         let Ok(hash) = parse_hash32(&hash_hex) else {
             return not_found();
         };
-        let Some(height) = (match st.query.height_of_hash(&hash) {
-            Ok(h) => h,
+        let (first, count) = match stored_block_tx_span(&st.query, &hash) {
+            Ok(span) => span,
             Err(e) => return store_err(e),
-        }) else {
-            return not_found();
         };
-        match st.query.block_txid_at(height, index as usize) {
+        if index >= count {
+            return not_found();
+        }
+        match st
+            .query
+            .store()
+            .txs
+            .body_txid(Fk(first.0 + u64::from(index)))
+        {
             Ok(txid) => plain_ok(block_hash_hex(&txid)),
             Err(e) => store_err(e),
         }
@@ -261,15 +321,22 @@ pub async fn blocks_from_height(State(st): State<AppState>, Path(start): Path<u3
     spawn_join(move || blocks_from(&st, Some(start))).await
 }
 
+// `start == tip` assigns that height either way. `start > tip` clamps either way.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn clamp_block_start(h: u32, tip: u32) -> u32 {
+    if h > tip {
+        tip
+    } else {
+        h
+    }
+}
+
 #[doc(hidden)]
 pub fn blocks_from(st: &AppState, start: Option<u32>) -> Response {
     let Some(tip) = st.query.tip_height() else {
         return json_reply_here(json!([]));
     };
-    let mut h = start.unwrap_or(tip.0);
-    if h > tip.0 {
-        h = tip.0;
-    }
+    let mut h = clamp_block_start(start.unwrap_or(tip.0), tip.0);
     let mut out = Vec::new();
     for _ in 0..10 {
         let height = Height(h);
@@ -293,14 +360,35 @@ pub async fn block_txids(State(st): State<AppState>, Path(hash_hex): Path<String
         let Ok(hash) = parse_hash32(&hash_hex) else {
             return not_found();
         };
-        let Some(h) = (match st.query.height_of_hash(&hash) {
-            Ok(h) => h,
+        let header_fk = match st.query.connected_block_header(&hash) {
+            Ok(Some((fk, _))) => fk,
+            Ok(None) => return not_found(),
             Err(e) => return store_err(e),
-        }) else {
+        };
+        match st.query.header_txids(header_fk) {
+            Ok(ids) => json_reply_here(ids.iter().map(block_hash_hex).collect::<Vec<_>>()),
+            Err(e) => store_err(e),
+        }
+    })
+    .await
+}
+
+/// `GET /block/:hash/txs/summary` — `[txid, fee, weight, value]` per tx, coinbase first.
+pub async fn block_txs_summary(
+    State(st): State<AppState>,
+    Path(hash_hex): Path<String>,
+) -> Response {
+    spawn_join(move || {
+        let Ok(hash) = parse_hash32(&hash_hex) else {
             return not_found();
         };
-        match st.query.block_txids(h) {
-            Ok(ids) => json_reply_here(ids.iter().map(block_hash_hex).collect::<Vec<_>>()),
+        match st.query.block_tx_summary(&hash) {
+            Ok(Some(rows)) => json_reply_here(
+                rows.iter()
+                    .map(|r| json!([block_hash_hex(&r.txid), r.fee_sat, r.weight, r.value_sat]))
+                    .collect::<Vec<_>>(),
+            ),
+            Ok(None) => not_found(),
             Err(e) => store_err(e),
         }
     })
@@ -331,29 +419,23 @@ pub fn block_txs_impl(st: AppState, hash_hex: &str, start: u32) -> Response {
     let Ok(hash) = parse_hash32(hash_hex) else {
         return not_found();
     };
-    let Some(h) = (match st.query.height_of_hash(&hash) {
-        Ok(h) => h,
+    let (first, count) = match stored_block_tx_span(&st.query, &hash) {
+        Ok(span) => span,
         Err(e) => return store_err(e),
-    }) else {
-        return not_found();
     };
-    match st.query.block_tx_fks(h) {
-        Ok(fks) => {
-            if (start as usize) >= fks.len() {
-                return (StatusCode::NOT_FOUND, "start index out of range").into_response();
-            }
-            let page: Vec<_> = fks.into_iter().skip(start as usize).take(25).collect();
-            let mut out = Vec::with_capacity(page.len());
-            for fk in page {
-                match build_tx_json(&st.query, fk, st.network, None) {
-                    Ok(v) => out.push(v),
-                    Err(e) => return store_err(e),
-                }
-            }
-            json_reply_here(out)
-        }
-        Err(e) => store_err(e),
+    if start >= count {
+        return (StatusCode::NOT_FOUND, "start index out of range").into_response();
     }
+    let end = start.saturating_add(25).min(count);
+    let mut out = Vec::with_capacity((end - start) as usize);
+    for index in start..end {
+        let fk = Fk(first.0 + u64::from(index));
+        match build_tx_json(&st.query, fk, st.network, None) {
+            Ok(v) => out.push(v),
+            Err(e) => return store_err(e),
+        }
+    }
+    json_reply_here(out)
 }
 
 pub async fn tx_merkle_proof(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Response {
@@ -395,8 +477,8 @@ pub async fn tx_raw(State(st): State<AppState>, Path(txid_hex): Path<String>) ->
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
         };
-        match st.query.get_tx_by_txid(&txid) {
-            Ok(Some((fk, _))) => match st.query.tx_wire_bytes(fk) {
+        match st.query.tx_fk_by_txid(&txid) {
+            Ok(Some(fk)) => match st.query.tx_wire_bytes(fk) {
                 Ok(raw) => (
                     StatusCode::OK,
                     [(header::CONTENT_TYPE, "application/octet-stream")],
@@ -444,27 +526,19 @@ pub fn tx_merkleblock_proof_sync(st: AppState, txid_hex: String) -> Response {
     if !matches!(st.query.store().is_confirmed_strong(fk), Ok(true)) {
         return not_found();
     }
-    let proof = match st.query.merkle_proof(Height(height), &txid) {
-        Ok(p) => p,
-        Err(e) => return store_err(e),
-    };
     let ids = match st.query.block_txids(Height(height)) {
         Ok(v) => v,
         Err(e) => return store_err(e),
     };
-    let pos = proof.pos as usize;
-    if pos >= ids.len() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "merkle pos out of range").into_response();
+    if !ids.iter().any(|t| t == &txid) {
+        return not_found();
     }
-    let mut header = match st.query.wire_header_at_height(Height(height)) {
+    let header = match st.query.wire_header_at_height(Height(height)) {
         Ok(h) => h,
         Err(e) => return store_err(e),
     };
-    header.merkle_root =
-        bitcoin::TxMerkleNode::from_byte_array(rbitcoin_store::merkle_root_from_txids(&ids));
     let txids: Vec<bitcoin::Txid> = ids
-        .iter()
-        .copied()
+        .into_iter()
         .map(bitcoin::Txid::from_byte_array)
         .collect();
     let want = bitcoin::Txid::from_byte_array(txid);
@@ -726,8 +800,8 @@ pub async fn tx_outspends(
             Err(e) => return store_err(e),
         };
         let nout = if let Some(fk) = fk {
-            match st.query.store().get_tx_meta_and_outputs(fk) {
-                Ok((meta, _)) => meta.output_count,
+            match confirmed_output_count(&st.query, fk) {
+                Ok(n) => n,
                 Err(e) => return store_err(e),
             }
         } else {
@@ -752,16 +826,50 @@ pub async fn tx_outspends(
         } else {
             None
         };
-        let mut arr = Vec::with_capacity(nout as usize);
-        for vout in 0..nout {
-            match outspend_json(&st.query, mp, &txid, vout, view.as_ref()) {
-                Ok(v) => arr.push(v),
-                Err(e) => return store_err(e),
-            }
+        let mut body = Vec::new();
+        if let Err(e) = write_outspends(&mut body, &st.query, mp, &txid, nout, view.as_ref()) {
+            return store_err(e);
         }
-        maybe_attach_view(json_reply_here(arr), view)
+        maybe_attach_view(crate::server::json_bytes_reply(body), view)
     })
     .await
+}
+
+/// A confirmed tx's output count from its `create.loc` row. No output is
+/// decoded.
+#[doc(hidden)]
+pub fn confirmed_output_count(query: &Query, fk: Fk) -> Result<u32, StoreError> {
+    query
+        .store()
+        .tx_create_loc_range_batch(&[fk])?
+        .into_iter()
+        .next()
+        .flatten()
+        .map(|pair| pair.n_out)
+        .ok_or(StoreError::NotFound)
+}
+
+/// Append the JSON array of `txid`'s first `nout` outspends to `out`. Each
+/// slot is encoded as it is read, so no `Value` tree is held for the array.
+#[doc(hidden)]
+pub fn write_outspends(
+    out: &mut Vec<u8>,
+    query: &Query,
+    mempool: Option<&MempoolHub>,
+    txid: &[u8; 32],
+    nout: u32,
+    view: Option<&rbitcoin_query::ChainView>,
+) -> Result<(), rbitcoin_query::QueryError> {
+    out.push(b'[');
+    for vout in 0..nout {
+        if vout > 0 {
+            out.push(b',');
+        }
+        let slot = outspend_json(query, mempool, txid, vout, view)?;
+        serde_json::to_writer(&mut *out, &slot).expect("Value encodes into a Vec");
+    }
+    out.push(b']');
+    Ok(())
 }
 
 pub fn outspend_json(
@@ -830,6 +938,12 @@ pub async fn block_template(State(st): State<AppState>) -> Response {
     }
 }
 
+// Exactly 15s is the same hit as the next instant for every tested session.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn gbt_cache_fresh(elapsed: Duration) -> bool {
+    elapsed < Duration::from_secs(15)
+}
+
 #[doc(hidden)]
 pub fn block_template_sync(st: &AppState) -> Response {
     let Some(fun) = st.block_template.as_ref() else {
@@ -851,7 +965,7 @@ pub fn block_template_sync(st: &AppState) -> Response {
     {
         let cache = st.gbt_cache.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(c) = cache.as_ref() {
-            if c.tip == tip && c.updates == updates && c.at.elapsed() < Duration::from_secs(15) {
+            if c.tip == tip && c.updates == updates && gbt_cache_fresh(c.at.elapsed()) {
                 return gbt_json(&c.body);
             }
         }
@@ -970,25 +1084,10 @@ pub async fn address_info(
     AsOf(asof): AsOf,
     JoinClient(client): JoinClient,
 ) -> Response {
-    match resolve_address_sh(&addr_s, st.network) {
-        Ok(sh) => {
-            spawn_join(move || {
-                match sh_stats_json(
-                    &st,
-                    &sh,
-                    Some(addr_s.as_str()),
-                    None,
-                    asof,
-                    client.as_deref(),
-                ) {
-                    Ok((v, view)) => maybe_attach_view(json_reply_here(v), view),
-                    Err(r) => r,
-                }
-            })
-            .await
-        }
-        Err(_) => not_found(),
-    }
+    let Ok(sh) = resolve_address_sh(&addr_s, st.network) else {
+        return not_found();
+    };
+    spawn_join(move || sh_info_reply(&st, &sh, Some(&addr_s), None, asof, client.as_deref())).await
 }
 
 pub async fn scripthash_info(
@@ -1000,20 +1099,23 @@ pub async fn scripthash_info(
     let Ok(sh) = parse_hash32(&sh_hex) else {
         return not_found();
     };
-    spawn_join(move || {
-        match sh_stats_json(
-            &st,
-            &sh,
-            None,
-            Some(sh_hex.as_str()),
-            asof,
-            client.as_deref(),
-        ) {
-            Ok((v, view)) => maybe_attach_view(json_reply_here(v), view),
-            Err(r) => r,
-        }
-    })
-    .await
+    spawn_join(move || sh_info_reply(&st, &sh, None, Some(&sh_hex), asof, client.as_deref())).await
+}
+
+/// `/address/:a` and `/scripthash/:h` totals, run on the blocking pool.
+#[doc(hidden)]
+pub fn sh_info_reply(
+    st: &AppState,
+    sh: &[u8; 32],
+    address: Option<&str>,
+    scripthash_hex: Option<&str>,
+    asof: Option<[u8; 32]>,
+    client: Option<&str>,
+) -> Response {
+    match sh_stats_json(st, sh, address, scripthash_hex, asof, client) {
+        Ok((v, view)) => maybe_attach_view(json_reply_here(v), view),
+        Err(r) => r,
+    }
 }
 
 pub async fn address_utxo(
@@ -1616,13 +1718,17 @@ pub fn dedup_txid(rows: Vec<Value>) -> Vec<Value> {
     out
 }
 
+fn page_keeps_absent_cursor(after_some: bool, script_count: usize) -> bool {
+    after_some && script_count > 1
+}
+
 /// One newest window per script. More than one script keeps a cursor that
 /// is absent from some of them. One script stays the single-address rule:
 /// a foreign cursor is 422.
 #[doc(hidden)]
 pub fn multi_page_filter(after: Option<[u8; 32]>, script_count: usize) -> HistoryFilter {
     let mut filter = HistoryFilter::esplora_chain_page(after);
-    filter.after_absent_keeps_older = after.is_some() && script_count > 1;
+    filter.after_absent_keeps_older = page_keeps_absent_cursor(after.is_some(), script_count);
     filter
 }
 
@@ -1642,6 +1748,9 @@ pub fn accept_script_page<T>(
     Ok(page.rows)
 }
 
+// `truncate(limit)` when the page is already `limit` long does not change it,
+// so `>=` matches `>`.
+#[cfg_attr(feature = "mutants", mutants::skip)]
 #[doc(hidden)]
 pub fn truncate_page(rows: &mut Vec<Value>, limit: usize) {
     if rows.len() > limit {
@@ -2045,7 +2154,7 @@ pub fn mempool_indexes(st: &AppState, sh: &[u8; 32], id: &[u8; 32]) -> bool {
 
 #[doc(hidden)]
 pub fn txid_on_chain(st: &AppState, id: &[u8; 32]) -> bool {
-    st.query.get_tx_by_txid(id).ok().flatten().is_some()
+    st.query.tx_fk_by_txid(id).ok().flatten().is_some()
 }
 
 /// Mempool JSON that stays on this `/txs` page.
@@ -2086,7 +2195,7 @@ pub fn push_mempool_tx_json(
     fee: i64,
     out: &mut Vec<Value>,
 ) {
-    if let Ok(Some((fk, _))) = st.query.get_tx_by_txid(&txid) {
+    if let Ok(Some(fk)) = st.query.tx_fk_by_txid(&txid) {
         if let Ok(v) = build_tx_json(&st.query, fk, st.network, None) {
             out.push(v);
             return;
@@ -2132,7 +2241,7 @@ pub fn parse_after_txid_query(q: AfterTxidQuery) -> Result<Option<[u8; 32]>, Res
 pub fn txid_is_known(st: &AppState, id: &[u8; 32]) -> bool {
     let tid = Txid::from_byte_array(*id);
     st.mempool.as_ref().is_some_and(|m| m.contains(&tid))
-        || st.query.get_tx_by_txid(id).ok().flatten().is_some()
+        || st.query.tx_fk_by_txid(id).ok().flatten().is_some()
 }
 
 #[derive(Deserialize)]
@@ -2316,7 +2425,7 @@ pub async fn post_txs_test(
                         "txid": txid,
                         "wtxid": wtxid,
                         "allowed": true,
-                        "vsize": r.weight / 4,
+                        "vsize": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
                         "fees": { "base": r.fee_sat as f64 / 100_000_000.0 },
                     }));
                 }

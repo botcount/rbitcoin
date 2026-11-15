@@ -8,18 +8,6 @@ use super::interpreter::{self, EvalContext, SigVersion};
 use crate::block::ScriptCheckJob;
 use crate::error::ConsensusError;
 
-pub fn verify(
-    job: &ScriptCheckJob,
-    input_index: crate::block::InputIndex,
-    tx: &Transaction,
-    spk: &[u8],
-    amount: Amount,
-) -> Result<(), ConsensusError> {
-    debug_assert!(spk.len() == 34 && spk.starts_with(&rbitcoin_primitives::P2WSH_PREFIX));
-    let scripthash: &[u8; 32] = spk[2..34].try_into().expect("34-byte p2wsh script");
-    verify_with_scripthash(job, input_index, tx, scripthash, amount)
-}
-
 pub fn verify_with_scripthash(
     job: &ScriptCheckJob,
     input_index: crate::block::InputIndex,

@@ -2,14 +2,7 @@ use rbitcoin_store::error::StoreError;
 use rbitcoin_store::readonly_map::*;
 
 fn tmp() -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "rbitcoin-romap-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let p = rbitcoin_store::testutil::fresh_path("romap");
     std::fs::create_dir_all(&p).unwrap();
     p
 }

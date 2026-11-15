@@ -8,7 +8,7 @@
 use crate::delta_loc::{checkpoint_prefix, loc_window, loc_within, LOC_WINDOW};
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
-use rbitcoin_primitives::{Fk, TableKind};
+use rbitcoin_primitives::{le_u64, Fk, TableKind};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
@@ -135,8 +135,9 @@ impl Input {
         if n_win > 0 {
             let mut bytes = vec![0u8; (n_win * OFF_SLOT) as usize];
             off.read_at(FILE_HEADER_LEN as u64, &mut bytes)?;
-            for (i, chunk) in bytes.chunks_exact(OFF_SLOT as usize).enumerate() {
-                checkpoints[i] = u64::from_le_bytes(chunk.try_into().unwrap());
+            let (rows, _) = bytes.as_chunks::<{ OFF_SLOT as usize }>();
+            for (i, row) in rows.iter().enumerate() {
+                checkpoints[i] = le_u64!(row, 0);
             }
         }
         let opened = Self {

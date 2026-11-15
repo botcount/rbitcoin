@@ -61,6 +61,23 @@ fn open_ctx(dir: &TempDir) -> RpcContext {
     }
 }
 
+#[test]
+fn genesis_coinbase_txid_reads_the_query_once_set() {
+    let dir = TempDir::labeled("rpc-genesis-cb").expect("temp dir");
+    let ctx = open_ctx(&dir);
+    let network = rbitcoin_consensus::ChainParams::regtest().genesis_coinbase_txid;
+    assert_eq!(genesis_coinbase_txid(&ctx), network);
+    let mut testnet5 = ctx_without_chain(&ctx);
+    testnet5.network = Network::Testnet5;
+    assert_eq!(
+        genesis_coinbase_txid(&testnet5),
+        rbitcoin_consensus::ChainParams::testnet5().genesis_coinbase_txid
+    );
+    let marked = [0x11; 32];
+    ctx.query.set_genesis_coinbase_txid(marked);
+    assert_eq!(genesis_coinbase_txid(&ctx), marked);
+}
+
 /// Genesis plus empty blocks `1..=102` (genesis time + 600s). `collect_coinbases`
 /// does not change those block bytes, so the height-102 mempool tests share one pad.
 struct Empty102Pad {
@@ -612,10 +629,67 @@ fn filter_header_hex(filter_hex: &str, parent_header_hex: &str) -> String {
 }
 
 #[test]
+fn getindexinfo_lists_the_basic_filter_index_when_enabled() {
+    let (ctx, _dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let tip = dispatch(&ctx, "getblockcount", vec![]).unwrap();
+    let name = json!("basic block filter index");
+
+    let off = dispatch(&ctx, "getindexinfo", vec![]).unwrap();
+    assert_eq!(
+        off,
+        json!({ "txindex": { "synced": true, "best_block_height": tip } })
+    );
+    assert_eq!(
+        dispatch(&ctx, "getindexinfo", vec![name.clone()]).unwrap(),
+        json!({})
+    );
+
+    ctx.query.set_block_filter_index(true).unwrap();
+    let empty = dispatch(&ctx, "getindexinfo", vec![]).unwrap();
+    assert_eq!(
+        empty["basic block filter index"],
+        json!({ "synced": false, "best_block_height": 0 }),
+        "{empty}"
+    );
+
+    // Seal every height up to the tip, parents first, as the index builder commits them.
+    let tip_height = u32::try_from(tip.as_u64().unwrap()).unwrap();
+    for h in 0..=tip_height {
+        let hash = dispatch(&ctx, "getblockhash", vec![json!(h)]).unwrap();
+        let f = dispatch(&ctx, "getblockfilter", vec![hash]).unwrap();
+        let body = rbitcoin_primitives::hex_decode(f["filter"].as_str().unwrap()).unwrap();
+        let fk = ctx
+            .query
+            .store()
+            .confirmed
+            .get(Height(h))
+            .unwrap()
+            .expect("best-chain header");
+        let sealed = ctx
+            .query
+            .commit_window_filters(h, &[(bitcoin::bip158::BlockFilter::new(&body), fk)])
+            .unwrap();
+        assert_eq!(sealed, 1, "height {h}");
+    }
+    let built = json!({ "synced": true, "best_block_height": tip });
+    let all = dispatch(&ctx, "getindexinfo", vec![]).unwrap();
+    assert_eq!(all["basic block filter index"], built, "{all}");
+    assert_eq!(all["txindex"]["best_block_height"], tip);
+    assert_eq!(
+        dispatch(&ctx, "getindexinfo", vec![name]).unwrap(),
+        json!({ "basic block filter index": built })
+    );
+    assert_eq!(
+        dispatch(&ctx, "getindexinfo", vec![json!("txindex")]).unwrap(),
+        json!({ "txindex": { "synced": true, "best_block_height": tip } })
+    );
+}
+
+#[test]
 fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
     use bitcoin::bip158::BlockFilter;
 
-    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let (ctx, dir, hub) = ctx_from_mature_pad(300_000_000);
     ctx.query.set_block_filter_index(true).unwrap();
     assert_eq!(ctx.query.filter_index_next(), Some(0));
 
@@ -720,6 +794,28 @@ fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
             stale_two["header"].as_str().unwrap(),
         )),
         "a stale grandchild walks back to the sealed fork point, got {stale_three}"
+    );
+
+    // Core #36613: the tip is height 1 again and its filter is sealed. A
+    // header submitted on it is a known block that never connected.
+    let header_only = rbitcoin_consensus::mine_regtest_paying(
+        hub.tip_hash().unwrap(),
+        hub.tip_header().unwrap().time + 60,
+        hub.tip_height().unwrap() + 1,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![],
+    );
+    dispatch(&ctx, "submitheader", vec![json!(block_hex(&header_only))]).unwrap();
+    let never = dispatch(
+        &ctx,
+        "getblockfilter",
+        vec![json!(header_only.block_hash().to_string())],
+    )
+    .unwrap_err();
+    assert_eq!(never["code"], ERR_INVALID_ADDRESS_OR_KEY, "{never}");
+    assert_eq!(
+        never["message"], "Filter not found. Block was not connected to active chain.",
+        "{never}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2606,6 +2702,33 @@ fn getblock_named_verbose_genesis_and_hex() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core `getblock` verbosity 1 carries `size`, `strippedsize` and `weight` for
+/// a side-branch block too; they are the block's own, equal to what it showed
+/// while it was active and to verbosity 2 and 3.
+#[test]
+fn stale_block_v1_carries_size_fields() {
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let parent_sat = generated_coinbase_value(&ctx, 1);
+    let (hex, _) =
+        mature_coinbase_spend(&ctx, parent_sat - 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
+    let tip = dispatch(&ctx, "generate", vec![json!(1)]).unwrap()[0].clone();
+    let active = dispatch(&ctx, "getblock", vec![tip.clone(), json!(1)]).unwrap();
+    dispatch(&ctx, "invalidateblock", vec![tip.clone()]).unwrap();
+    for verbosity in [1, 2, 3] {
+        let stale = dispatch(&ctx, "getblock", vec![tip.clone(), json!(verbosity)]).unwrap();
+        assert_eq!(stale["confirmations"], json!(-1), "{stale}");
+        for field in ["size", "strippedsize", "weight"] {
+            assert!(
+                stale[field].is_u64(),
+                "v{verbosity} {field} missing: {stale}"
+            );
+            assert_eq!(stale[field], active[field], "v{verbosity} {field}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Core `mediantime` on an inactive header is the median of that header and
 /// up to 10 ancestors, not the header's own timestamp.
 #[test]
@@ -3397,6 +3520,11 @@ fn assert_missing_txid_and_rest(ctx: &RpcContext, txid: &str) -> String {
         let (status, body) = rest_text(ctx, &format!("/rest/tx/{missing}.json"), "");
         assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{body}");
         assert!(body.contains("not found"), "{body}");
+        for ext in ["bin", "hex"] {
+            let (status, body) = rest_text(ctx, &format!("/rest/tx/{missing}.{ext}"), "");
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{body}");
+            assert!(body.contains(&format!("{missing} not found")), "{body}");
+        }
     }
     let (status, body) = rest_text(ctx, &format!("/rest/tx/{txid}.json"), "");
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
@@ -4340,6 +4468,93 @@ fn submitpackage_child_fail_keeps_parent() {
             .is_some(),
         "child must be the failed member, got {pkg}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core `rpc_packages.py` `test_submitpackage_other_wtxid`: a member whose
+/// txid is live under another witness reports only `other-wtxid`.
+#[test]
+fn submitpackage_reports_other_wtxid_for_a_live_witness_variant() {
+    use bitcoin::consensus::encode::serialize;
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let (parent_hex, parent) =
+        mature_coinbase_spend(&ctx, 50_0000_0000 - 1_000, p2wsh_script(1).to_p2wsh());
+    dispatch(&ctx, "sendrawtransaction", vec![json!(parent_hex)]).unwrap();
+    let prev = bitcoin::OutPoint {
+        txid: parent.compute_txid(),
+        vout: 0,
+    };
+    let value = parent.output[0].value.to_sat();
+    let one = p2wsh_with_lens(prev, value, 1_000, 1, &[1]);
+    let two = p2wsh_with_lens(prev, value, 1_000, 1, &[2]);
+    assert_eq!(one.compute_txid(), two.compute_txid());
+    assert_ne!(one.compute_wtxid(), two.compute_wtxid());
+    let one_hex = rbitcoin_primitives::hex_encode(serialize(&one));
+    let two_hex = rbitcoin_primitives::hex_encode(serialize(&two));
+    dispatch(&ctx, "sendrawtransaction", vec![json!(one_hex)]).unwrap();
+    let pkg = dispatch(&ctx, "submitpackage", vec![json!([two_hex])]).unwrap();
+    assert_eq!(
+        pkg,
+        json!({
+            "package_msg": "success",
+            "tx-results": {
+                hash_hex_display(&two.compute_wtxid().to_byte_array()): {
+                    "txid": hash_hex_display(&two.compute_txid().to_byte_array()),
+                    "other-wtxid": hash_hex_display(&one.compute_wtxid().to_byte_array()),
+                },
+            },
+            "replaced-transactions": [],
+        })
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core `AcceptPackage` rechecks each member by txid after `LimitMempoolSize`:
+/// a live witness variant that the package's trim evicted is `mempool full`.
+#[test]
+fn submitpackage_witness_variant_trimmed_by_the_package_is_mempool_full() {
+    use bitcoin::consensus::encode::serialize;
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let (parent_hex, parent) =
+        mature_coinbase_spend(&ctx, 50_0000_0000 - 1_000, p2wsh_script(1).to_p2wsh());
+    dispatch(&ctx, "sendrawtransaction", vec![json!(parent_hex)]).unwrap();
+    let prev = bitcoin::OutPoint {
+        txid: parent.compute_txid(),
+        vout: 0,
+    };
+    let value = parent.output[0].value.to_sat();
+    let one = p2wsh_with_lens(prev, value, 1_000, 1, &[1]);
+    let two = p2wsh_with_lens(prev, value, 1_000, 1, &[2]);
+    dispatch(
+        &ctx,
+        "sendrawtransaction",
+        vec![json!(rbitcoin_primitives::hex_encode(serialize(&one)))],
+    )
+    .unwrap();
+    let (rich_hex, rich) = spend_generated_coinbase(
+        &ctx,
+        2,
+        50_0000_0000 - 200_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    // Room for `rich` alone: the trim after it drops the parent and `one`.
+    let mp = ctx.mempool.as_ref().unwrap();
+    mp.set_max_weight(rich.weight().to_wu());
+    let two_hex = rbitcoin_primitives::hex_encode(serialize(&two));
+    let pkg = dispatch(&ctx, "submitpackage", vec![json!([two_hex, rich_hex])]).unwrap();
+    assert!(!mp.contains(&one.compute_txid()), "trim kept `one`: {pkg}");
+    assert!(mp.contains(&rich.compute_txid()), "{pkg}");
+    assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
+    assert_eq!(
+        pkg["tx-results"][hash_hex_display(&two.compute_wtxid().to_byte_array())],
+        json!({
+            "txid": hash_hex_display(&two.compute_txid().to_byte_array()),
+            "error": "mempool full",
+        }),
+        "{pkg}"
+    );
+    let rich_row = &pkg["tx-results"][hash_hex_display(&rich.compute_wtxid().to_byte_array())];
+    assert!(rich_row.get("error").is_none(), "{pkg}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5840,6 +6055,99 @@ fn getpeerinfo_lists_registered_session() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn getpeerinfo_last_block_announcement_tracks_new_heavier_headers() {
+    use bitcoin::block::{Header, Version};
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use rbitcoin_net::{PeerConnType, PeerHub};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let (mut ctx, dir, hub) = ctx_regtest_hub();
+    let peers = PeerHub::new();
+    ctx.peers = Some(peers.clone());
+    dispatch(&ctx, "setmocktime", vec![json!(1_700_000_000)]).unwrap();
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&bind, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 1,
+        relay: true,
+    };
+    let peer = peers.register(addr, bind, &ver, true, PeerConnType::Inbound);
+    let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut follow = rbitcoin_net::peer::PeerFollowState::new();
+    let genesis = hub
+        .query
+        .wire_header_at_height(Height::GENESIS)
+        .unwrap()
+        .block_hash();
+    let tip = hub.tip_header().unwrap();
+
+    let mut heavier = Header {
+        version: Version::from_consensus(4),
+        prev_blockhash: tip.block_hash(),
+        merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+        time: tip.time.saturating_add(1),
+        bits: tip.bits,
+        nonce: 0,
+    };
+    let target = bitcoin::Target::from_compact(heavier.bits);
+    while heavier.validate_pow(target).is_err() {
+        heavier.nonce = heavier.nonce.wrapping_add(1);
+    }
+
+    assert_eq!(
+        dispatch(&ctx, "getpeerinfo", vec![]).unwrap()[0]["last_block_announcement"],
+        0
+    );
+    rbitcoin_net::peer::on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[heavier])
+        .await
+        .unwrap();
+    let stamped = dispatch(&ctx, "getpeerinfo", vec![]).unwrap()[0]["last_block_announcement"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(stamped, 1_700_000_000);
+
+    dispatch(&ctx, "setmocktime", vec![json!(1_700_000_100)]).unwrap();
+    rbitcoin_net::peer::on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[heavier])
+        .await
+        .unwrap();
+    assert_eq!(
+        dispatch(&ctx, "getpeerinfo", vec![]).unwrap()[0]["last_block_announcement"],
+        stamped,
+        "re-announcing an indexed header does not stamp"
+    );
+
+    let mut sibling = Header {
+        prev_blockhash: genesis,
+        time: tip.time.saturating_add(2),
+        nonce: 0,
+        ..heavier
+    };
+    while sibling.validate_pow(target).is_err() {
+        sibling.nonce = sibling.nonce.wrapping_add(1);
+    }
+    rbitcoin_net::peer::on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[sibling])
+        .await
+        .unwrap();
+    assert_eq!(
+        dispatch(&ctx, "getpeerinfo", vec![]).unwrap()[0]["last_block_announcement"],
+        stamped,
+        "equal-work sibling of the active tip does not stamp"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn getpeerinfo_reports_each_peer_transport() {
     use rbitcoin_net::{PeerConnType, PeerHub};
@@ -6355,6 +6663,34 @@ fn getpeerinfo_and_disconnectnode_support_onion_addr() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `--proxy` name session lists its name as `addr`, and `disconnectnode`
+/// takes that `addr` back, as Core matches the name a peer was added by.
+#[test]
+fn disconnectnode_takes_the_addr_of_a_proxied_name() {
+    use rbitcoin_net::{PeerConnType, PeerHub};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let (mut ctx, dir) = ctx_empty();
+    let hub = PeerHub::new();
+    let hint = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8333);
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
+    hub.register_net(
+        hint,
+        rbitcoin_net::NetAddr::name("peer.example", 8333).unwrap(),
+        bind,
+        &test_version(0, 0),
+        false,
+        PeerConnType::Manual,
+    );
+    ctx.peers = Some(hub);
+
+    let r = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
+    assert_eq!(r[0]["addr"], json!("peer.example:8333"));
+    dispatch(&ctx, "disconnectnode", vec![json!("peer.example:8333")]).unwrap();
+    assert_eq!(dispatch(&ctx, "getpeerinfo", vec![]).unwrap(), json!([]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn addpeeraddress_updates_addrman_without_rewriting_peers_file() {
     use rbitcoin_net::AddrMan;
@@ -6833,6 +7169,74 @@ fn getblocktemplate_mintime_is_one_past_the_tip_median() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core bitcoin/bitcoin#36192: six blocks at the two-hour future limit put the
+/// median there, so the next block's floor is past the limit and
+/// `getblocktemplate` fails as Core's `TestBlockValidity` does. The generate
+/// RPCs share Core's `CreateNewBlock` and fail the same way without mining.
+/// One second later the floor is at the limit and the template is stamped
+/// with it.
+#[test]
+fn getblocktemplate_fails_while_the_next_block_floor_is_past_the_future_limit() {
+    let (ctx, dir, hub) = ctx_regtest_hub();
+    let ctx = Arc::new(ctx);
+    let genesis = hub.tip_header().unwrap().time;
+    let now = genesis + 100_000;
+    let limit = now + 7_200;
+    dispatch(&ctx, "setmocktime", vec![json!(now)]).unwrap();
+    // Five blocks keep the median low while the six at the limit connect.
+    for h in 1..=11 {
+        let time = if h <= 5 { genesis + h } else { limit };
+        let prev = hub.tip_hash().unwrap();
+        let b = rbitcoin_consensus::mine_regtest_paying(prev, time, h, true_spk(), vec![]);
+        let r = dispatch(&ctx, "submitblock", vec![json!(block_hex(&b))]).unwrap();
+        assert!(r.is_null(), "height {h}: {r}");
+    }
+    let mtp = rbitcoin_query::median_time_past(hub.query.as_ref(), Height(11)).unwrap();
+    assert_eq!(mtp, limit);
+    let template = || dispatch(&ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]);
+
+    let too_new = |e: Value| {
+        assert_eq!(e["code"], ERR_MISC, "{e}");
+        assert_eq!(
+            e["message"],
+            "TestBlockValidity failed: time-too-new, block timestamp too far in the future",
+        );
+    };
+    too_new(template().expect_err("the next block cannot be valid yet"));
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    for (method, params) in [
+        ("generate", vec![json!(1)]),
+        ("generatetodescriptor", vec![json!(1), json!("raw(51)")]),
+        ("generateblock", vec![json!("raw(51)"), json!([])]),
+        (
+            "generateblock",
+            vec![json!("raw(51)"), json!([]), json!(false)],
+        ),
+    ] {
+        too_new(dispatch(&ctx, method, params.clone()).expect_err(method));
+        let call = dispatch_tip_connect(&ctx, method, RpcParams::positional(params));
+        too_new(rt.block_on(call).expect_err(method));
+    }
+    assert_eq!(hub.tip_height(), Some(11));
+
+    dispatch(&ctx, "setmocktime", vec![json!(now + 1)]).unwrap();
+    let gbt = template().unwrap();
+    assert_eq!(gbt["mintime"], limit + 1, "{gbt}");
+    assert_eq!(gbt["curtime"], limit + 1, "{gbt}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The limit is judged on the whole clock, not its low 32 bits.
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    dispatch(&ctx, "setmocktime", vec![json!(1u64 << 32)]).unwrap();
+    dispatch(&ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Core `GetMinimumTime` on every network: a period's last block is not
 /// before its first block, and a period's first block is at most 600 seconds
 /// before its parent. A node whose clock is behind still builds and mines
@@ -7288,6 +7692,84 @@ fn request_task_generate_is_an_active_command() {
             .store(false, Ordering::Release);
         job.await.expect("join").expect("generate");
     });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two HTTP `generate` calls must not both copy the same pool transaction.
+/// The first parks after accept and before `commit_generated_txids`, still
+/// holding `generate_lock`. The second waits there, then mines what remains.
+#[test]
+fn overlapping_generate_mines_the_pool_tx_once() {
+    let (ctx, dir, hub) = ctx_from_mature_pad(300_000_000);
+    let (hex, spend) = mature_coinbase_spend_hex(&ctx, generated_coinbase_value(&ctx, 1) - 1_000);
+    let txid = spend.compute_txid();
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
+    hub.pause_before_generate_commit
+        .store(true, Ordering::Release);
+    let ctx = std::sync::Arc::new(ctx);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (first, second) = rt.block_on(async {
+        let ctx_a = std::sync::Arc::clone(&ctx);
+        let first = tokio::spawn(async move {
+            rbitcoin_rpc::methods::dispatch_tip_connect(
+                &ctx_a,
+                "generate",
+                rbitcoin_rpc::methods::RpcParams::positional(vec![json!(1)]),
+            )
+            .await
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !hub.generate_commit_parked.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first generate never parked"
+            );
+            tokio::task::yield_now().await;
+        }
+        let ctx_b = std::sync::Arc::clone(&ctx);
+        let second = tokio::spawn(async move {
+            rbitcoin_rpc::methods::dispatch_tip_connect(
+                &ctx_b,
+                "generate",
+                rbitcoin_rpc::methods::RpcParams::positional(vec![json!(1)]),
+            )
+            .await
+        });
+        // Let the second call reach the lock. A select outside the lock
+        // would copy the transaction during this wait; the parked call has
+        // not removed it yet.
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_millis(200) {
+            tokio::task::yield_now().await;
+        }
+        hub.pause_before_generate_commit
+            .store(false, Ordering::Release);
+        let first = first.await.expect("join first").expect("first generate");
+        let second = second.await.expect("join second").expect("second generate");
+        (first, second)
+    });
+    let hashes = [first[0].as_str().unwrap(), second[0].as_str().unwrap()];
+    assert_ne!(hashes[0], hashes[1], "both calls returned {hashes:?}");
+    let mut with_tx = 0;
+    for hash in hashes {
+        let block = dispatch(&ctx, "getblock", vec![json!(hash), json!(1)]).unwrap();
+        let ntx = block["nTx"].as_u64().unwrap();
+        assert!(ntx == 1 || ntx == 2, "{block}");
+        if block["tx"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id.as_str() == Some(txid.to_string().as_str()))
+        {
+            with_tx += 1;
+        }
+    }
+    assert_eq!(with_tx, 1, "pool tx in {with_tx} blocks");
+    assert!(!ctx.mempool.as_ref().unwrap().contains(&txid));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -8134,6 +8616,7 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
         (Network::Testnet, "test"),
         (Network::Signet, "signet"),
         (Network::Testnet4, "testnet4"),
+        (Network::Testnet5, "testnet5"),
     ] {
         let mut labeled = ctx_without_chain(&ctx);
         labeled.network = net;
@@ -8149,6 +8632,15 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
     )
     .unwrap();
     assert_eq!(tb["isvalid"], true, "testnet4 addresses are tb: {tb}");
+    let mut testnet5 = ctx_without_chain(&ctx);
+    testnet5.network = Network::Testnet5;
+    let tb = dispatch(
+        &testnet5,
+        "validateaddress",
+        vec![json!("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx")],
+    )
+    .unwrap();
+    assert_eq!(tb["isvalid"], true, "testnet5 addresses are tb: {tb}");
 
     let gbt = dispatch(
         &bare,
@@ -8277,6 +8769,27 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
         "{on_signet}"
     );
     assert!(gbt.get("signet_challenge").is_none(), "{gbt}");
+    let mut testnet5 = ctx_without_chain(&ctx);
+    testnet5.network = Network::Testnet5;
+    assert_eq!(
+        gbt_err(&testnet5, json!({"rules": ["segwit"]})),
+        (
+            ERR_INVALID_PARAMETER,
+            "Support for 'consensuscleanup' rule requires explicit client support".to_owned()
+        ),
+        "BIP 54 changes what a valid coinbase is"
+    );
+    let on_testnet5 = dispatch(
+        &testnet5,
+        "getblocktemplate",
+        vec![json!({"rules": ["segwit", "consensuscleanup"]})],
+    )
+    .unwrap();
+    assert_eq!(
+        on_testnet5["rules"],
+        json!(["csv", "!segwit", "taproot", "!consensuscleanup"]),
+        "{on_testnet5}"
+    );
     let mut mainnet = ctx_without_chain(&ctx);
     mainnet.network = Network::Mainnet;
     mainnet.connections = Arc::new(AtomicU64::new(0));
@@ -8706,6 +9219,17 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
         rpc_message(&tip_filter).contains("still in the process of being indexed"),
         "{tip_filter}"
     );
+    // Nothing is sealed, yet a block that never connected says so first:
+    // a submitted header, and a side-branch body held in RAM.
+    for never_connected in [&off_hash, &held_hash] {
+        let e = dispatch(&ctx, "getblockfilter", vec![json!(never_connected)]).unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_ADDRESS_OR_KEY, "{e}");
+        assert_eq!(
+            rpc_message(&e),
+            "Filter not found. Block was not connected to active chain.",
+            "{e}"
+        );
+    }
     let unknown_filter = dispatch(
         &ctx,
         "getblockfilter",
@@ -8848,7 +9372,11 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
     assert!(body.trim().len() > 20, "{body}");
     let tx_bin = dispatch_rest(&ctx, &format!("/rest/tx/{child_txid}.bin"), "", &[]);
     assert_eq!(tx_bin.status, axum::http::StatusCode::OK);
-    assert!(!tx_bin.body.is_empty());
+    assert_eq!(
+        tx_bin.body,
+        rbitcoin_primitives::hex_decode(body.trim()).unwrap(),
+        "REST bin bytes are the hex body"
+    );
 
     let height2 = dispatch(&ctx, "getblockhash", vec![json!(2)]).unwrap();
     let coinbase = dispatch(&ctx, "getblock", vec![height2, json!(1)]).unwrap();
@@ -8956,6 +9484,7 @@ include!("../regtest_chain_ops_journey.rs");
 mod chain;
 mod decode;
 mod mempool;
+mod submit_spent_race;
 
 /// The HTTP route runs these methods on the request task
 /// (`dispatch_tip_connect`), not through `dispatch`. Core's block count and

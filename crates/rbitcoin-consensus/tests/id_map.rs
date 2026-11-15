@@ -28,6 +28,13 @@ fn txid_hasher_uses_first_8_bytes() {
 }
 
 #[test]
+fn txid_hasher_places_a_short_write_in_little_endian_bytes() {
+    let mut h = TxidHasher::default();
+    h.write(&[0x11, 0x22, 0x33]);
+    assert_eq!(h.finish(), 0x11 | (0x22 << 8) | (0x33 << 16));
+}
+
+#[test]
 fn outpoint_hasher_mixes_vout() {
     use std::collections::HashSet;
     use std::hash::{BuildHasher, BuildHasherDefault};

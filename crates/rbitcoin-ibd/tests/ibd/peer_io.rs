@@ -35,6 +35,7 @@ fn dummy_slot(id: usize) -> PeerSlot {
         requested: Arc::new(Mutex::new(HashSet::new())),
         solicited_bytes: Arc::new(AtomicU64::new(0)),
         solicited_ms: Arc::new(AtomicU64::new(0)),
+        open_block_bytes: Arc::new(AtomicU64::new(0)),
         any_rx_ms: Arc::new(AtomicU64::new(0)),
         getdata_wire: GetdataWire::new(),
         peer_height: 100,
@@ -181,6 +182,60 @@ fn unsolicited_block_does_not_refresh_progress() {
     assert_eq!(slot.rate.progress_ms, marked);
 }
 
+/// The progress baseline is the solicited total. Socket bytes that are not
+/// a requested block stay off that stamp.
+#[test]
+fn block_progress_stamp_records_solicited_bytes() {
+    let step = rbitcoin_ibd::ibd::rate::PROGRESS_STEP;
+    let mut slot = dummy_slot(8);
+    slot.in_flight.insert(BlockHash::from_byte_array([8u8; 32]));
+    slot.bytes_rx_total.store(1, Ordering::Relaxed);
+    slot.solicited_bytes.store(step, Ordering::Relaxed);
+    slot.solicited_ms.store(5_000, Ordering::Relaxed);
+    sample_peer_rates(std::slice::from_mut(&mut slot), 5_000);
+    assert_eq!(slot.rate.progress_ms, 5_000);
+    assert_eq!(
+        slot.rate.bytes_at_progress, step,
+        "a moved solicited clock stamps solicited bytes, not the socket total"
+    );
+
+    slot.bytes_rx_total.store(2, Ordering::Relaxed);
+    slot.solicited_bytes
+        .store(step.saturating_mul(2), Ordering::Relaxed);
+    note_block_progress(std::slice::from_mut(&mut slot), 8);
+    assert_eq!(slot.rate.bytes_at_progress, step.saturating_mul(2));
+
+    slot.bytes_rx_total.store(3, Ordering::Relaxed);
+    slot.solicited_bytes
+        .store(step.saturating_mul(3), Ordering::Relaxed);
+    note_block_rx(std::slice::from_mut(&mut slot), 8, 1_000);
+    assert_eq!(slot.rate.bytes_at_progress, step.saturating_mul(3));
+}
+
+#[test]
+fn open_block_bytes_count_a_frame_past_a_headers_message() {
+    let hash = BlockHash::from_byte_array([9u8; 32]);
+    let requested = Mutex::new(HashSet::from([hash]));
+    let open = AtomicU64::new(0);
+    let step = rbitcoin_ibd::ibd::rate::PROGRESS_STEP as usize;
+    let headers = rbitcoin_net::codec::MAX_HEADERS_CONTENTS;
+    note_open_block(&open, &requested, headers, step);
+    assert_eq!(open.load(Ordering::Relaxed), 0, "a headers message is chat");
+    note_open_block(&open, &requested, headers + 1, step);
+    assert_eq!(
+        open.load(Ordering::Relaxed),
+        step as u64,
+        "a longer frame while a block is owed is that frame"
+    );
+    requested.lock().unwrap().clear();
+    note_open_block(&open, &requested, headers + 1, step);
+    assert_eq!(
+        open.load(Ordering::Relaxed),
+        0,
+        "a long frame with nothing owed is not a block"
+    );
+}
+
 #[test]
 fn socket_bytes_refresh_the_quiet_clock_only() {
     let mut slot = dummy_slot(4);
@@ -284,6 +339,7 @@ fn test_ctx(
         rate: PeerRateLimiter::default_limits(),
         logged_invalid_v2: false,
         ban_score: 0,
+        pong: Arc::new(IbdPong::new()),
     };
     (ctx, out_rx, body_rx, ctrl_rx)
 }
@@ -342,6 +398,125 @@ fn second_decoy_past_the_window_is_the_threshold() {
         err,
         NetError::Protocol("peer misbehavior threshold")
     ));
+}
+
+fn ping_frame(nonce: u64) -> FramedMessage {
+    framed(*b"ping\0\0\0\0\0\0\0\0", nonce.to_le_bytes().to_vec())
+}
+
+/// Two valid pings leave one pong, and the writer emits the later nonce.
+/// Pings past the message window take the misbehavior disconnect. A block
+/// this node requested still skips that window.
+#[test]
+fn ibd_pings_coalesce_and_overflow_the_message_window() {
+    use rbitcoin_net::peer_dos::DEFAULT_MAX_MSGS_PER_SEC;
+
+    let (mut ctx, mut out_rx, _body_rx, _ctrl) = test_ctx(1);
+    assert!(!ctx.handle(Ok(ping_frame(1))));
+    assert!(!ctx.handle(Ok(ping_frame(0))));
+    assert!(matches!(out_rx.try_recv(), Ok(NetworkMessage::Pong(_))));
+    assert!(
+        out_rx.try_recv().is_err(),
+        "a second ping does not queue a second pong"
+    );
+    assert_eq!(
+        ctx.pong.wire_nonce(1),
+        0,
+        "nonce 0 is the pong the writer sends"
+    );
+    assert!(ctx.pong.finish(0).is_none());
+
+    let (mut ctx, mut out_rx, mut body_rx, _ctrl) = test_ctx(1);
+    for n in 0..DEFAULT_MAX_MSGS_PER_SEC {
+        assert!(
+            !ctx.handle(Ok(ping_frame(u64::from(n) + 1))),
+            "ping {n} fits the window"
+        );
+    }
+    let mut queued = 0usize;
+    while out_rx.try_recv().is_ok() {
+        queued += 1;
+    }
+    assert_eq!(queued, 1, "the window of pings is one pong");
+    assert!(!ctx.handle(Ok(ping_frame(9))));
+    assert_eq!(ctx.ban_score, RATE_LIMIT_BAN_SCORE);
+    assert!(body_rx.try_recv().is_err(), "the first overflow stays");
+    assert!(ctx.handle(Ok(ping_frame(10))));
+    match recv_body(&mut body_rx) {
+        PeerEvent::Dead { peer, reason } => {
+            assert_eq!(peer, 3);
+            assert_eq!(reason, "peer misbehavior threshold");
+        }
+        _ => panic!("the next ping disconnects"),
+    }
+
+    let (mut ctx, _out, mut body_rx, _ctrl) = test_ctx(1);
+    for n in 0..DEFAULT_MAX_MSGS_PER_SEC {
+        assert!(!ctx.handle(Ok(ping_frame(u64::from(n) + 1))));
+    }
+    let block = framed(*b"block\0\0\0\0\0\0\0", vec![7u8; 80]);
+    let hash = block.block_hash_from_header().expect("80-byte header");
+    ctx.requested.lock().unwrap().insert(hash);
+    assert!(
+        !ctx.handle(Ok(block)),
+        "a requested block skips the ping window"
+    );
+    assert!(
+        matches!(recv_body(&mut body_rx), PeerEvent::BlockFramed { .. }),
+        "the requested block is delivered"
+    );
+}
+
+/// A ping during the extra pong is written, and a later ping still queues.
+#[tokio::test]
+async fn an_extra_ibd_pong_still_answers_the_next_ping() {
+    let pong = IbdPong::new();
+    assert!(pong.note(7));
+    let mut sent = Vec::new();
+    struct Emit<'a> {
+        sent: &'a mut Vec<u64>,
+        pong: &'a IbdPong,
+    }
+    impl IbdPongEmit for Emit<'_> {
+        fn emit(
+            &mut self,
+            nonce: u64,
+        ) -> impl std::future::Future<Output = Result<(), NetError>> + Send {
+            self.sent.push(nonce);
+            if nonce == 7 {
+                assert!(
+                    !self.pong.note(8),
+                    "the slot stays held during the first write"
+                );
+            }
+            if nonce == 8 {
+                assert!(
+                    !self.pong.note(9),
+                    "a ping during the extra write is stored"
+                );
+            }
+            std::future::ready(Ok(()))
+        }
+    }
+    write_ibd_pong(
+        &pong,
+        1,
+        &mut Emit {
+            sent: &mut sent,
+            pong: &pong,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sent,
+        vec![7, 8, 9],
+        "the writer emits every nonce that arrived during a write"
+    );
+    assert!(
+        pong.note(10),
+        "the slot is free after the latest nonce is written"
+    );
 }
 
 #[test]

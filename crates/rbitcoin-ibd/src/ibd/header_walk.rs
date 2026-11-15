@@ -28,9 +28,43 @@ use bitcoin::BlockHash;
 use bitcoin::CompactTarget;
 use bitcoin::Work;
 use rbitcoin_net::chain::ChainHub;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+
+/// Headers a chain may grow per second of its age. A longer walk is not
+/// a chain this clock can still be validating.
+pub const HEADER_RATE_PER_SEC: u64 = 6;
+/// Local clock further than this behind the walk's starting median time
+/// does not start the walk. Same window as a future block.
+pub const WALK_CLOCK_SKEW: u64 = 2 * 60 * 60;
+/// Blocks confirm may run past the last height a second peer matched,
+/// while the walk has not proved minimum chain work.
+pub const UNPROVEN_LEAD_BLOCKS: u32 = 65_536;
+/// Class A bytes above the matched height. A full gibibyte stops further
+/// blocks above that height. The height cap stays the match plus
+/// [`UNPROVEN_LEAD_BLOCKS`].
+pub const UNPROVEN_LEAD_BYTES: u64 = 1024 * 1024 * 1024;
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static WALK_UNIX: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Fix the walk clock for a test. `None` uses the system clock.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_walk_unix_for_test(unix: Option<u64>) {
+    WALK_UNIX.with(|slot| slot.set(unix));
+}
+
+fn walk_now(hub: &ChainHub) -> u64 {
+    #[cfg(debug_assertions)]
+    if let Some(fixed) = WALK_UNIX.with(|slot| slot.get()) {
+        return fixed;
+    }
+    hub.clock.now_secs()
+}
 
 /// Difficulty state after a header, so a fork or rewind can retarget without
 /// the abandoned tip's period.
@@ -49,6 +83,8 @@ pub struct DiffSnap {
 pub struct Checkpoint {
     pub hash: BlockHash,
     pub height: u32,
+    /// Height when it does not fit in [`u32`]. The stored chain stays `u32`.
+    pub height_wide: u64,
     pub work: [u8; 32],
     /// Last header of this reply. Lets the next batch check `nBits` and time
     /// without a row in `header.body`.
@@ -58,6 +94,9 @@ pub struct Checkpoint {
     /// Difficulty after this reply. A later fork from this hash retargets
     /// from here, not from the walk tip.
     pub diff: DiffSnap,
+    /// Address that supplied this reply. A reconnect keeps the address and
+    /// must not count as a second peer. Not written to `header.adopt`.
+    pub supplied_by: Option<rbitcoin_net::NetAddr>,
 }
 
 /// Fork point, the chain built from it, and one checkpoint per reply.
@@ -93,6 +132,9 @@ pub struct HeaderWalk {
     pub emptied: HashSet<usize>,
     /// Checkpoint work has reached the milestone floor.
     pub proven: bool,
+    /// Tip height last written to `header.adopt`. Short proved batches move
+    /// the in-memory tip past this without rewriting the file.
+    pub last_adopt_height: Option<u32>,
     /// Stored header hashes from this peer that are not on the download path.
     pub off_path: std::collections::HashMap<usize, HashSet<BlockHash>>,
     /// The caught-up line has already been logged. The status thread keeps
@@ -134,6 +176,23 @@ pub struct HeaderWalk {
     pub challenger: Option<Challenger>,
     /// Confirmed chain already proved the anchor; stop stat'ing the sidecar.
     pub adopt_retired: bool,
+    /// Header count this walk may reach, fixed when the walk starts.
+    pub max_headers: Option<u64>,
+    /// The clock was behind the starting median time, so the walk did not start.
+    pub clock_refused: bool,
+    /// The refusal has already been logged. Survives the reset in
+    /// `install_origin`, so a later ask does not log it again.
+    clock_logged: bool,
+    /// A batch would have passed [`Self::max_headers`].
+    pub length_exceeded: bool,
+    /// Highest checkpoint height a non-reserved peer's full batch matched.
+    pub witness_height: Option<u32>,
+    /// Class A wire accepted above the matched height, keyed by block height.
+    /// A later match drops heights at or below the new line.
+    pub lead_class_a: BTreeMap<u32, u64>,
+    /// This process loaded an unproved `header.adopt`. The first headers ask
+    /// drops it when stored headers already continue past that tip. Not written.
+    restored_unproved: bool,
 }
 
 /// One in-flight header ask on one lane. Not written to `header.adopt`.
@@ -157,7 +216,7 @@ pub const LOOKAHEAD_ASK: Duration = Duration::from_secs(5);
 #[doc(hidden)]
 pub const HEADER_MISS_DISCONNECT: u8 = 2;
 /// Recent block traffic permits two extra header misses, not indefinite silence.
-const PRODUCTIVE_HEADER_MISS_DISCONNECT: u8 = HEADER_MISS_DISCONNECT + 2;
+const PRODUCTIVE_HEADER_MISS_DISCONNECT: u8 = 4;
 /// Header-only timeouts must not destroy a productive block session. Match
 /// the minimum block-stall window; pings and unrelated bytes do not renew it.
 #[doc(hidden)]
@@ -276,9 +335,15 @@ pub struct OriginInput {
 
 pub struct OriginLoaded {
     pub report_epoch: Option<rbitcoin_net::chain::IbdHeaderEpoch>,
+    /// Walk tip. This may be the stored header queue, past the confirmed tip.
     pub height: u32,
     pub hash: Option<BlockHash>,
     pub work: Work,
+    /// Confirmed tip. The unproved lead is measured from here, not from the
+    /// queue tail.
+    pub base_height: u32,
+    pub base_hash: Option<BlockHash>,
+    pub base_work: Work,
     pub milestone_hash: Option<BlockHash>,
     pub milestone_prev: BlockHash,
     pub milestone_header: Option<Header>,
@@ -323,11 +388,14 @@ pub fn load_origin(hub: &ChainHub, input: &OriginInput) -> OriginLoaded {
     if input.hash.is_some_and(|hash| invalid.contains(&hash)) {
         report_epoch = None;
     }
-    let mut height = input.height;
-    let mut hash = input.hash;
-    let mut work = hub
+    let base_height = input.height;
+    let base_hash = input.hash;
+    let base_work = hub
         .chain_work()
         .unwrap_or_else(|_| Work::from_be_bytes([0u8; 32]));
+    let mut height = base_height;
+    let mut hash = base_hash;
+    let mut work = base_work;
     let mut milestone_hash = input.milestone_hash;
     let mut milestone_prev = input.milestone_prev;
     let mut milestone_header = input.milestone_header;
@@ -367,6 +435,9 @@ pub fn load_origin(hub: &ChainHub, input: &OriginInput) -> OriginLoaded {
         height,
         hash,
         work,
+        base_height,
+        base_hash,
+        base_work,
         milestone_hash,
         milestone_prev,
         milestone_header,
@@ -383,6 +454,9 @@ pub fn install_origin(st: &mut IbdWorkState, hub: &ChainHub, loaded: OriginLoade
         height,
         hash,
         work,
+        base_height,
+        base_hash,
+        base_work,
         milestone_hash,
         milestone_prev,
         milestone_header,
@@ -397,23 +471,79 @@ pub fn install_origin(st: &mut IbdWorkState, hub: &ChainHub, loaded: OriginLoade
         milestone_header,
         ..WalkTip::default()
     };
-    st.header_walk.base_hash = hash;
-    st.header_walk.base_height = height;
-    st.header_walk.base_work = work.to_be_bytes();
-    st.header_walk.origin = true;
+    st.header_walk.base_hash = base_hash;
+    st.header_walk.base_height = base_height;
+    st.header_walk.base_work = base_work.to_be_bytes();
     st.header_walk.report_epoch = report_epoch;
     if let Some(h) = tip_header {
         seed_tip_times(st, hub, h);
         note_period_snap(&mut st.header_walk.tip.diff, hub, h, height);
         note_full_diff_snap(&mut st.header_walk.tip.diff, hub, &h, height);
     }
-    st.header_walk.base_diff = st.header_walk.tip.diff;
+    if let Some(base_hash) = base_hash {
+        if let Some(hdr) = hub.header_of(&base_hash) {
+            note_period_snap(&mut st.header_walk.base_diff, hub, hdr, base_height);
+            note_full_diff_snap(&mut st.header_walk.base_diff, hub, &hdr, base_height);
+        }
+    }
+    if !arm_walk_bounds(st, hub) {
+        // Keep the loaded base. Wiping the walk would look proved and lift
+        // the confirm caps over headers already stored.
+        refuse_walk_clock(st);
+        return;
+    }
+    st.header_walk.clock_refused = false;
+    st.header_walk.origin = true;
     publish_work(st, hub);
+}
+
+fn refuse_walk_clock(st: &mut IbdWorkState) {
+    let logged = st.header_walk.clock_logged;
+    st.header_walk.origin = true;
+    st.header_walk.proven = false;
+    st.header_walk.clock_refused = true;
+    st.header_walk.clock_logged = true;
+    if !logged {
+        rbitcoin_log::warn!(
+            "ibd: header walk refused: clock is more than two hours behind the starting median time"
+        );
+    }
+}
+
+/// Fix the length cap from Bitcoin's start. False when the clock is too far
+/// behind the starting median time to start the walk.
+fn arm_walk_bounds(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
+    let mtp = starting_mtp(&st.header_walk.tip);
+    let now = walk_now(hub);
+    if u64::from(mtp) > now.saturating_add(WALK_CLOCK_SKEW) {
+        return false;
+    }
+    let genesis_time = rbitcoin_consensus::params::genesis_block(&hub.params)
+        .header
+        .time;
+    let span = now.saturating_sub(u64::from(genesis_time));
+    st.header_walk.max_headers = Some(span.saturating_mul(HEADER_RATE_PER_SEC));
+    true
+}
+
+fn starting_mtp(tip: &WalkTip) -> u32 {
+    if tip.times.len() >= 11 {
+        let mut sorted = tip.times[tip.times.len() - 11..].to_vec();
+        sorted.sort_unstable();
+        return sorted[5];
+    }
+    tip.header.map(|h| h.time).unwrap_or(0)
 }
 
 #[doc(hidden)]
 pub fn ensure_origin(st: &mut IbdWorkState, hub: &ChainHub) {
     if st.header_walk.origin {
+        if st.header_walk.clock_refused && arm_walk_bounds(st, hub) {
+            st.header_walk.clock_refused = false;
+            // The loaded tip may already be past the floor. No new header
+            // arrives to publish that work.
+            publish_work(st, hub);
+        }
         return;
     }
     let input = origin_input(st, hub);
@@ -458,9 +588,11 @@ pub fn header_status_view(st: &IbdWorkState, hub: &ChainHub) -> HeaderStatusView
     }
 }
 
-/// Operator line for the header walk. Production logs this from the status
-/// thread. Tests call this to observe the once-only caught-up latch.
+/// Debug stand-in for the status thread's header line. The thread keeps
+/// `saw_quiet` and emits the caught-up line itself.
+// Debug status line only. `announced_done` is not a session result.
 #[cfg(debug_assertions)]
+#[cfg_attr(feature = "mutants", mutants::skip)]
 pub fn log_status(st: &mut IbdWorkState, hub: &ChainHub, horizon: u32) {
     if !st.header_walk.origin {
         return;
@@ -557,7 +689,22 @@ pub fn settle_walk_peer(
     if !st.header_walk.origin {
         return;
     }
-    if below_floor(hub, &st.header_walk.tip_work()) || extended {
+    // Below the floor a short reply ended light, even when the store kept
+    // one connecting header. A full window that moved the queue stays.
+    // An empty reply stays with the all-peers rewind.
+    if below_floor(hub, &st.header_walk.tip_work()) {
+        let stored_window = batch_len >= rbitcoin_net::codec::MAX_HEADERS_RESULTS
+            && st.ordered.len() > queued_before;
+        let advanced = st.header_walk.tip_hash() != tip_before || stored_window || fork_advanced;
+        if batch_len > 0 && !advanced {
+            st.header_walk.walk_quiet.insert(peer);
+            if st.header_walk.reserved == Some(peer) {
+                st.header_walk.reserved = None;
+            }
+        }
+        return;
+    }
+    if extended {
         return;
     }
     // This reply is the walk's answer to someone else's block inv.
@@ -943,12 +1090,23 @@ fn note_invalid_tip(st: &mut IbdWorkState, hash: BlockHash) {
 /// retire `peer` from the walk. The batch's last header is remembered, so
 /// the next batch of that chain is refused too.
 pub fn refuse_invalid_batch(st: &mut IbdWorkState, peer: usize, headers: &[Header]) -> bool {
+    let linked = !headers.is_empty() && pow_linked(headers);
+    refuse_invalid_linked(st, peer, headers, linked)
+}
+
+#[doc(hidden)]
+pub fn refuse_invalid_linked(
+    st: &mut IbdWorkState,
+    peer: usize,
+    headers: &[Header],
+    linked: bool,
+) -> bool {
     let Some(first) = headers.first() else {
         return false;
     };
     // An unlinked batch does not build on what it names, so its last
     // header is not remembered. The usual checks drop it.
-    if !pow_linked(headers) {
+    if !linked {
         return false;
     }
     let rejected = |hash: &BlockHash| {
@@ -1003,6 +1161,8 @@ pub fn retire_invalid(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, he
         let at_parent = checkpoint_at(&st.header_walk.tip);
         st.header_walk.checkpoints.push(at_parent);
     }
+    recompute_witness(st);
+    drop_lead_past_tip(st, hub);
     // A challenger's headers are not stored, and its fork can sit below the
     // confirmed tip. Peers are asked again from the parent, and a heavier
     // chain comes back as headers that are stored and can be rewound onto.
@@ -1027,13 +1187,9 @@ pub(crate) fn drop_dead_path(
     drop_queue_above(st, keep, &HashSet::new());
     st.clear_path_above(keep);
     if let Some(query) = query {
-        for queued in query.block_queue_queued_heights() {
-            if queued > keep {
-                let _ = query.block_queue_dequeue_height(queued);
-            }
-        }
+        let _ = query.block_queue_dequeue_above(keep);
     }
-    st.confirm_quiesce = true;
+    st.quiesce_plan();
     st.max_ready_height = st.max_ready_height.min(keep);
     let next = keep.saturating_add(1);
     st.densify_scan_lo = st.densify_scan_lo.min(next);
@@ -1057,6 +1213,7 @@ fn cut_back_to(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, height: u
         milestone_hash: st.header_walk.tip.milestone_hash,
         milestone_prev: st.header_walk.tip.milestone_prev,
         milestone_header: st.header_walk.tip.milestone_header,
+        ..WalkTip::default()
     };
     forget_milestone_below(st, hub, height);
     if height < hub.milestone.height {
@@ -1125,6 +1282,10 @@ pub fn rewind_to(st: &mut IbdWorkState, hub: &ChainHub, height: u32, dead: Optio
         }
     }
     clear_off_path(st);
+    recompute_witness(st);
+    drop_lead_past_tip(st, hub);
+    mark_unproved_if_below_floor(st, hub);
+    st.quiesce_plan();
     publish_header_tip(st, hub);
     save_adopt(st, hub);
 }
@@ -1166,10 +1327,18 @@ pub fn offer_alternate(
     if !pow_linked(headers) {
         return None;
     }
+    if short_below_floor(st, hub, headers) {
+        return Some(true);
+    }
     let prev = headers[0].prev_blockhash;
     let parent = work_at(st, hub, prev)?;
     let fork_height = height_of(st, hub, prev)?;
     if parent_header(st, hub, prev).is_none() {
+        return Some(true);
+    }
+    let end_h = u64::from(fork_height).saturating_add(headers.len() as u64);
+    if over_length_at(st, end_h) {
+        st.header_walk.length_exceeded = true;
         return Some(true);
     }
     let diff = diff_at(st, hub, prev);
@@ -1181,11 +1350,55 @@ pub fn offer_alternate(
     }
     let work = chain_work_after(parent, headers);
     if work > Work::from_be_bytes(st.header_walk.tip_work()) {
-        adopt_heavier(st, hub, prev, headers, work);
+        adopt_heavier(st, hub, prev, headers, work, peer);
         return Some(st.ordered.len() >= ORDERED_HEADERS_SOFT_CAP);
     }
-    note_challenger(st, hub, prev, fork_height, parent, headers);
+    note_challenger(st, hub, prev, fork_height, parent, headers, peer);
     Some(true)
+}
+
+/// The old match counts only while its checkpoint is still on this chain.
+/// Bytes at or below the match that remains are not the lead.
+fn recompute_witness(st: &mut IbdWorkState) {
+    let floor = st.header_walk.base_height;
+    let kept = st.header_walk.witness_height.and_then(|old| {
+        st.header_walk
+            .checkpoints
+            .iter()
+            .filter(|c| c.height <= old && c.supplied_by.is_some())
+            .map(|c| c.height)
+            .max()
+            .filter(|&h| h > floor)
+    });
+    st.header_walk.witness_height = kept;
+    let above = kept.unwrap_or(floor);
+    st.header_walk.lead_class_a.retain(|&h, _| h > above);
+}
+
+fn peer_net(st: &IbdWorkState, peer: usize) -> Option<rbitcoin_net::NetAddr> {
+    st.slots.iter().find(|s| s.id == peer).map(|s| s.net)
+}
+
+fn stamp_supplier(checkpoints: &mut [Checkpoint], supplier: Option<rbitcoin_net::NetAddr>) {
+    if let Some(c) = checkpoints.last_mut() {
+        c.supplied_by = supplier;
+    }
+}
+
+/// A header rewind can sit under blocks already confirmed. Those bytes stay
+/// on the lead until the confirmed tip moves.
+fn drop_lead_past_tip(st: &mut IbdWorkState, hub: &ChainHub) {
+    let keep = st
+        .header_walk
+        .tip_height()
+        .max(hub.tip_height().unwrap_or(0));
+    st.header_walk.lead_class_a.retain(|&h, _| h <= keep);
+}
+
+fn mark_unproved_if_below_floor(st: &mut IbdWorkState, hub: &ChainHub) {
+    if below_floor(hub, &st.header_walk.tip_work()) {
+        st.header_walk.proven = false;
+    }
 }
 
 #[doc(hidden)]
@@ -1207,6 +1420,8 @@ pub fn chain_work_after(parent: Work, headers: &[Header]) -> Work {
 pub struct WalkTip {
     pub hash: Option<BlockHash>,
     pub height: u32,
+    /// Same count as `height` until the chain passes `u32::MAX`.
+    pub height_wide: u64,
     pub work: Work,
     pub header: Option<Header>,
     pub times: Vec<u32>,
@@ -1221,6 +1436,7 @@ impl Default for WalkTip {
         Self {
             hash: None,
             height: 0,
+            height_wide: 0,
             work: Work::from_be_bytes([0; 32]),
             header: None,
             times: Vec::new(),
@@ -1230,6 +1446,11 @@ impl Default for WalkTip {
             milestone_header: None,
         }
     }
+}
+
+/// `height` when `wide` was never stored, and `wide` after the walk passes `u32::MAX`.
+fn wide_height(wide: u64, height: u32) -> u64 {
+    wide.max(u64::from(height))
 }
 
 /// One header onto the tip. Milestone latch and the query note stay with the caller.
@@ -1242,7 +1463,9 @@ pub fn push_header(tip: &mut WalkTip, hub: &ChainHub, hdr: &Header) -> bool {
         return false;
     }
     tip.work = tip.work + hdr.work();
-    tip.height = tip.height.saturating_add(1);
+    let next = wide_height(tip.height_wide, tip.height).saturating_add(1);
+    tip.height_wide = next;
+    tip.height = u32::try_from(next).unwrap_or(u32::MAX);
     tip.hash = Some(hdr.block_hash());
     push_times(&mut tip.times, *hdr);
     note_period_snap(&mut tip.diff, hub, *hdr, tip.height);
@@ -1301,10 +1524,12 @@ pub fn checkpoint_at(tip: &WalkTip) -> Checkpoint {
             .hash
             .unwrap_or_else(|| BlockHash::from_byte_array([0; 32])),
         height: tip.height,
+        height_wide: wide_height(tip.height_wide, tip.height),
         work: tip.work.to_be_bytes(),
         header: tip.header,
         times: tip.times.clone(),
         diff: tip.diff,
+        supplied_by: None,
     }
 }
 
@@ -1313,6 +1538,7 @@ pub fn tip_from_checkpoint(c: &Checkpoint) -> WalkTip {
     WalkTip {
         hash: Some(c.hash),
         height: c.height,
+        height_wide: wide_height(c.height_wide, c.height),
         work: Work::from_be_bytes(c.work),
         ..WalkTip::default()
     }
@@ -1336,6 +1562,7 @@ pub fn note_challenger(
     fork_height: u32,
     parent_work: Work,
     headers: &[Header],
+    peer: Option<usize>,
 ) {
     let end = chain_work_after(parent_work, headers);
     if st
@@ -1355,10 +1582,14 @@ pub fn note_challenger(
         ..WalkTip::default()
     };
     advance_tip(&mut tip, hub, headers);
+    let mut checkpoints = vec![checkpoint_at(&tip)];
+    if let Some(peer) = peer {
+        stamp_supplier(&mut checkpoints, peer_net(st, peer));
+    }
     st.header_walk.challenger = Some(Challenger {
         fork_hash,
         fork_height,
-        checkpoints: vec![checkpoint_at(&tip)],
+        checkpoints,
         tip,
     });
 }
@@ -1380,16 +1611,28 @@ pub fn extend_challenger(
         }
         return true;
     }
+    let too_long = st.header_walk.challenger.as_ref().is_some_and(|ch| {
+        let wide = wide_height(ch.tip.height_wide, ch.tip.height);
+        over_length_at(st, wide.saturating_add(headers.len() as u64))
+    });
+    if too_long {
+        st.header_walk.length_exceeded = true;
+        return true;
+    }
     let Some(ch) = st.header_walk.challenger.as_ref() else {
         return true;
     };
     let mut tip = ch.tip.clone();
     advance_tip(&mut tip, hub, headers);
     let beat = tip.work > st.header_walk.tip.work;
+    let supplier = peer.and_then(|id| peer_net(st, id));
     let Some(ch) = st.header_walk.challenger.as_mut() else {
         return true;
     };
     ch.checkpoints.push(checkpoint_at(&tip));
+    if peer.is_some() {
+        stamp_supplier(&mut ch.checkpoints, supplier);
+    }
     ch.tip = tip;
     if beat {
         promote_challenger(st, hub);
@@ -1399,13 +1642,21 @@ pub fn extend_challenger(
 
 #[doc(hidden)]
 pub fn promote_challenger(st: &mut IbdWorkState, hub: &ChainHub) {
-    let Some(ch) = st.header_walk.challenger.take() else {
+    let Some(mut ch) = st.header_walk.challenger.take() else {
         return;
     };
+    if ch
+        .checkpoints
+        .last()
+        .is_none_or(|c| c.height < ch.tip.height)
+    {
+        ch.checkpoints.push(checkpoint_at(&ch.tip));
+    }
     forget_milestone_below(st, hub, ch.fork_height);
     st.header_walk
         .checkpoints
         .retain(|c| c.height <= ch.fork_height);
+    recompute_witness(st);
     st.header_walk.checkpoints.extend(ch.checkpoints);
     let kept = st.header_walk.tip.milestone_hash;
     let kept_prev = st.header_walk.tip.milestone_prev;
@@ -1737,6 +1988,7 @@ pub fn adopt_heavier(
     prev: BlockHash,
     headers: &[Header],
     work: Work,
+    peer: Option<usize>,
 ) {
     let Some(fork_height) = height_of(st, hub, prev) else {
         return;
@@ -1744,6 +1996,10 @@ pub fn adopt_heavier(
     // Capture the fork's period and timestamps before the challenger is dropped.
     let mut tip = cut_back_to(st, hub, prev, fork_height);
     st.header_walk.challenger = None;
+    st.header_walk
+        .checkpoints
+        .retain(|c| c.height <= fork_height);
+    recompute_witness(st);
     let mut link = prev;
     for hdr in headers {
         if !push_header(&mut tip, hub, hdr) {
@@ -1758,9 +2014,13 @@ pub fn adopt_heavier(
         tip.work = work;
     }
     st.header_walk.tip = tip;
+    let supplier = peer.and_then(|id| peer_net(st, id));
     st.header_walk
         .checkpoints
         .push(checkpoint_at(&st.header_walk.tip));
+    if peer.is_some() {
+        stamp_supplier(&mut st.header_walk.checkpoints, supplier);
+    }
     publish_work(st, hub);
     st.header_walk.emptied.clear();
     st.header_walk.dead_ends.clear();
@@ -1840,7 +2100,19 @@ pub fn classify(
     ask: HeaderAsk,
     headers: &[Header],
 ) -> HeaderClass {
-    if headers.is_empty() || !pow_linked(headers) {
+    let linked = !headers.is_empty() && pow_linked(headers);
+    classify_linked(st, hub, ask, headers, linked)
+}
+
+#[doc(hidden)]
+pub fn classify_linked(
+    st: &IbdWorkState,
+    hub: &ChainHub,
+    ask: HeaderAsk,
+    headers: &[Header],
+    linked: bool,
+) -> HeaderClass {
+    if headers.is_empty() || !linked {
         return HeaderClass::Fork;
     }
     if !st.header_walk.origin {
@@ -1918,7 +2190,11 @@ pub fn absorb_lookahead(
         clear_peer_ask(st, peer);
         return true;
     }
-    let extended = extend_tip(st, hub, headers);
+    let extended = extend_tip(st, hub, headers, Some(peer));
+    if st.header_walk.length_exceeded {
+        clear_peer_ask(st, peer);
+        return true;
+    }
     clear_peer_ask(st, peer);
     if extended && ask == HeaderAsk::Late {
         rbitcoin_log::info!(
@@ -2287,10 +2563,16 @@ pub fn note_empty(st: &mut IbdWorkState, hub: &ChainHub, peer: usize) -> bool {
 
 /// Checkpoint at the batch end when these stored headers extend the candidate.
 ///
-/// Context was already checked by [`ChainHub::ensure_headers_batch`]. A batch
-/// the walk absorbed is written on that same path; this only records the
-/// checkpoint when the tip has not already moved.
-pub fn note_stored_candidate(st: &mut IbdWorkState, hub: &ChainHub, headers: &[Header]) {
+/// `reply_len` is the headers message, before the store drops a rejected tail.
+/// A full window follows the prefix that was kept. A shorter reply still has
+/// to clear the floor on that prefix.
+pub fn note_stored_candidate(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    peer: usize,
+    headers: &[Header],
+    reply_len: usize,
+) {
     if !st.header_walk.origin || headers.is_empty() || !pow_linked(headers) {
         return;
     }
@@ -2300,11 +2582,82 @@ pub fn note_stored_candidate(st: &mut IbdWorkState, hub: &ChainHub, headers: &[H
     if headers[0].prev_blockhash != tip || st.header_walk.dead_ends.contains(&tip) {
         return;
     }
-    let _ = extend_tip(st, hub, headers);
+    if reply_len >= rbitcoin_net::codec::MAX_HEADERS_RESULTS {
+        let _ = extend_connected(st, hub, headers, Some(peer));
+    } else {
+        let _ = extend_tip(st, hub, headers, Some(peer));
+    }
 }
 
+/// A batch shorter than a full window whose work, after the batch, is still
+/// under the floor. A short batch that itself crosses the floor is kept.
+/// A batch that does not prove its target is not this case: adding that
+/// work overflows, and it is not a reason to retire the peer.
 #[doc(hidden)]
-pub fn extend_tip(st: &mut IbdWorkState, hub: &ChainHub, headers: &[Header]) -> bool {
+pub fn short_below_floor(st: &IbdWorkState, hub: &ChainHub, headers: &[Header]) -> bool {
+    if !st.header_walk.origin
+        || headers.is_empty()
+        || headers.len() >= rbitcoin_net::codec::MAX_HEADERS_RESULTS
+        || !pow_linked(headers)
+    {
+        return false;
+    }
+    let after = work_at(st, hub, headers[0].prev_blockhash)
+        .map(|parent| chain_work_after(parent, headers))
+        .unwrap_or_else(|| Work::from_be_bytes(st.header_walk.tip_work()));
+    below_floor(hub, &after.to_be_bytes())
+}
+
+fn over_length_at(st: &IbdWorkState, end_height: u64) -> bool {
+    match st.header_walk.max_headers {
+        Some(cap) => end_height > cap,
+        None => false,
+    }
+}
+
+fn over_length(st: &IbdWorkState, extra: usize) -> bool {
+    let wide = wide_height(st.header_walk.tip.height_wide, st.header_walk.tip.height);
+    over_length_at(st, wide.saturating_add(extra as u64))
+}
+
+/// A stored continuation that would pass the length cap. Sets the flag.
+/// The caller must not write or enqueue the batch.
+#[doc(hidden)]
+pub fn store_would_pass_length(st: &mut IbdWorkState, extra: usize) -> bool {
+    if !over_length(st, extra) {
+        return false;
+    }
+    st.header_walk.length_exceeded = true;
+    true
+}
+
+pub fn extend_tip(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    headers: &[Header],
+    peer: Option<usize>,
+) -> bool {
+    if headers.is_empty() || !pow_linked(headers) {
+        return false;
+    }
+    if short_below_floor(st, hub, headers) {
+        return false;
+    }
+    extend_connected(st, hub, headers, peer)
+}
+
+/// Record `headers` on the candidate. The caller already decided this batch
+/// is allowed to extend, including a stored prefix of a full reply.
+fn extend_connected(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    headers: &[Header],
+    peer: Option<usize>,
+) -> bool {
+    if over_length(st, headers.len()) {
+        st.header_walk.length_exceeded = true;
+        return false;
+    }
     let Some(start) = st.header_walk.tip.hash else {
         return false;
     };
@@ -2319,13 +2672,58 @@ pub fn extend_tip(st: &mut IbdWorkState, hub: &ChainHub, headers: &[Header]) -> 
     if st.header_walk.tip.hash == Some(start) {
         return false;
     }
+    let was_proven = st.header_walk.proven;
+    let supplier = peer.and_then(|id| peer_net(st, id));
     st.header_walk
         .checkpoints
         .push(checkpoint_at(&st.header_walk.tip));
+    if peer.is_some() {
+        stamp_supplier(&mut st.header_walk.checkpoints, supplier);
+    }
     st.header_walk.emptied.clear();
+    st.header_walk.restored_unproved = false;
     publish_work(st, hub);
-    save_adopt(st, hub);
+    if adopt_checkpoint_due(
+        st.header_walk.proven,
+        was_proven,
+        st.header_walk.last_adopt_height,
+        st.header_walk.tip_height(),
+        headers.len(),
+    ) {
+        save_adopt(st, hub);
+    }
     true
+}
+
+/// Whether this batch should rewrite `header.adopt`.
+///
+/// An unproved walk returns true and [`save_adopt`] writes nothing. The
+/// batch that first proves the floor writes. A later proved batch writes
+/// when the tip is a full headers window past the last saved checkpoint, or
+/// this batch is itself a full window. A saved height above the tip writes.
+/// In-memory checkpoints stay per reply.
+#[doc(hidden)]
+pub fn adopt_checkpoint_due(
+    proven: bool,
+    was_proven: bool,
+    last_height: Option<u32>,
+    tip_height: u32,
+    batch_len: usize,
+) -> bool {
+    if !proven || !was_proven {
+        return true;
+    }
+    let Some(saved) = last_height else {
+        return true;
+    };
+    // A rewind or a failed save can leave the stamp above the tip. That
+    // file is not the walk we have now, so the next batch rewrites it.
+    if saved > tip_height {
+        return true;
+    }
+    let window = rbitcoin_net::codec::MAX_HEADERS_RESULTS;
+    let gap = tip_height - saved;
+    gap >= window as u32 || batch_len >= window
 }
 
 #[doc(hidden)]
@@ -2361,6 +2759,7 @@ pub fn remember_milestone(tip: &mut WalkTip, hub: &ChainHub, prev: BlockHash, hd
 pub fn publish_work(st: &mut IbdWorkState, hub: &ChainHub) {
     publish_header_tip(st, hub);
     if below_floor(hub, &st.header_walk.tip_work()) {
+        st.header_walk.proven = false;
         return;
     }
     let opened = !st.header_walk.proven;
@@ -2680,6 +3079,19 @@ pub fn send_getheaders(
 ) -> Result<bool, rbitcoin_net::error::NetError> {
     ensure_origin(st, hub);
     super::path::append_stored_headers(st, hub);
+    // An older binary saved this tip and then stored more headers without
+    // rewriting the file. The next height is already indexed, so the ask
+    // would never go out. Start again from the stored path.
+    if st.header_walk.restored_unproved {
+        let behind = !st.header_walk.proven && super::path::walk_successor_indexed(st, hub);
+        st.header_walk.restored_unproved = false;
+        if behind {
+            forget_adopt(hub);
+            st.header_walk = HeaderWalk::default();
+            ensure_origin(st, hub);
+            super::path::append_stored_headers(st, hub);
+        }
+    }
     let owed = probe_or_challenge_owed(st);
     if !owed && super::path::walk_successor_indexed(st, hub) {
         release_lane(&mut st.header_walk.walk);
@@ -2827,6 +3239,28 @@ pub fn peer_can_head(st: &IbdWorkState, id: usize, above: u32) -> bool {
     })
 }
 
+/// Timed-out peers sort last. A peer with no body yet sorts after one who has
+/// delivered. Both header picks use this key.
+fn header_peer_rank_key(
+    st: &IbdWorkState,
+    slot: &super::peer_io::PeerSlot,
+) -> (bool, u8, u64, usize) {
+    match header_ttfb(slot) {
+        Some(ttfb) => (
+            st.header_walk.header_timeout_peers.contains(&slot.id),
+            0u8,
+            ttfb,
+            slot.id,
+        ),
+        None => (
+            st.header_walk.header_timeout_peers.contains(&slot.id),
+            1u8,
+            0,
+            slot.id,
+        ),
+    }
+}
+
 /// A live peer when nobody's connect-time height is above the stored path.
 /// Peers still on the walk come first.
 #[doc(hidden)]
@@ -2840,20 +3274,7 @@ pub fn pick_any_header_peer(st: &IbdWorkState, skip: Option<usize>) -> Option<us
             if !quiet_ok && st.header_walk.walk_quiet.contains(&slot.id) {
                 continue;
             }
-            let key = match header_ttfb(slot) {
-                Some(ttfb) => (
-                    st.header_walk.header_timeout_peers.contains(&slot.id),
-                    0u8,
-                    ttfb,
-                    slot.id,
-                ),
-                None => (
-                    st.header_walk.header_timeout_peers.contains(&slot.id),
-                    1u8,
-                    0,
-                    slot.id,
-                ),
-            };
+            let key = header_peer_rank_key(st, slot);
             if best.is_none_or(|cur| key < cur) {
                 best = Some(key);
             }
@@ -2880,20 +3301,7 @@ pub fn pick_header_peer(st: &IbdWorkState, above: u32, skip: Option<usize>) -> O
         if !peer_can_head(st, slot.id, above) || skip == Some(slot.id) {
             continue;
         }
-        let key = match header_ttfb(slot) {
-            Some(ttfb) => (
-                st.header_walk.header_timeout_peers.contains(&slot.id),
-                0u8,
-                ttfb,
-                slot.id,
-            ),
-            None => (
-                st.header_walk.header_timeout_peers.contains(&slot.id),
-                1u8,
-                0,
-                slot.id,
-            ),
-        };
+        let key = header_peer_rank_key(st, slot);
         if best.is_none_or(|cur| key < cur) {
             best = Some(key);
         }
@@ -3111,16 +3519,14 @@ pub fn batch_context_ok(
         if own_guard {
             seen.push((height, hash.to_byte_array()));
         }
-        let mtp = if times.len() < 11 {
-            0
-        } else {
-            // `len >= 11`, so `new` cannot fail. A shorter window is median 0 above.
-            let window = rbitcoin_primitives::MedianWindow::new(&times)
-                .expect("a window of at least 11 timestamps is not empty");
-            rbitcoin_primitives::median_time_past_times(window)
+        let mtp = match rbitcoin_primitives::MedianWindow::at_least_eleven(&times) {
+            Some(window) => rbitcoin_primitives::median_time_past_times(window),
+            None => 0,
         };
         parent_hash = hash;
-        let Some(bits) = expected_lookahead_bits(hub, height, &parent, hdr.time, st, &diff) else {
+        let first = period_first(hub, height, st, &diff);
+        let Some(bits) = expected_lookahead_bits(hub, height, &parent, hdr.time, first, st, &diff)
+        else {
             stopped = Some((
                 height,
                 hash.to_byte_array(),
@@ -3135,6 +3541,7 @@ pub fn batch_context_ok(
             hdr,
             mtp,
             parent.time,
+            first,
             bits,
             hash.to_byte_array(),
         ) {
@@ -3179,6 +3586,7 @@ pub fn expected_lookahead_bits(
     height: u32,
     parent: &Header,
     header_time: u32,
+    first: Option<rbitcoin_consensus::PeriodFirst>,
     st: &IbdWorkState,
     diff: &DiffSnap,
 ) -> Option<CompactTarget> {
@@ -3188,7 +3596,7 @@ pub fn expected_lookahead_bits(
         parent.bits,
         parent.time,
         header_time,
-        period_first(hub, height, st, diff),
+        first,
         |h| lookahead_bits_at(diff, st, hub, h),
     )
 }
@@ -3200,12 +3608,7 @@ pub fn period_first(
     st: &IbdWorkState,
     diff: &DiffSnap,
 ) -> Option<rbitcoin_consensus::PeriodFirst> {
-    let params = &hub.params;
-    let interval = params.difficulty_adjustment_interval();
-    if interval == 0 || !height.is_multiple_of(interval) || params.no_pow_retargeting() {
-        return None;
-    }
-    let start_h = height - interval;
+    let start_h = hub.params.period_first_height(height)?;
     let first = if diff.period_height == start_h {
         diff.period_header
     } else {
@@ -3339,15 +3742,21 @@ pub fn write_diff(buf: &mut Vec<u8>, diff: &DiffSnap) {
     buf.extend_from_slice(&bits.to_le_bytes());
 }
 
+fn le_u32_exact(bytes: &[u8], off: usize) -> u32 {
+    let mut word = [0u8; 4];
+    word.copy_from_slice(&bytes[off..off + 4]);
+    u32::from_le_bytes(word)
+}
+
 #[doc(hidden)]
 pub fn read_diff(bytes: &[u8]) -> Option<DiffSnap> {
     if bytes.len() < DIFF_SNAP_LEN {
         return None;
     }
-    let period_height = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    let period_height = le_u32_exact(bytes, 0);
     let period_header = read_header(&bytes[4..84]);
-    let full_diff_height = u32::from_le_bytes(bytes[84..88].try_into().ok()?);
-    let full_bits = u32::from_le_bytes(bytes[88..92].try_into().ok()?);
+    let full_diff_height = le_u32_exact(bytes, 84);
+    let full_bits = le_u32_exact(bytes, 88);
     let full_diff_bits = (full_bits != 0).then_some(CompactTarget::from_consensus(full_bits));
     Some(DiffSnap {
         period_header,
@@ -3378,6 +3787,24 @@ pub fn base_conflicts(st: &IbdWorkState, hub: &ChainHub, walk: &HeaderWalk) -> b
     }
 }
 
+/// A confirmed rewind disconnects every height above `lca_h`. A match that
+/// sits above that fork is the chain that was left. A match at or below the
+/// fork can stay. Class A above the fork is not the new chain's lead.
+fn settle_lead_after_confirmed_rewind(st: &mut IbdWorkState, lca_h: u32) {
+    if st.header_walk.witness_height.is_some_and(|h| h > lca_h) {
+        let floor = st.header_walk.base_height;
+        let kept = st
+            .header_walk
+            .checkpoints
+            .iter()
+            .filter(|c| c.supplied_by.is_some() && c.height <= lca_h && c.height > floor)
+            .map(|c| c.height)
+            .max();
+        st.header_walk.witness_height = kept;
+    }
+    st.header_walk.lead_class_a.retain(|&h, _| h <= lca_h);
+}
+
 /// A confirmed reorg under the walk's base drops `header.adopt`. The file must
 /// not bring back a hash from the chain that was disconnected. A reorg under
 /// the milestone height drops the latched hash. Putting that hash back is
@@ -3393,6 +3820,10 @@ pub fn on_confirmed_rewind(st: &mut IbdWorkState, hub: &ChainHub, lca_h: u32) {
         forget_adopt(hub);
         return;
     }
+    // The confirmed chain left these heights. A match above the fork belongs
+    // to the chain that was disconnected, and its Class A bytes are not the
+    // new chain's lead.
+    settle_lead_after_confirmed_rewind(st, lca_h);
     if hub.milestone.height == 0 || !st.header_walk.origin {
         return;
     }
@@ -3424,14 +3855,15 @@ pub fn on_confirmed_rewind(st: &mut IbdWorkState, hub: &ChainHub, lca_h: u32) {
 }
 
 #[doc(hidden)]
-pub fn save_adopt(st: &IbdWorkState, hub: &ChainHub) {
-    if !st.header_walk.origin {
+pub fn save_adopt(st: &mut IbdWorkState, hub: &ChainHub) {
+    if !st.header_walk.origin || !st.header_walk.proven {
         return;
     }
     // A walk saved while a failure is not on disk could resume onto the
     // invalid chain. No walk is the resume point until the mark is.
     if !hub.invalid_marks_on_disk() {
         forget_adopt(hub);
+        st.header_walk.last_adopt_height = None;
         return;
     }
     let mut buf = Vec::new();
@@ -3476,8 +3908,11 @@ pub fn save_adopt(st: &IbdWorkState, hub: &ChainHub) {
     write_diff(&mut buf, &st.header_walk.base_diff);
     let path = adopt_path(hub);
     let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, &buf).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
+    if std::fs::write(&tmp, &buf).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+        st.header_walk.last_adopt_height = Some(st.header_walk.tip_height());
+    } else {
+        // The bytes on disk are not this tip. The next proved batch retries.
+        st.header_walk.last_adopt_height = None;
     }
 }
 
@@ -3586,9 +4021,16 @@ pub fn restore_adopt(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
         renote_stored_path(st, hub);
         return false;
     }
+    // A saved tip that does not reach past the confirmed chain is an old
+    // unproved resume. Installing it pins the walk behind stored headers.
+    let confirmed = hub.tip_height().unwrap_or(0);
+    if parsed.tip.height <= confirmed {
+        renote_stored_path(st, hub);
+        return false;
+    }
     // A saved candidate above the confirmed tip may build on a block marked
     // invalid after it was saved. The walk starts again from the tip.
-    if parsed.tip.height > hub.tip_height().unwrap_or(0) && failure_above(hub, parsed.base_height) {
+    if failure_above(hub, parsed.base_height) {
         rbitcoin_log::info!(
             "ibd: headers resume refused height={}: invalid blocks are stored",
             parsed.tip.height
@@ -3612,6 +4054,22 @@ pub fn restore_adopt(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
         }
     }
     publish_work(st, hub);
+    if st.header_walk.proven {
+        st.header_walk.last_adopt_height = Some(st.header_walk.tip_height());
+    }
+    rebase_unproved_base(st, hub);
+    st.header_walk.restored_unproved = !st.header_walk.proven;
+    if arm_walk_bounds(st, hub) {
+        st.header_walk.clock_refused = false;
+    } else if !st.header_walk.clock_logged {
+        st.header_walk.clock_refused = true;
+        st.header_walk.clock_logged = true;
+        rbitcoin_log::warn!(
+            "ibd: header walk refused: clock is more than two hours behind the starting median time"
+        );
+    } else {
+        st.header_walk.clock_refused = true;
+    }
     let work = if st.header_walk.proven { "ok" } else { "below" };
     rbitcoin_log::info!(
         "ibd: headers resume height={} work={work} took={took:?}",
@@ -3625,7 +4083,7 @@ pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
     if bytes.len() < 8 + 4 + 32 || &bytes[..8] != ADOPT_MAGIC {
         return None;
     }
-    let n = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
+    let n = le_u32_exact(bytes, 8) as usize;
     const CKPT: usize = 32 + 4 + 32 + 80 + 1 + 11 * 4 + DIFF_SNAP_LEN;
     let body = 12 + n * CKPT;
     const TAIL: usize = 32 + 32 + 4 + 32 + 80 + 4 + 80 + 4 + 4 + DIFF_SNAP_LEN;
@@ -3638,7 +4096,7 @@ pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&bytes[off..off + 32]);
         off += 32;
-        let height = u32::from_le_bytes(bytes[off..off + 4].try_into().ok()?);
+        let height = le_u32_exact(bytes, off);
         off += 4;
         let mut work = [0u8; 32];
         work.copy_from_slice(&bytes[off..off + 32]);
@@ -3652,10 +4110,12 @@ pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
         checkpoints.push(Checkpoint {
             hash: BlockHash::from_byte_array(hash),
             height,
+            height_wide: 0,
             work,
             header,
             times,
             diff,
+            supplied_by: None,
         });
     }
     let mut milestone = [0u8; 32];
@@ -3665,20 +4125,20 @@ pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
     let mut base = [0u8; 32];
     base.copy_from_slice(&bytes[off..off + 32]);
     off += 32;
-    let base_height = u32::from_le_bytes(bytes[off..off + 4].try_into().ok()?);
+    let base_height = le_u32_exact(bytes, off);
     off += 4;
     let mut base_work = [0u8; 32];
     base_work.copy_from_slice(&bytes[off..off + 32]);
     off += 32;
     let tip_header = read_header(&bytes[off..off + 80]);
     off += 80;
-    let period_height = u32::from_le_bytes(bytes[off..off + 4].try_into().ok()?);
+    let period_height = le_u32_exact(bytes, off);
     off += 4;
     let period_header = read_header(&bytes[off..off + 80]);
     off += 80;
-    let full_diff_height = u32::from_le_bytes(bytes[off..off + 4].try_into().ok()?);
+    let full_diff_height = le_u32_exact(bytes, off);
     off += 4;
-    let full_bits = u32::from_le_bytes(bytes[off..off + 4].try_into().ok()?);
+    let full_bits = le_u32_exact(bytes, off);
     off += 4;
     let full_diff_bits = (full_bits != 0).then_some(CompactTarget::from_consensus(full_bits));
     let base_diff = read_diff(&bytes[off..off + DIFF_SNAP_LEN])?;
@@ -3697,7 +4157,6 @@ pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
             height,
             work: Work::from_be_bytes(work),
             header: tip_header,
-            times: Vec::new(),
             diff: DiffSnap {
                 period_header,
                 period_height,
@@ -3705,8 +4164,7 @@ pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
                 full_diff_height,
             },
             milestone_hash,
-            milestone_prev: BlockHash::from_byte_array([0; 32]),
-            milestone_header: None,
+            ..WalkTip::default()
         },
         origin: true,
         dead_ends: HashSet::new(),
@@ -3714,6 +4172,7 @@ pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
         invalid_tip_order: std::collections::VecDeque::new(),
         emptied: HashSet::new(),
         proven: false,
+        last_adopt_height: None,
         off_path: std::collections::HashMap::new(),
         #[cfg(debug_assertions)]
         announced_done: false,
@@ -3731,7 +4190,196 @@ pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
         base_diff,
         challenger: None,
         adopt_retired: false,
+        max_headers: None,
+        clock_refused: false,
+        clock_logged: false,
+        length_exceeded: false,
+        witness_height: None,
+        lead_class_a: BTreeMap::new(),
+        restored_unproved: false,
     })
+}
+
+/// A saved walk from an older binary stored the queue tail as `base_height`.
+/// While this walk is still under the floor, the lead is the confirmed tip.
+fn rebase_unproved_base(st: &mut IbdWorkState, hub: &ChainHub) {
+    if st.header_walk.proven {
+        return;
+    }
+    let Some(tip_h) = hub.tip_height() else {
+        return;
+    };
+    // Above or below: an older file stored the queue tail, which is often
+    // under the blocks already confirmed. The lead is this tip either way.
+    if st.header_walk.base_height == tip_h {
+        return;
+    }
+    let hash = hub.tip_hash();
+    let work = hub
+        .chain_work()
+        .unwrap_or_else(|_| Work::from_be_bytes([0; 32]));
+    st.header_walk.base_height = tip_h;
+    st.header_walk.base_hash = hash;
+    st.header_walk.base_work = work.to_be_bytes();
+    st.header_walk.witness_height = None;
+    if let Some(hdr) = hash.and_then(|h| hub.header_of(&h)) {
+        note_period_snap(&mut st.header_walk.base_diff, hub, hdr, tip_h);
+        note_full_diff_snap(&mut st.header_walk.base_diff, hub, &hdr, tip_h);
+    }
+}
+
+/// Class A bytes still charged against the lead: only heights above the
+/// current match.
+fn class_a_above_match(walk: &HeaderWalk) -> u64 {
+    let matched = walk.witness_height.unwrap_or(walk.base_height);
+    walk.lead_class_a
+        .range((
+            std::ops::Bound::Excluded(matched),
+            std::ops::Bound::Unbounded,
+        ))
+        .fold(0u64, |acc, (_, n)| acc.saturating_add(*n))
+}
+
+/// What confirm may still offer while the walk is unproved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct UnprovenOfferBounds {
+    /// Highest height confirm may claim. `None` once work is proved.
+    pub height_limit: Option<u32>,
+    /// Class A at or below this height is the matched chain, not the lead.
+    pub lead_from: u32,
+    /// Class A bytes still allowed above `lead_from`. `None` once work is proved.
+    pub bytes_left: Option<u64>,
+}
+
+/// Height and byte bounds for the next confirm offer.
+///
+/// The height cap is always the matched height plus [`UNPROVEN_LEAD_BLOCKS`].
+/// The byte remainder is the lead minus Class A above that height. The feed
+/// subtracts reservations it still holds, so a rewind that drops Class A
+/// installs this allowance again.
+#[doc(hidden)]
+pub fn unproven_offer_bounds(st: &IbdWorkState) -> UnprovenOfferBounds {
+    if !st.header_walk.origin || st.header_walk.proven {
+        return UnprovenOfferBounds {
+            height_limit: None,
+            lead_from: 0,
+            bytes_left: None,
+        };
+    }
+    let matched = st
+        .header_walk
+        .witness_height
+        .unwrap_or(st.header_walk.base_height);
+    let spent = class_a_above_match(&st.header_walk);
+    UnprovenOfferBounds {
+        height_limit: Some(matched.saturating_add(UNPROVEN_LEAD_BLOCKS)),
+        lead_from: matched,
+        bytes_left: Some(UNPROVEN_LEAD_BYTES.saturating_sub(spent)),
+    }
+}
+
+/// Highest height confirm may offer while the walk is unproved.
+/// `None` once the walk has proved work: the lead has lifted.
+#[doc(hidden)]
+pub fn unproven_confirm_limit(st: &IbdWorkState) -> Option<u32> {
+    unproven_offer_bounds(st).height_limit
+}
+
+/// Add Class A bytes for a block confirmed above the matched height.
+#[doc(hidden)]
+pub fn note_unproven_class_a(st: &mut IbdWorkState, height: u32, wire_bytes: u64) {
+    if !st.header_walk.origin || st.header_walk.proven || wire_bytes == 0 {
+        return;
+    }
+    let matched = st
+        .header_walk
+        .witness_height
+        .unwrap_or(st.header_walk.base_height);
+    if height > matched {
+        let slot = st.header_walk.lead_class_a.entry(height).or_insert(0);
+        *slot = slot.saturating_add(wire_bytes);
+    }
+}
+
+/// A full batch we asked for, checked against checkpoints another peer supplied.
+/// A match moves the height confirm may follow.
+///
+/// `linked` is the caller's single [`pow_linked`] result. The batch is hashed
+/// only when a checkpoint was supplied by a different address. A proved walk
+/// ignores the match.
+#[doc(hidden)]
+pub fn note_header_witness(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    peer: usize,
+    ask: HeaderAsk,
+    headers: &[Header],
+    linked: bool,
+) {
+    if st.header_walk.proven {
+        return;
+    }
+    if !st.header_walk.origin
+        || !matches!(ask, HeaderAsk::InWindow | HeaderAsk::Late)
+        || headers.len() < rbitcoin_net::codec::MAX_HEADERS_RESULTS
+        || !linked
+    {
+        return;
+    }
+    let Some(mine) = peer_net(st, peer) else {
+        return;
+    };
+    if !st
+        .header_walk
+        .checkpoints
+        .iter()
+        .any(|c| c.supplied_by.is_some_and(|supplier| supplier != mine))
+    {
+        return;
+    }
+    let prev = headers[0].prev_blockhash;
+    let Some(start) = height_of(st, hub, prev) else {
+        return;
+    };
+    let PathAgree::Checkpoint(height) = path_agree(st, start, headers, true) else {
+        return;
+    };
+    let other = st
+        .header_walk
+        .checkpoints
+        .iter()
+        .rev()
+        .find(|c| c.height == height)
+        .is_some_and(|c| c.supplied_by.is_some_and(|supplier| supplier != mine));
+    if !other {
+        return;
+    }
+    let next = st.header_walk.witness_height.unwrap_or(0).max(height);
+    st.header_walk.witness_height = Some(next);
+    st.header_walk.lead_class_a.retain(|&h, _| h > next);
+}
+
+/// Rewind depth for this walk. [`super::reorg::REWIND_MAX_DEPTH`] stays 1,024.
+/// The wide cap follows the confirmed tip. `publish_work` can mark the new
+/// headers proved while that tip is still under the floor.
+#[doc(hidden)]
+pub fn rewind_depth_cap(st: &IbdWorkState, hub: &ChainHub) -> u32 {
+    if st.header_walk.origin && leaving_unproved_lead(st, hub) {
+        UNPROVEN_LEAD_BLOCKS
+    } else {
+        super::reorg::REWIND_MAX_DEPTH
+    }
+}
+
+/// True while a rewind would leave the unproved lead. The confirmed chain's
+/// own work decides, including when a refused clock has cleared `proven`.
+/// If that work cannot be read, an unproved walk stays wide.
+fn leaving_unproved_lead(st: &IbdWorkState, hub: &ChainHub) -> bool {
+    match hub.chain_work() {
+        Ok(work) => below_floor(hub, &work.to_be_bytes()),
+        Err(_) => !st.header_walk.proven,
+    }
 }
 
 #[doc(hidden)]
@@ -3758,9 +4406,8 @@ pub fn read_times(bytes: &[u8]) -> Option<Vec<u32>> {
         return None;
     }
     let mut times = Vec::with_capacity(n);
-    for i in 0..n {
-        let off = 1 + i * 4;
-        times.push(u32::from_le_bytes(bytes[off..off + 4].try_into().ok()?));
+    for row in bytes[1..1 + n * 4].as_chunks::<4>().0 {
+        times.push(u32::from_le_bytes(*row));
     }
     Some(times)
 }

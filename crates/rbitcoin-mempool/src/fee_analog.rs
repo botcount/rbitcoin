@@ -12,6 +12,7 @@
 //! inside a spike stop steering calm-market estimates, and the reverse.
 
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 
 /// Lookback medians within this ratio of now count as "looked like now".
 pub const ANALOG_BAND: f64 = 1.25;
@@ -29,10 +30,26 @@ pub fn analog_lookback(n_blocks: u32) -> usize {
     (n_blocks as usize / 4).clamp(3, 144)
 }
 
+fn blocks_in_window(n_blocks: u32) -> NonZeroUsize {
+    match NonZeroUsize::new(n_blocks as usize) {
+        Some(n) => n,
+        None => NonZeroUsize::MIN,
+    }
+}
+
+/// Lowest hurdle in `hurdles[start..start + n]`. `n` is at least one.
+fn lowest_hurdle(hurdles: &VecDeque<u64>, start: usize, n: NonZeroUsize) -> u64 {
+    let mut low = hurdles[start];
+    for h in hurdles.range(start + 1..start + n.get()).copied() {
+        low = low.min(h);
+    }
+    low
+}
+
 #[derive(Debug)]
 #[doc(hidden)]
 pub struct Depth {
-    pub n: usize,
+    pub n: NonZeroUsize,
     pub lookback: usize,
     /// `(ln lookback median, window hurdle)` by window start, oldest first.
     pub pairs: VecDeque<(f64, u64)>,
@@ -70,7 +87,7 @@ impl AnalogHistory {
             depths: targets
                 .iter()
                 .map(|&n| Depth {
-                    n: n.max(1) as usize,
+                    n: blocks_in_window(n),
                     lookback: analog_lookback(n),
                     pairs: VecDeque::new(),
                 })
@@ -82,11 +99,7 @@ impl AnalogHistory {
     #[doc(hidden)]
     pub fn pair(hurdles: &VecDeque<u64>, d: &Depth, t: usize) -> (f64, u64) {
         let before = lower_median(hurdles.range(t - d.lookback..t).copied());
-        let ahead = hurdles
-            .range(t..t + d.n)
-            .copied()
-            .min()
-            .expect("window is not empty");
+        let ahead = lowest_hurdle(hurdles, t, d.n);
         (ln_rate(before), ahead)
     }
 
@@ -95,8 +108,8 @@ impl AnalogHistory {
         self.hurdles.push_back(hurdle);
         let k = self.hurdles.len();
         for d in &mut self.depths {
-            if k >= d.lookback + d.n {
-                let pair = Self::pair(&self.hurdles, d, k - d.n);
+            if k >= d.lookback + d.n.get() {
+                let pair = Self::pair(&self.hurdles, d, k - d.n.get());
                 d.pairs.push_back(pair);
             }
         }
@@ -116,7 +129,7 @@ impl AnalogHistory {
         self.hurdles.push_front(hurdle);
         let k = self.hurdles.len();
         for d in &mut self.depths {
-            if k >= d.lookback + d.n {
+            if k >= d.lookback + d.n.get() {
                 let pair = Self::pair(&self.hurdles, d, d.lookback);
                 d.pairs.push_front(pair);
             }
@@ -147,7 +160,7 @@ impl AnalogHistory {
     pub fn pairs(&self, n_blocks: u32) -> usize {
         self.depths
             .iter()
-            .find(|d| d.n == n_blocks.max(1) as usize)
+            .find(|d| d.n == blocks_in_window(n_blocks))
             .map_or(0, |d| d.pairs.len())
     }
 
@@ -158,7 +171,7 @@ impl AnalogHistory {
         let d = self
             .depths
             .iter()
-            .find(|d| d.n == n_blocks.max(1) as usize)?;
+            .find(|d| d.n == blocks_in_window(n_blocks))?;
         if d.pairs.len() < ANALOG_READY_PAIRS || !(0.0..=1.0).contains(&confidence) {
             return None;
         }

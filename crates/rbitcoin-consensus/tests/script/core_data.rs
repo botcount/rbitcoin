@@ -1,4 +1,4 @@
-//! Stage Bitcoin Core `src/test/data` JSON from the v32.1 submodule.
+//! Stage Bitcoin Core `src/test/data` JSON from the pinned submodule.
 //!
 //! In-tree copies of Core `src/test/data/*.json` are not kept. Each corpus
 //! run hard-links (or copies) the pin into `$CARGO_TARGET_DIR/core-data/`.
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, Once};
 
-const HINT: &str = "run ./scripts/core-functional/init-submodule.sh (sparse v32.1 pin)";
+const HINT: &str = "run ./scripts/core-functional/init-submodule.sh (sparse Core pin)";
 
 /// Directory that holds Core JSON corpora (`RBITCOIN_CORE_DATA` or
 /// `third_party/bitcoin/src/test/data` walking up from this crate).
@@ -115,10 +115,11 @@ fn stage_dir() -> PathBuf {
 }
 
 /// Replace `dest` with a hard link to `src`, or a copy if link is not allowed.
+/// A staged file that no longer matches `src` (the pin moved) is replaced.
 fn install(src: &Path, dest: &Path) {
     static STAGE: Mutex<()> = Mutex::new(());
     let _g = STAGE.lock().unwrap();
-    if dest.is_file() {
+    if dest.is_file() && fs::read(dest).ok() == fs::read(src).ok() {
         return;
     }
     if fs::hard_link(src, dest).is_ok() {
@@ -140,4 +141,19 @@ fn install(src: &Path, dest: &Path) {
         }
         Err(e) => panic!("rename {tmp:?} -> {dest:?}: {e}"),
     }
+}
+
+/// A pin bump replaces the submodule file, and a hard link staged before it
+/// still holds the old rows. Staging again must pick up the new file.
+#[test]
+fn stale_staged_copy_is_replaced() {
+    let dir = std::env::temp_dir().join(format!("rbtc-core-stage-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let (src, dest) = (dir.join("src.json"), dir.join("dest.json"));
+    fs::write(&src, "[\"new pin\"]").unwrap();
+    fs::write(&dest, "[\"old pin\"]").unwrap();
+    install(&src, &dest);
+    let got = fs::read_to_string(&dest).unwrap();
+    fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(got, "[\"new pin\"]");
 }

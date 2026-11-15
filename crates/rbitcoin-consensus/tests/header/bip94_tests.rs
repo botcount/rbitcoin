@@ -6,17 +6,17 @@ use rbitcoin_consensus::header::*;
 use rbitcoin_consensus::params::ChainParams;
 use rbitcoin_primitives::Height;
 
-const PARENT_TIME: u32 = 1_714_800_000;
-const PARENT_HASH: [u8; 32] = [7; 32];
+pub(super) const PARENT_TIME: u32 = 1_714_800_000;
+pub(super) const PARENT_HASH: [u8; 32] = [7; 32];
 
 /// The network's rules with the regtest pow limit, so a header grinds in a
 /// few hashes. The rules under test do not read the pow limit.
-fn cheap(mut params: ChainParams) -> ChainParams {
+pub(super) fn cheap(mut params: ChainParams) -> ChainParams {
     params.pow_limit = Target::MAX_ATTAINABLE_REGTEST;
     params
 }
 
-fn header_at(time: u32) -> Header {
+pub(super) fn header_at(time: u32) -> Header {
     let mut h = Header {
         version: Version::from_consensus(4),
         prev_blockhash: BlockHash::from_byte_array(PARENT_HASH),
@@ -29,7 +29,13 @@ fn header_at(time: u32) -> Header {
     h
 }
 
-fn on_parent(params: &ChainParams, height: u32, time: u32) -> Result<(), ConsensusError> {
+/// The off-tip check for a header at `time` on a parent at [`PARENT_TIME`].
+pub(super) fn on_parent_with(
+    params: &ChainParams,
+    height: u32,
+    time: u32,
+    period_first: Option<PeriodFirst>,
+) -> Result<(), ConsensusError> {
     let h = header_at(time);
     rbitcoin_consensus::clock::with_now(u64::from(PARENT_TIME), || {
         validate_header_on_parent(
@@ -38,13 +44,18 @@ fn on_parent(params: &ChainParams, height: u32, time: u32) -> Result<(), Consens
             &h,
             0,
             PARENT_TIME,
+            period_first,
             h.bits,
             h.block_hash().to_byte_array(),
         )
     })
 }
 
-fn is_timewarp(err: &ConsensusError) -> bool {
+fn on_parent(params: &ChainParams, height: u32, time: u32) -> Result<(), ConsensusError> {
+    on_parent_with(params, height, time, None)
+}
+
+pub(super) fn is_timewarp(err: &ConsensusError) -> bool {
     matches!(err, ConsensusError::BadHeader("time-timewarp-attack"))
         && rbitcoin_consensus::block_reject_reason(err) == "time-timewarp-attack"
 }
@@ -80,7 +91,7 @@ fn retarget_multiplies_the_period_first_bits_on_testnet4() {
 }
 
 /// Core `ContextualCheckBlockHeader`: with BIP94 a period's first header is
-/// at most `MAX_TIMEWARP` (600 s) before its parent.
+/// at most `MAX_TIMEWARP_BIP94` (600 s) before its parent.
 #[test]
 fn timewarp_floor_is_600_seconds_before_the_parent_on_testnet4() {
     let t4 = cheap(ChainParams::testnet4());

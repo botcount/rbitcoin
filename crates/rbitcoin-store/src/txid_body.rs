@@ -210,12 +210,8 @@ impl TxidBody {
         if (rc as usize) != blob.len() {
             self.file.pread_at(off, &mut blob)?;
         }
-        let mut out = Vec::with_capacity(count);
-        for i in 0..count {
-            let s = i * 32;
-            out.push(blob[s..s + 32].try_into().unwrap());
-        }
-        Ok(out)
+        let (rows, _) = blob.as_chunks::<32>();
+        Ok(rows.to_vec())
     }
 
     /// Fill `out[i]` with txid for `fks[i]` (scattered fks).

@@ -1,7 +1,7 @@
 # Script corpus
 
 Run beside Bitcoin Core's JSON suites. Every row is executed by our
-interpreter and by Bitcoin Core v32.1 `VerifyScript` (the submodule, not
+interpreter and by Bitcoin Core `VerifyScript` at the pin (the submodule, not
 the crates.io `bitcoinconsensus` crate, which is Core 26). Both must
 agree with the row's expected accept or reject. Error strings are not
 compared.

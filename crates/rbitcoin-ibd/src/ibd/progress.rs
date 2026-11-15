@@ -8,6 +8,7 @@ use super::body::BodyPresence;
 use super::state::HeightOccupants;
 use bitcoin::BlockHash;
 use rbitcoin_net::chain::ChainHub;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -84,6 +85,19 @@ pub fn format_progress_line(i: &ProgressLineInput) -> String {
 /// (`H ≤ lookup_taken_hi`). Class A alone is not enough. Pending without
 /// BQ is not in hand (zombie). Rejected is never in hand.
 pub fn claim_ready(hub: &ChainHub, body: &mut BodyPresence, height: u32, hash: &BlockHash) -> bool {
+    claim_ready_queued(hub, body, height, hash, || {
+        hub.query.block_queue_hash_at_height(height)
+    })
+}
+
+/// Same rule as [`claim_ready`]. `queued` supplies the body-queue hash.
+pub(crate) fn claim_ready_queued(
+    hub: &ChainHub,
+    body: &mut BodyPresence,
+    height: u32,
+    hash: &BlockHash,
+    mut queued: impl FnMut() -> Option<[u8; 32]>,
+) -> bool {
     use bitcoin::hashes::Hash as _;
     if hub.has_block(hash) {
         return true;
@@ -96,9 +110,57 @@ pub fn claim_ready(hub: &ChainHub, body: &mut BodyPresence, height: u32, hash: &
     }
     // Must be **this** hash at the height — first-wins BQ of a different block
     // is not claim-ready (mainnet tip+1 wrong-wire thrash / permanent hole).
-    hub.query
-        .block_queue_hash_at_height(height)
-        .is_some_and(|h| h == hash.to_byte_array())
+    queued().is_some_and(|h| h == hash.to_byte_array())
+}
+
+/// Queued hashes for one densify or tip-hole walk.
+///
+/// The copy is taken under one lock and records which heights had a row.
+/// A height missing from it stays missing for the walk. A listed height is
+/// read again, because confirm can dequeue it while the walk runs.
+#[doc(hidden)]
+pub struct QueuedHashSpan {
+    lo: u32,
+    hi: u32,
+    present: HashSet<u32>,
+}
+
+impl QueuedHashSpan {
+    #[doc(hidden)]
+    pub fn load(hub: &ChainHub, lo: u32, hi: u32) -> Self {
+        if lo > hi {
+            return Self {
+                lo: 1,
+                hi: 0,
+                present: HashSet::new(),
+            };
+        }
+        Self {
+            lo,
+            hi,
+            present: hub
+                .query
+                .block_queue_hashes_in_span(lo, hi)
+                .into_iter()
+                .map(|(height, _hash)| height)
+                .collect(),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn hash_at(&mut self, hub: &ChainHub, height: u32) -> Option<[u8; 32]> {
+        if height < self.lo || height > self.hi {
+            return hub.query.block_queue_hash_at_height(height);
+        }
+        if !self.present.contains(&height) {
+            return None;
+        }
+        let live = hub.query.block_queue_hash_at_height(height);
+        if live.is_none() {
+            self.present.remove(&height);
+        }
+        live
+    }
 }
 
 /// Count heights from tip+1 until the next in-hand body (fetch gap).
@@ -127,6 +189,7 @@ pub fn tip_fetch_hole_at(
         Some(t) => t.saturating_add(1),
     };
     let limit = path_lo.saturating_add(TIP_HOLE_SCAN_MAX);
+    let mut span = QueuedHashSpan::load(hub, path_lo, limit);
     let mut flags = Vec::new();
     for ht in path_lo..=limit {
         let Some(hash) = height_to_hash.occupant(ht) else {
@@ -135,7 +198,9 @@ pub fn tip_fetch_hole_at(
         if body.is_rejected(&hash) {
             break;
         }
-        flags.push(claim_ready(hub, body, ht, &hash));
+        flags.push(claim_ready_queued(hub, body, ht, &hash, || {
+            span.hash_at(hub, ht)
+        }));
     }
     tip_hole_from_claim_ready(&flags)
 }

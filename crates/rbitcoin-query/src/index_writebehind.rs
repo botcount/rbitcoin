@@ -155,6 +155,7 @@ pub fn prepare_live_indexes(query: &Query) -> Result<(), ConfirmError> {
 
 pub fn prepare_live_indexes_limited(query: &Query, max_heights: u32) -> Result<(), ConfirmError> {
     let tip_h = query.tip_height().map(|h| h.0);
+    refuse_pruned_tweak_gap(query, tip_h)?;
     if let Some(tip) = tip_h {
         let repair_f = repair_from(query.filter_index_next(), tip, max_heights);
         let repair_t = repair_from(query.tweak_index_next(), tip, max_heights);
@@ -169,7 +170,46 @@ pub fn prepare_live_indexes_limited(query: &Query, max_heights: u32) -> Result<(
             && index_caught_up(query.filter_index_next(), tip_h)
             && index_caught_up(query.tweak_index_next(), tip_h),
     );
+    query.set_tweak_follow(tweak_follow_for(query));
     Ok(())
+}
+
+/// A tweak watermark at or below the prune height cannot be rebuilt.
+/// Returns before any `read_index_window` of those heights.
+fn refuse_pruned_tweak_gap(query: &Query, tip: Option<u32>) -> Result<(), ConfirmError> {
+    if !query.prune_seqsigwit() {
+        return Ok(());
+    }
+    let Some(next) = query.tweak_index_next() else {
+        return Ok(());
+    };
+    let Some(tip) = tip else {
+        return Ok(());
+    };
+    if tip < query.sptweaks_origin().0 {
+        return Ok(());
+    }
+    let Some(ph) = query.witnessed_pruneheight() else {
+        return Ok(());
+    };
+    if next > ph {
+        return Ok(());
+    }
+    Err(ConfirmError::Store(rbitcoin_store::StoreError::Layout(
+        crate::sp_tweaks::SP_TWEAKS_PRUNE_BEFORE_TAPROOT.into(),
+    )))
+}
+
+/// Pruned tweaks append on the confirm thread when their watermark already
+/// follows the tip. Filters keep using [`Query::index_live`].
+#[doc(hidden)]
+pub fn tweak_follow_for(query: &Query) -> bool {
+    if !query.prune_seqsigwit() {
+        return false;
+    }
+    let next = query.tweak_index_next();
+    let tip = query.tip_height().map(|h| h.0);
+    next.is_some() && index_caught_up(next, tip)
 }
 
 #[doc(hidden)]

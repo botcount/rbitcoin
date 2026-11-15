@@ -124,9 +124,6 @@ pub fn taproot_matches_scan(
     scan_sk: &SecretKey,
     spend_keys: &[PublicKey],
 ) -> bool {
-    if outputs.is_empty() || spend_keys.is_empty() {
-        return false;
-    }
     let Ok(a) = PublicKey::from_slice(tweak_compressed) else {
         return false;
     };

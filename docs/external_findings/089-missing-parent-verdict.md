@@ -75,6 +75,14 @@ whether this node's read of the chain is complete.
   (about 1.7 GiB on mainnet, 2 MiB at a time), only on this reject path.
 - Open starts the drain watermark at the head's last create. Open
   already rebuilds or backfills `tx.head` through every Class A create.
+- A write that rejects after its Class A append has still inserted the
+  batch's creates into `tx.head`, and moves the drain watermark like a
+  write that connects. Before, only a connecting write moved it. An
+  archived retry of the same blocks queues no insert, so after a valid
+  block connected on its retry the drain stayed behind the fence until a
+  fresh write. A later block of that rejected write whose parent was
+  missing then waited 10 s twice, was an engine fault both times, and
+  halted IBD (found 2026-11-10).
 
 **Ways a read can miss a parent that exists, and why each is safe:**
 
@@ -87,6 +95,7 @@ whether this node's read of the chain is complete.
 | IBD rewind during the wait or read | Disconnect generation and tip are checked after the read: cascade |
 | IBD rewind after load drops the body, before apply | Apply's tip check fails: cascade, and the body is asked for again |
 | Drain behind the tip, or a failed drain re-queued | `head_covers_fence` is false: wait, then engine fault |
+| Write rejected after its append, valid block retried alone from the archive | The rejected write's insert moved the drain past its creates: the read runs |
 | Restart | Open backfills `tx.head`; the drain starts at its last create |
 | Power loss drops slot pages of the open tail, which then rolls and seals | `txid.body` scan of every unsealed segment finds the connected create: engine fault |
 | IBD stops during the scan | The scan ends as `Cancelled`: retry, not a verdict |
@@ -105,4 +114,8 @@ until restart. That is not changed here.
 `spend_of_a_create_the_head_lost_is_not_invalid`,
 `spend_of_a_create_the_head_lost_before_a_roll_is_not_invalid`,
 `verdict_applied_after_the_tip_moved_asks_for_the_body_again`,
-`batched_spend_of_a_later_block_is_rejected_alone`
+`batched_spend_of_a_later_block_is_rejected_alone`,
+`forward_spend_behind_a_valid_block_in_one_write_is_invalid`,
+`forward_spend_after_a_valid_block_connected_alone_is_invalid`;
+`rbitcoin-test`
+`consensus_rules::archived_retry_after_a_rejected_write_keeps_head_covering_the_fence`

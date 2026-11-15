@@ -12,6 +12,7 @@ cd "$ROOT"
 
 ./scripts/core-functional/init-submodule.sh
 "$HERE/bitcoind.test.sh"
+"$HERE/rpc_wallet.test.sh"
 "$HERE/warnet/Dockerfile.test.sh"
 "$HERE/map_debuglog_test.sh"
 "$HERE/rpc_util_validateaddress.test.sh"

@@ -593,7 +593,40 @@ assert "deps_started == 1" in between
 assert "[[ -f \"$deps_log\" ]]" not in text
 assert "--test-workspace" not in text
 assert "workspace-baseline.log" in text
+assert "show_baseline_failure" in text
+assert "grep -m 40" in text
+assert "tail -n 80 \"$OUT/workspace-baseline.log\"" in text
+assert "cat \"$OUT/workspace-baseline.log\"" not in text
 ' "$NIGHTLY"
+
+awk '/^show_baseline_failure\(\) \{/,/^}$/' "$NIGHTLY" >"$tmp/show-baseline.sh"
+cat >"$tmp/baseline-driver.sh" <<'EOF'
+set -euo pipefail
+source "$1"
+OUT="$2"
+show_baseline_failure "failed" 101
+exit 101
+EOF
+mkdir -p "$tmp/empty-out"
+printf '%s\n' 'running 1 test' 'test quiet ... ok' >"$tmp/empty-out/workspace-baseline.log"
+set +e
+bash "$tmp/baseline-driver.sh" "$tmp/show-baseline.sh" "$tmp/empty-out" >"$tmp/baseline-empty.out" 2>"$tmp/baseline-empty.err"
+empty_ec=$?
+set -e
+assert_ok "a baseline log with no failure line still exits with cargo status" \
+  test "$empty_ec" -eq 101
+assert_ok "a baseline log with no failure line still prints the tail" \
+  grep -q 'test quiet ... ok' "$tmp/baseline-empty.out"
+mkdir -p "$tmp/fail-out"
+printf '%s\n' 'test integrity::cleared_anchor_range_still_drops_the_tip ... FAILED' 'tail line' >"$tmp/fail-out/workspace-baseline.log"
+set +e
+bash "$tmp/baseline-driver.sh" "$tmp/show-baseline.sh" "$tmp/fail-out" >"$tmp/baseline-fail.out" 2>"$tmp/baseline-fail.err"
+fail_ec=$?
+set -e
+assert_ok "a baseline log with a failure line exits with cargo status" \
+  test "$fail_ec" -eq 101
+assert_ok "a baseline log with a failure line prints that line" \
+  grep -q 'cleared_anchor_range_still_drops_the_tip' "$tmp/baseline-fail.out"
 assert_ok "one job budget is 4 hours" \
   grep -q 'MUTANTS_BUDGET_SEC:-14400' "$NIGHTLY"
 assert_ok "missed mutants do not fail the nightly script" \
@@ -744,8 +777,8 @@ assert_ok "consensus mutants feature is the optional dep" \
   grep -q 'mutants = \["dep:mutants"\]' "$ROOT/crates/rbitcoin-consensus/Cargo.toml"
 assert_ok "query mutants feature is the optional dep" \
   grep -q 'mutants = \["dep:mutants"\]' "$ROOT/crates/rbitcoin-query/Cargo.toml"
-assert_ok "csv mask skip is behind the mutants feature" \
-  grep -q 'cfg_attr(feature = "mutants", mutants::skip)' \
+assert_ok "csv mask adds the type bit" \
+  grep -q '0x0000_ffff_u32.wrapping_add(type_bit)' \
   "$ROOT/crates/rbitcoin-consensus/src/script/interpreter.rs"
 assert_ok "parent stamp skip is behind the mutants feature" \
   grep -q 'cfg_attr(feature = "mutants", mutants::skip)' \

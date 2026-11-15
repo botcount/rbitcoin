@@ -1,3 +1,5 @@
+use std::mem::size_of;
+
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::encode::Encodable;
 use bitcoin::hashes::{sha256, sha256d, Hash};
@@ -189,6 +191,16 @@ fn tx_precompute_matches_zero_input_bip144() {
     assert!(TxPrecompute::from_tx(&tx).has_witness);
 }
 
+/// A connect row is stored at the connect size. A script row still
+/// carries `sha_prevouts`.
+#[test]
+fn connect_row_is_the_connect_size() {
+    assert_eq!(size_of::<TxPrecompute>(), size_of::<TxConnectPrecompute>(),);
+    let tx = p2wpkh_like();
+    let row = TxPrecompute::from_tx(&tx);
+    assert_eq!(row.sha_prevouts(), Some(oracle_sha_prevouts(&tx)));
+}
+
 #[test]
 fn from_tx_connect_omits_sighash_midstates() {
     assert_connect_matches_ids(&legacy_1in());
@@ -268,6 +280,26 @@ fn flag_zero_wire_is_one_slice() {
     assert_eq!(w.base_size, flag.base_size());
     assert_eq!(w.total_size, raw.len());
     assert!(TxPrecompute::from_tx_wire(&p2wpkh_like(), &raw, false).is_none());
+    assert!(flag_zero_wire(&raw));
+    let mut marker = raw;
+    marker[4] = 1;
+    assert!(!flag_zero_wire(&marker));
+    let mut with_out = flag.clone();
+    with_out.output.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::new(),
+    });
+    assert!(!flag_zero_tx(&with_out, &raw));
+    let mut empty_out = legacy_1in();
+    empty_out.output.clear();
+    let empty_raw = bitcoin::consensus::encode::serialize(&empty_out);
+    assert!(!flag_zero_tx(&empty_out, &empty_raw));
+    assert!(witness_wire(&empty_out, &empty_raw).is_none());
+    let legacy = legacy_1in();
+    let legacy_raw = bitcoin::consensus::encode::serialize(&legacy);
+    let spans = legacy_spans(&legacy, &legacy_raw).expect("legacy spans");
+    let (txid, _) = hash_wire_sighash(&legacy, &spans).expect("legacy sighash");
+    assert_eq!(txid, legacy.compute_txid().to_byte_array());
 }
 
 #[test]
@@ -312,15 +344,15 @@ fn sighash_midstates_come_from_wire_spans() {
     let tx = two_input_witness();
     let raw = serialize(&tx);
     let spans = witness_wire(&tx, &raw).expect("spans");
-    let (txid, mids) = hash_wire_sighash(&tx, &spans).expect("span sighash");
+    let (txid, [prev, seq, outs]) = hash_wire_sighash(&tx, &spans).expect("span sighash");
     assert_eq!(txid, tx.compute_txid().to_byte_array());
-    assert_eq!(mids[0], Some(oracle_sha_prevouts(&tx)));
-    assert_eq!(mids[1], Some(oracle_sha_sequences(&tx)));
-    assert_eq!(mids[2], Some(oracle_sha_outputs(&tx)));
+    assert_eq!(prev, oracle_sha_prevouts(&tx));
+    assert_eq!(seq, oracle_sha_sequences(&tx));
+    assert_eq!(outs, oracle_sha_outputs(&tx));
     let w = TxPrecompute::from_tx_wire(&tx, &raw, true).expect("wire");
-    assert_eq!(w.sha_prevouts(), mids[0]);
-    assert_eq!(w.sha_sequences(), mids[1]);
-    assert_eq!(w.sha_outputs(), mids[2]);
+    assert_eq!(w.sha_prevouts(), Some(prev));
+    assert_eq!(w.sha_sequences(), Some(seq));
+    assert_eq!(w.sha_outputs(), Some(outs));
     let mut prevouts = Vec::new();
     let mut sequences = Vec::new();
     for input in &tx.input {

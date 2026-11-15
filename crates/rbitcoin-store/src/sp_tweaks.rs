@@ -23,7 +23,7 @@
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::seg_pair::{locate, SegDirs, SegPair as Seg};
-use rbitcoin_primitives::{Height, TableKind};
+use rbitcoin_primitives::{le_u32, Height, TableKind};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -142,8 +142,8 @@ impl SpTweaksTable {
         }
         let mut prefix = [0u8; 8];
         meta.read_at(FILE_HEADER_LEN as u64, &mut prefix)?;
-        let origin = u32::from_le_bytes(prefix[..4].try_into().unwrap());
-        let fmt = u32::from_le_bytes(prefix[4..8].try_into().unwrap());
+        let origin = le_u32!(prefix, 0);
+        let fmt = le_u32!(prefix, 4);
         if fmt != IDX_FMT_SEG_TIP {
             return Err(StoreError::Corrupt("sp_tweaks idx format"));
         }
@@ -252,14 +252,14 @@ impl SpTweaksTable {
         let mut buf = vec![0u8; (n_offs as usize) * SLOT as usize];
         seg.idx
             .read_at(FILE_HEADER_LEN as u64 + local * SLOT, &mut buf)?;
-        let mut starts = Vec::with_capacity(n as usize);
-        for i in 0..n as usize {
-            let s = i * SLOT as usize;
-            starts.push(u32::from_le_bytes(buf[s..s + 4].try_into().unwrap()));
+        let (raw, _) = buf.as_chunks::<{ SLOT as usize }>();
+        let n_rows = n as usize;
+        let mut starts = Vec::with_capacity(n_rows);
+        for row in &raw[..n_rows] {
+            starts.push(le_u32!(row, 0));
         }
         let end = if need_next {
-            let s = n as usize * SLOT as usize;
-            u64::from(u32::from_le_bytes(buf[s..s + 4].try_into().unwrap()))
+            u64::from(le_u32!(raw[n_rows], 0))
         } else {
             seg.body.logical_len()
         };

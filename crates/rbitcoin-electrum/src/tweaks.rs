@@ -24,8 +24,8 @@ pub const SUBSCRIBE_CHUNK: Duration = Duration::from_secs(60);
 
 /// Omit served P2TR `output_pubkeys` with `value <=` this many sats.
 ///
-/// `0` serves every value. Default **1000**. **546** matches Cake electrs
-/// `sp_min_dust`. Index still stores every eligible tweak.
+/// `0` serves every value. Default **1000**. **545** matches Cake electrs
+/// `sp_min_dust` 546, which keeps `value >= 546`. Index still stores every eligible tweak.
 pub const DEFAULT_TWEAKS_MIN_DUST: u64 = 1000;
 
 #[doc(hidden)]
@@ -94,7 +94,26 @@ pub fn height_map_json(
     cut_through: bool,
     min_dust: u64,
 ) -> Result<String, String> {
-    let tip = query.tip_height().map(|t| t.0);
+    height_map_json_with_tip(
+        query,
+        chain,
+        h,
+        query.tip_height().map(|t| t.0),
+        cut_through,
+        min_dust,
+    )
+}
+
+/// Same map as [`height_map_json`], using `tip` instead of a second read.
+#[doc(hidden)]
+pub fn height_map_json_with_tip(
+    query: &Query,
+    chain: &ChainParams,
+    h: u32,
+    tip: Option<u32>,
+    cut_through: bool,
+    min_dust: u64,
+) -> Result<String, String> {
     if tip.is_none_or(|t| h > t) || !chain.taproot_active_at(h) {
         return Ok(empty_height_json(h));
     }
@@ -108,22 +127,42 @@ pub fn height_map_json(
             let rows = batch.pop().map(|(_, r)| r).unwrap_or_default();
             Ok(encode_thin_height_json(h, &rows, min_dust))
         }
+        Ok(_) if query.prune_seqsigwit() => match query.tweak_index_next() {
+            // Below the sealed watermark the index skipped this height.
+            Some(n) if h < n => Err("silent payment tweak index does not cover this height".into()),
+            None => Err("silent payment tweaks are unavailable with --prune-seqsigwit".into()),
+            // The tip moved before this height's row was sealed. The keep
+            // window still has the witness. An empty map would tell the
+            // client the height was scanned.
+            Some(_) => {
+                let mut tweaks = rbitcoin_query::tweaks_from_pruned_keep(query, Height(h))
+                    .map_err(|e| e.to_string())?;
+                if cut_through {
+                    retain_unspent_taproot(query, Height(h), &mut tweaks)?;
+                }
+                Ok(encode_height_map(h, &tweaks, min_dust))
+            }
+        },
         Ok(_) => {
             let mut tweaks =
                 tweaks_for_height(query, chain, Height(h)).map_err(|e| e.to_string())?;
             if cut_through {
                 retain_unspent_taproot(query, Height(h), &mut tweaks)?;
             }
-            let mut s = String::new();
-            s.push('{');
-            push_quoted_u32(&mut s, h);
-            s.push(':');
-            push_height_object_json(&mut s, &tweaks, min_dust);
-            s.push('}');
-            Ok(s)
+            Ok(encode_height_map(h, &tweaks, min_dust))
         }
         Err(e) => Err(e.to_string()),
     }
+}
+
+fn encode_height_map(h: u32, tweaks: &BTreeMap<[u8; 32], TxTweak>, min_dust: u64) -> String {
+    let mut s = String::new();
+    s.push('{');
+    push_quoted_u32(&mut s, h);
+    s.push(':');
+    push_height_object_json(&mut s, tweaks, min_dust);
+    s.push('}');
+    s
 }
 
 /// Electrum notify line for one height (json-rpc wrapper + newline not included).
@@ -455,7 +494,6 @@ fn push_quoted_u32(s: &mut String, n: u32) {
 
 fn push_hex(s: &mut String, data: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    s.reserve(data.len() * 2);
     for &b in data {
         s.push(HEX[(b >> 4) as usize] as char);
         s.push(HEX[(b & 0xf) as usize] as char);

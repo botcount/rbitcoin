@@ -162,9 +162,10 @@ impl Reader<'_> {
     }
 
     fn array<const N: usize>(&mut self) -> Result<[u8; N], String> {
-        self.take(N)?
-            .try_into()
-            .map_err(|_| "end of data".to_string())
+        let taken = self.take(N)?;
+        let mut out = [0u8; N];
+        out.copy_from_slice(taken);
+        Ok(out)
     }
 
     fn u64(&mut self) -> Result<u64, String> {

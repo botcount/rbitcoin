@@ -38,6 +38,14 @@ pub struct WorkStructureSizes {
     pub body: BodyPresenceSizes,
 }
 
+/// One peer that has been sent getdata for this hash.
+#[derive(Debug, Clone)]
+struct Holder {
+    peer: usize,
+    asked_at: Instant,
+    retired: bool,
+}
+
 /// Outstanding getdata for one block hash (one or more peers).
 ///
 /// Near/far densify use a single peer. Tip-hole hashes race up to
@@ -52,15 +60,11 @@ pub struct WorkStructureSizes {
 /// [`super::assign::TIP_HOLE_RX_STALE`], a retired peer is not asked for it again.
 /// Retired peers count toward the ask cap once a racer is live. A retired-only
 /// set is not coverage: cover still places a racer when holders are already
-/// at the cap.
+/// at the cap. The holders share one list.
 #[derive(Debug, Clone)]
 pub struct InflightReq {
-    /// Racing owners.
-    pub peers: HashSet<usize>,
-    /// When each racing owner was asked.
-    pub asked_at: HashMap<usize, Instant>,
-    /// Dropped from the race; still holding the getdata.
-    pub retired: HashSet<usize>,
+    /// First-ask order. A peer is in the list once.
+    holders: Vec<Holder>,
     /// When this hash first entered global inflight (stale tip-hole re-get).
     pub started_at: Instant,
 }
@@ -68,9 +72,7 @@ pub struct InflightReq {
 impl Default for InflightReq {
     fn default() -> Self {
         Self {
-            peers: HashSet::new(),
-            asked_at: HashMap::new(),
-            retired: HashSet::new(),
+            holders: Vec::new(),
             started_at: Instant::now(),
         }
     }
@@ -83,55 +85,121 @@ impl InflightReq {
         r
     }
 
+    fn slot(&self, peer: usize) -> Option<&Holder> {
+        self.holders.iter().find(|h| h.peer == peer)
+    }
+
+    fn slot_mut(&mut self, peer: usize) -> Option<&mut Holder> {
+        self.holders.iter_mut().find(|h| h.peer == peer)
+    }
+
+    /// Racing owner.
+    pub fn is_racing(&self, peer: usize) -> bool {
+        self.slot(peer).is_some_and(|h| !h.retired)
+    }
+
+    /// Dropped from the race; still holding the getdata.
+    pub fn is_retired(&self, peer: usize) -> bool {
+        self.slot(peer).is_some_and(|h| h.retired)
+    }
+
+    /// Racing owners, in first-ask order.
+    pub fn racing(&self) -> impl Iterator<Item = usize> + '_ {
+        self.holders.iter().filter(|h| !h.retired).map(|h| h.peer)
+    }
+
+    /// Racing owners as a set. Tests compare membership; assign does not.
+    #[doc(hidden)]
+    pub fn racing_set(&self) -> HashSet<usize> {
+        self.racing().collect()
+    }
+
+    /// Retired holders, in first-ask order.
+    pub fn retired_ids(&self) -> impl Iterator<Item = usize> + '_ {
+        self.holders.iter().filter(|h| h.retired).map(|h| h.peer)
+    }
+
+    /// Every peer already sent this getdata.
+    pub fn holder_ids(&self) -> impl Iterator<Item = usize> + '_ {
+        self.holders.iter().map(|h| h.peer)
+    }
+
+    pub fn retired_is_empty(&self) -> bool {
+        self.holders.iter().all(|h| !h.retired)
+    }
+
     /// Racing or retired: `peer` has been sent this getdata and not answered.
     pub fn holds(&self, peer: usize) -> bool {
-        self.peers.contains(&peer) || self.retired.contains(&peer)
+        self.slot(peer).is_some()
     }
 
     /// Racing owners only.
     pub fn len(&self) -> usize {
-        self.peers.len()
+        self.holders.iter().filter(|h| !h.retired).count()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.peers.is_empty()
+        self.len() == 0
     }
 
     /// Racing and retired: every peer already sent this getdata.
     pub fn holders(&self) -> usize {
-        self.peers.len() + self.retired.len()
+        self.holders.len()
     }
 
-    /// Returns true if `peer` was newly added.
+    /// Returns true if `peer` was newly added as a racer.
     pub fn add_peer(&mut self, peer: usize) -> bool {
-        self.retired.remove(&peer);
-        let added = self.peers.insert(peer);
-        if added {
-            self.asked_at.insert(peer, Instant::now());
+        if let Some(slot) = self.slot_mut(peer) {
+            if slot.retired {
+                slot.retired = false;
+                slot.asked_at = Instant::now();
+                return true;
+            }
+            return false;
         }
-        added
+        self.holders.push(Holder {
+            peer,
+            asked_at: Instant::now(),
+            retired: false,
+        });
+        true
     }
 
     /// When racing or retired owner `peer` was asked.
     pub fn owner_asked_at(&self, peer: usize) -> Option<Instant> {
-        self.asked_at.get(&peer).copied()
+        self.slot(peer).map(|h| h.asked_at)
+    }
+
+    /// Ask time of a peer that already holds this getdata.
+    pub(crate) fn holder_asked_at(&self, peer: usize) -> Instant {
+        self.slot(peer)
+            .map(|h| h.asked_at)
+            .expect("peer holds this getdata")
+    }
+
+    /// Test seam: age an existing holder's ask.
+    #[doc(hidden)]
+    pub fn set_asked_at(&mut self, peer: usize, at: Instant) {
+        if let Some(slot) = self.slot_mut(peer) {
+            slot.asked_at = at;
+        }
     }
 
     /// Stop counting `peer` as a racer. It keeps the request and its ask time,
     /// so a racerless hash can re-ask it once the hold has aged out.
     pub fn retire_peer(&mut self, peer: usize) {
-        if self.peers.remove(&peer) {
-            self.retired.insert(peer);
+        if let Some(slot) = self.slot_mut(peer) {
+            slot.retired = true;
         }
     }
 
     /// `peer` no longer holds the request (answered, notfound, or gone).
     /// Returns true if no holder remains (caller should drop the hash).
     pub fn remove_peer(&mut self, peer: usize) -> bool {
-        self.peers.remove(&peer);
-        self.asked_at.remove(&peer);
-        self.retired.remove(&peer);
-        self.peers.is_empty() && self.retired.is_empty()
+        if let Some(i) = self.holders.iter().position(|h| h.peer == peer) {
+            self.holders.remove(i);
+        }
+        self.holders.is_empty()
     }
 }
 
@@ -145,6 +213,19 @@ pub struct ConfirmedLocatorTail {
     pub hash: Option<[u8; 32]>,
     /// Each locator hash with its height.
     pub entries: Vec<(u32, BlockHash)>,
+}
+
+/// Why the next confirm drain drops in-channel plans.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConfirmQuiesce {
+    #[default]
+    /// Confirm is keeping up with the tip.
+    Live,
+    /// The header walk rewound. The confirmed tip did not move, so the lead
+    /// stays reserved.
+    Plan,
+    /// The confirmed tip moved. Reservations above it go back to the lead.
+    Refund,
 }
 
 /// Core mutable state for the IBD event loop.
@@ -205,7 +286,9 @@ pub struct IbdWorkState {
     /// First time confirm rejected without tip progress (download gate timer).
     pub confirm_stuck_since: Option<Instant>,
     /// Set by header-work rewind/plant so the main loop can drop in-channel plans.
-    pub confirm_quiesce: bool,
+    /// [`ConfirmQuiesce::Plan`] keeps the lead reserved. [`ConfirmQuiesce::Refund`]
+    /// is a confirmed rewind.
+    pub confirm_quiesce: ConfirmQuiesce,
     /// Repeated Cascade at the same tip for the same hash → escalate to halt.
     pub cascade_at: Option<(BlockHash, [u8; 32], u8)>,
     /// Tip-child BadPrev retries. Another block's soft reject does not clear this.
@@ -259,6 +342,18 @@ pub fn enqueue_header_cmd(st: &mut IbdWorkState, cmd: HeaderCmd) {
 }
 
 impl IbdWorkState {
+    /// Header walk rewound. A confirmed rewind already recorded keeps its refund.
+    pub fn quiesce_plan(&mut self) {
+        if self.confirm_quiesce != ConfirmQuiesce::Refund {
+            self.confirm_quiesce = ConfirmQuiesce::Plan;
+        }
+    }
+
+    /// Confirmed tip moved. The next drain returns reservations above that tip.
+    pub fn quiesce_refund(&mut self) {
+        self.confirm_quiesce = ConfirmQuiesce::Refund;
+    }
+
     pub fn new(slots: Vec<PeerSlot>, tip_hash: Option<BlockHash>, tip_height: Option<u32>) -> Self {
         let mut known_headers = HashSet::new();
         let mut hash_height = HashMap::new();
@@ -308,7 +403,7 @@ impl IbdWorkState {
             engine_fault_seen: HashSet::new(),
             halt: None,
             confirm_stuck_since: None,
-            confirm_quiesce: false,
+            confirm_quiesce: ConfirmQuiesce::Live,
             cascade_at: None,
             tip_child_bad_prev: None,
             intake_stop: u64::MAX,

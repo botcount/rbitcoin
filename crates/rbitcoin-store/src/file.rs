@@ -35,7 +35,7 @@
 
 use crate::error::StoreError;
 use crate::io_handle::IoHandle;
-use rbitcoin_primitives::{schema_file_openable, TableKind, SCHEMA_VERSION, STORE_MAGIC};
+use rbitcoin_primitives::{le_u64, schema_file_openable, TableKind, SCHEMA_VERSION, STORE_MAGIC};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -60,16 +60,34 @@ pub fn tmp_sidecar_path(path: &Path) -> PathBuf {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TmpSync {
+    None,
+    /// File `sync_all` only. The caller syncs the parent directory.
+    File,
+    /// File `sync_all`, then `fsync` the parent directory.
+    FileAndDir,
+}
+
 /// Write `bytes` to a sibling tmp, then rename over `path`. No `sync_all`.
 pub fn write_tmp_rename(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    write_tmp_file(path, false, |f| {
+    write_tmp_synced(path, TmpSync::None, |f| {
         f.write_all(bytes).map_err(|e| StoreError::io(path, e))
     })
 }
 
 /// Write `bytes` to a sibling tmp, `sync_all`, then rename over `path`.
 pub fn write_synced_tmp_rename(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    write_tmp_file(path, true, |f| {
+    write_tmp_synced(path, TmpSync::FileAndDir, |f| {
+        f.write_all(bytes).map_err(|e| StoreError::io(path, e))
+    })
+}
+
+/// Write `bytes` to a sibling tmp and `sync_all` the file before rename.
+///
+/// The parent directory is left unsynced so a batch can fsync it once.
+pub fn write_file_synced_tmp_rename(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    write_tmp_synced(path, TmpSync::File, |f| {
         f.write_all(bytes).map_err(|e| StoreError::io(path, e))
     })
 }
@@ -81,11 +99,26 @@ pub fn write_synced_tmp_file<F>(path: &Path, write: F) -> Result<(), StoreError>
 where
     F: FnOnce(&mut File) -> Result<(), StoreError>,
 {
-    write_tmp_file(path, true, write)
+    write_tmp_synced(path, TmpSync::FileAndDir, write)
 }
 
 #[doc(hidden)]
 pub fn write_tmp_file<F>(path: &Path, sync: bool, write: F) -> Result<(), StoreError>
+where
+    F: FnOnce(&mut File) -> Result<(), StoreError>,
+{
+    write_tmp_synced(
+        path,
+        if sync {
+            TmpSync::FileAndDir
+        } else {
+            TmpSync::None
+        },
+        write,
+    )
+}
+
+fn write_tmp_synced<F>(path: &Path, sync: TmpSync, write: F) -> Result<(), StoreError>
 where
     F: FnOnce(&mut File) -> Result<(), StoreError>,
 {
@@ -98,12 +131,12 @@ where
     {
         let mut f = File::create(&tmp).map_err(|e| StoreError::io(&tmp, e))?;
         write(&mut f)?;
-        if sync {
+        if sync != TmpSync::None {
             f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
         }
     }
     std::fs::rename(&tmp, path).map_err(|e| StoreError::io(path, e))?;
-    if sync {
+    if sync == TmpSync::FileAndDir {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
@@ -120,12 +153,98 @@ where
 pub fn fsync_parent_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        std::fs::File::open(dir)?.sync_all()
+        #[cfg(debug_assertions)]
+        if fail_dir_sync() {
+            return Err(std::io::Error::other("injected directory sync failure"));
+        }
+        let result = std::fs::File::open(dir)?.sync_all();
+        #[cfg(debug_assertions)]
+        if result.is_ok() {
+            note_fsynced_dir(dir);
+        }
+        result
     }
     #[cfg(not(unix))]
     {
         let _ = dir;
         Ok(())
+    }
+}
+
+/// Record directories passed to [`fsync_parent_dir`] on this thread.
+///
+/// Debug tests use this to check that `store/` is synced after
+/// `seqsigwit.window` exists. A release build does not record.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_fsync_dir_trace() {
+    FSYNC_TRACE.with(|on| on.set(true));
+    FSYNC_DIRS.with(|dirs| dirs.borrow_mut().clear());
+}
+
+/// Stop recording and return the directories synced since [`arm_fsync_dir_trace`].
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn take_fsynced_dirs() -> Vec<PathBuf> {
+    FSYNC_TRACE.with(|on| on.set(false));
+    FSYNC_DIRS.with(|dirs| std::mem::take(&mut *dirs.borrow_mut()))
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static FSYNC_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FSYNC_DIRS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Let `skip` directory syncs succeed, then fail the next `times` on this thread.
+///
+/// Debug tests use this for a rename that is already visible when only the
+/// parent-directory sync fails. A release build cannot arm it.
+#[cfg(all(debug_assertions, unix))]
+#[doc(hidden)]
+pub fn arm_fail_dir_sync_after(skip: u32, times: u32) {
+    DIR_SYNC_SKIP.with(|c| c.set(skip));
+    DIR_SYNC_FAIL.with(|c| c.set(times));
+}
+
+#[cfg(all(debug_assertions, unix))]
+fn fail_dir_sync() -> bool {
+    let skipping = DIR_SYNC_SKIP.with(|c| {
+        let n = c.get();
+        if n == 0 {
+            false
+        } else {
+            c.set(n - 1);
+            true
+        }
+    });
+    if skipping {
+        return false;
+    }
+    DIR_SYNC_FAIL.with(|c| {
+        let n = c.get();
+        if n == 0 {
+            false
+        } else {
+            c.set(n - 1);
+            true
+        }
+    })
+}
+
+#[cfg(all(debug_assertions, unix))]
+thread_local! {
+    static DIR_SYNC_SKIP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static DIR_SYNC_FAIL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+// Only Unix calls this. Windows `fsync_parent_dir` is a no-op, and a
+// private helper with no caller fails `-D warnings` there.
+#[cfg(all(debug_assertions, unix))]
+fn note_fsynced_dir(dir: &Path) {
+    if FSYNC_TRACE.with(|on| on.get()) {
+        FSYNC_DIRS.with(|dirs| dirs.borrow_mut().push(dir.to_path_buf()));
     }
 }
 
@@ -438,7 +557,7 @@ impl TableFile {
                 got,
             });
         }
-        let logical = u64::from_le_bytes(footer[8..16].try_into().unwrap());
+        let logical = le_u64!(footer, 8);
         if logical < TRAILING_FOOTER_LEN as u64 || logical > file_len {
             return Err(StoreError::Corrupt("trailing-header logical length"));
         }
@@ -497,7 +616,7 @@ impl TableFile {
         }
 
         let file_len = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
-        let mut logical = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        let mut logical = le_u64!(header, 8);
         if logical < FILE_HEADER_LEN as u64 {
             logical = FILE_HEADER_LEN as u64;
         }
@@ -543,6 +662,13 @@ impl TableFile {
         self.io_handle()
     }
 
+    /// Handle of the locked write fd, the one `fallocate` runs on.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn write_handle(&self) -> crate::io_handle::IoHandle {
+        crate::io_handle::IoHandle::from_file(&self.file.lock().unwrap())
+    }
+
     /// Portable handle for the completion session (lock-free; do not close).
     #[inline]
     pub fn io_handle(&self) -> crate::io_handle::IoHandle {
@@ -570,6 +696,19 @@ impl TableFile {
             self.publish_prefixed_len(logical)?;
         }
         self.needs_sync.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Publish `logical` and drop the file allocation past it.
+    ///
+    /// [`Self::set_logical_len`] leaves the fallocated tail in place. Prune
+    /// uses this so the bytes come back.
+    pub fn release_to_len(&self, logical: u64) -> Result<(), StoreError> {
+        self.set_logical_len(logical)?;
+        let file = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        set_file_len(&file, &self.path, logical)?;
+        drop(file);
+        self.file_cap.store(logical, Ordering::Release);
         Ok(())
     }
 
@@ -941,12 +1080,12 @@ impl TableFile {
         let policy = self.grow_policy.load(Ordering::Acquire);
         if policy == GrowPolicy::Tight1MiB as u8 {
             let target = need.saturating_add(1 << 20).max(need);
-            return self.grow_to(target);
+            return self.grow_to_at_least(target, need);
         }
         if policy == GrowPolicy::Align64k as u8 {
             const STEP: u64 = 64 * 1024;
             let target = need.div_ceil(STEP).saturating_mul(STEP).max(need);
-            return self.grow_to(target);
+            return self.grow_to_at_least(target, need);
         }
         let (headroom, step) = if cur >= 8 * 1024 * 1024 * 1024 {
             (1024 * 1024 * 1024u64, 512 * 1024 * 1024u64)
@@ -967,12 +1106,28 @@ impl TableFile {
                 .saturating_mul(step)
                 .max(need)
         };
-        self.grow_to(new_cap)
+        self.grow_to_at_least(new_cap, need)
     }
 
     /// Fallocate/`set_len` to `new_cap` and publish `file_cap`.
     #[doc(hidden)]
     pub fn grow_to(&self, new_cap: u64) -> Result<(), StoreError> {
+        self.grow_to_at_least(new_cap, new_cap)
+    }
+
+    /// Grow to `new_cap`, or when the disk cannot hold that, to `need`.
+    ///
+    /// Fails, with the length and `file_cap` unchanged, when even `need`
+    /// cannot be reserved. If the rollback truncate itself fails (after
+    /// retrying EINTR) the file may stay longer than `file_cap` and that
+    /// truncate error is returned instead of the allocation error. The
+    /// failure holds only where `fallocate` reports it. Where `fallocate` is
+    /// missing (Darwin, Windows, or a Linux filesystem answering EOPNOTSUPP,
+    /// ENOSYS or EINVAL) the file is extended sparsely and a full disk shows
+    /// up on a later page write.
+    #[doc(hidden)]
+    pub fn grow_to_at_least(&self, new_cap: u64, need: u64) -> Result<(), StoreError> {
+        let need = need.min(new_cap);
         if new_cap <= self.file_cap.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -987,13 +1142,45 @@ impl TableFile {
         if new_cap <= self.file_cap.load(Ordering::Acquire) {
             return Ok(());
         }
-        if try_fallocate(&file, new_cap).is_err()
-            || file.metadata().map(|m| m.len()).unwrap_or(0) < new_cap
-        {
-            set_file_len(&file, &self.path, new_cap)?;
-        }
+        let before = file
+            .metadata()
+            .map_err(|e| StoreError::io(&self.path, e))?
+            .len();
+        // Try the slab first, then the smaller `need` that the caller must
+        // have. A failed `fallocate` is not atomic: it can leave a longer
+        // file with the blocks kept, so each failure is rolled back before
+        // the next try, and `file_cap` never moves on a failure.
+        let mut target = new_cap;
+        let reached = loop {
+            match try_fallocate(&file, target) {
+                Ok(()) => break target,
+                // No `fallocate` here: reserve nothing, extend the length.
+                // This can leave a sparse file, and a later page write can
+                // still hit a full disk.
+                Err(e) if fallocate_unsupported(&e) => {
+                    if file.metadata().map(|m| m.len()).unwrap_or(0) < target {
+                        set_file_len(&file, &self.path, target)?;
+                    }
+                    break target;
+                }
+                // ENOSPC, EDQUOT or any other failure must stop here, before
+                // the caller frees or overwrites anything. A sparse
+                // `set_len` would defer the error to a later page write.
+                Err(e) => {
+                    // If the undo fails the length is unknown, so report that
+                    // error rather than the allocation one.
+                    rollback_len(|| file.set_len(before))
+                        .map_err(|re| StoreError::io(&self.path, re))?;
+                    if target > need {
+                        target = need;
+                        continue;
+                    }
+                    return Err(StoreError::io(&self.path, e));
+                }
+            }
+        };
         drop(file);
-        self.file_cap.store(new_cap, Ordering::Release);
+        self.file_cap.store(reached, Ordering::Release);
         Ok(())
     }
 
@@ -1240,17 +1427,70 @@ pub fn ensure_nofile_budget_at_least(want_soft: u64) -> (u64, u64) {
     }
 }
 
+/// The platform or filesystem has no `fallocate`: the non-Linux stub, or
+/// `EOPNOTSUPP`, `ENOSYS`, `EINVAL`. Only these may fall back to `set_len`.
+/// Any other error, ENOSPC and EDQUOT included, is a real failure.
+#[doc(hidden)]
+pub fn fallocate_unsupported(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(
+            e.raw_os_error(),
+            Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EINVAL)
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// One `fallocate(2)` call, mode 0, no retry.
+#[cfg(target_os = "linux")]
+fn fallocate_once(file: &File, len: u64) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let raw = |len: u64| {
+        // SAFETY: `file` is open. Mode 0 allocates `[0, len)`.
+        let rc = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, len as i64) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    #[cfg(debug_assertions)]
+    if let Some(e) = crate::io_handle::injected_fallocate_fault(IoHandle::from_file(file), len, raw)
+    {
+        return Err(e);
+    }
+    raw(len)
+}
+
+/// Run the rollback truncate, retrying when a signal interrupts it.
+#[doc(hidden)]
+pub fn rollback_len(mut truncate: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    loop {
+        match truncate() {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            r => return r,
+        }
+    }
+}
+
+/// Reserve `[0, len)` with `fallocate`, retrying when a signal interrupts it.
 #[doc(hidden)]
 pub fn try_fallocate(file: &File, len: u64) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::io::AsRawFd;
-        // SAFETY: `file` is open. Mode 0 allocates `[0, len)`.
-        let rc = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, len as i64) };
-        if rc == 0 {
-            return Ok(());
+        loop {
+            match fallocate_once(file, len) {
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                r => return r,
+            }
         }
-        Err(std::io::Error::last_os_error())
     }
     #[cfg(not(target_os = "linux"))]
     {

@@ -248,11 +248,21 @@ fn pin_validate_refusals(td: &TestDatadir) {
     for (name, args) in [
         ("chainwork-not-hex", &["--min-chain-work=test"][..]),
         ("challenge-off-signet", &["--signet-challenge", "51"]),
-        ("tweaks-and-pruning", &["--sp-tweaks", "--prune-seqsigwit"]),
         ("metrics-without-health", &["--metrics"]),
     ] {
         assert!(exit_is(smoke(td, name, args), 1), "{name} must refuse");
     }
+    assert!(
+        exit_is(
+            smoke(
+                td,
+                "tweaks-and-pruning",
+                &["--sp-tweaks", "--prune-seqsigwit"]
+            ),
+            0
+        ),
+        "fresh datadir smokes with both flags"
+    );
     let d = td.path().join("signet-time-no-challenge");
     assert!(exit_is(
         node(&[
@@ -920,10 +930,13 @@ fn pin_disconnect_logs_and_rewinds_ibd_marks(q: &Query, top: u32, top_hash: &[u8
         "DisconnectTip: hash={} height={top} tx=1",
         BlockHash::from_byte_array(*top_hash)
     );
+    let disconnects = logs
+        .iter()
+        .filter(|(_, m)| m.contains("DisconnectTip:"))
+        .collect::<Vec<_>>();
     assert!(
-        logs.iter()
-            .any(|(l, m)| *l == rbitcoin_log::Level::Warn && m.contains(&line)),
-        "{logs:?}"
+        matches!(disconnects[..], [(rbitcoin_log::Level::Warn, m)] if m.contains(&line)),
+        "one DisconnectTip line per block: {logs:?}"
     );
     assert_eq!(q.lookup_taken_hi(), Some(top - 1));
     assert_eq!(q.lookup_started_hi(), Some(top - 1));
@@ -3008,13 +3021,14 @@ fn block_cache_and_mempool_hub_surface() {
     let cache = BlockCache::with_body_depth(4);
     assert!(cache.is_empty());
     assert!(cache.tip_height().is_none());
-    for b in &blocks {
-        cache.push_best(b.clone()).unwrap();
+    for (h, b) in (0u32..).zip(&blocks) {
+        cache.push_best(h, b.clone());
     }
     assert!(!cache.is_empty());
     assert_eq!(cache.tip_hash(), Some(tip));
     assert_eq!(cache.tip_height(), Some(maturity + 1));
     assert!(cache.get_block(&tip).is_some());
+    assert!(cache.has_body(&tip));
     assert!(cache.get_header(&tip).is_some());
     assert!(cache.hash_at_height(0).is_some());
     assert!(cache.header_at_height(maturity + 1).is_some());
@@ -3023,17 +3037,23 @@ fn block_cache_and_mempool_hub_surface() {
         cache.get_block(&blocks[0].block_hash()).is_none(),
         "body depth eviction"
     );
+    assert!(!cache.has_body(&blocks[0].block_hash()));
     assert!(cache.hash_at_height(0).is_some(), "hash chain retained");
     let genesis_hash = cache.hash_at_height(0).unwrap();
     let stop = BlockHash::from_byte_array([0u8; 32]);
     let hdrs = cache.headers_after_locator(&[genesis_hash], stop);
     assert!(!hdrs.is_empty());
     assert_ne!(hdrs[0].block_hash(), genesis_hash);
+    cache.truncate_to_height(2);
+    assert_eq!(cache.tip_height(), Some(2));
     let mut bad = blocks.last().unwrap().clone();
     bad.header.prev_blockhash = BlockHash::from_byte_array([0xee; 32]);
-    assert!(cache.push_best(bad).is_err());
-    cache.truncate_to_height(2);
-    assert!(cache.tip_height().unwrap() <= 2);
+    cache.push_best(3, bad.clone());
+    assert_eq!(cache.tip_hash(), Some(bad.block_hash()));
+    assert!(
+        cache.hash_at_height(2).is_none(),
+        "a block that does not link restarts the list at its height"
+    );
     cache.clear();
     assert!(cache.is_empty());
     let empty = BlockCache::new();
@@ -3381,11 +3401,23 @@ fn pin_wire_prep_ahead_cross_batch(
     assert!(plan_a.edges[&plan_a.planned_fks[0].0][0]
         .create_fk
         .is_null());
-    let same_batch: Vec<_> = plan_a
-        .same_batch_spent_overlay()
-        .into_iter()
-        .flatten()
-        .collect();
+    let image = plan_a.same_batch_spent_overlay().expect("overlay");
+    let mut same_batch = Vec::new();
+    for w in image.offs().windows(2) {
+        let mut off = w[0];
+        let mut vout = 0u32;
+        while off + rbitcoin_store::OutputRecord::SPENT_SLOT_LEN <= w[1] {
+            let (_flags, fk, vin) = rbitcoin_store::tx_table::decode_spent_slot(
+                &image.bytes()[off..off + rbitcoin_store::OutputRecord::SPENT_SLOT_LEN],
+            )
+            .expect("slot");
+            if !fk.is_null() {
+                same_batch.push((vout, fk, vin));
+            }
+            off += rbitcoin_store::OutputRecord::SPENT_SLOT_LEN;
+            vout += 1;
+        }
+    }
     assert_eq!(
         same_batch,
         [(0, plan_a.planned_fks[2], 0)],

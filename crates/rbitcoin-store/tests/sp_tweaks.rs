@@ -339,6 +339,47 @@ fn hole_vs_empty_eligible() {
 }
 
 #[test]
+fn open_reads_origin_and_refuses_a_short_meta() {
+    let dir = tmp_dir();
+    let t = SpTweaksTable::create(&dir, Height(11)).unwrap();
+    drop(t);
+    let t = SpTweaksTable::open(&dir).unwrap();
+    assert_eq!(t.origin_height(), Height(11));
+    drop(t);
+
+    set_file_hwm(
+        &SpTweaksTable::meta_path(dir.path()),
+        FILE_HEADER_LEN as u64 + 4,
+    );
+    let err = match SpTweaksTable::open(&dir) {
+        Ok(_) => panic!("open accepted a short meta"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, StoreError::Corrupt(m) if m.contains("meta short")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn open_refuses_a_foreign_idx_format() {
+    let dir = tmp_dir();
+    SpTweaksTable::create(&dir, Height(11)).unwrap();
+    let meta = SpTweaksTable::meta_path(dir.path());
+    let mut raw = fs::read(&meta).unwrap();
+    raw[FILE_HEADER_LEN + 4..FILE_HEADER_LEN + 8].copy_from_slice(&9u32.to_le_bytes());
+    fs::write(&meta, &raw).unwrap();
+    let err = match SpTweaksTable::open(&dir) {
+        Ok(_) => panic!("open accepted a foreign idx format"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, StoreError::Corrupt(m) if m.contains("idx format")),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn truncate_above_and_reopen() {
     let dir = tmp_dir();
     let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
@@ -478,4 +519,28 @@ fn get_two_heights_uses_next_slot_off() {
         vec![None, None]
     );
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_offs_run_reads_the_next_slot() {
+    let dir = tmp_dir();
+    let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+    t.put_block(Height(0), &[None]).unwrap();
+    t.put_block(Height(1), &[None, None]).unwrap();
+    let g = t.lock();
+    let seg = &g.segs[0];
+    let (starts, end) = SpTweaksTable::read_offs_run(seg, 0, 1).unwrap();
+    assert_eq!(starts, vec![FILE_HEADER_LEN as u32]);
+    assert_eq!(end, FILE_HEADER_LEN as u64 + 1);
+    let (starts, end) = SpTweaksTable::read_offs_run(seg, 1, 1).unwrap();
+    assert_eq!(starts, vec![FILE_HEADER_LEN as u32 + 1]);
+    assert_eq!(end, seg.body.logical_len());
+    let err = match SpTweaksTable::read_offs_run(seg, 0, 3) {
+        Ok(_) => panic!("run accepted a past-segment read"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, StoreError::Corrupt(m) if m.contains("run past segment")),
+        "{err:?}"
+    );
 }

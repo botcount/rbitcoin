@@ -5,6 +5,7 @@
 
 use crate::bdz::BdzMphf;
 use crate::error::StoreError;
+use rbitcoin_primitives::{le_u16, le_u32};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -184,28 +185,27 @@ pub fn read_mlt(path: &Path) -> Result<HashMap<u32, Vec<u32>>, StoreError> {
         return Ok(HashMap::new());
     }
     let buf = std::fs::read(path).map_err(|e| StoreError::io(path, e))?;
-    if buf.len() < 4 {
+    let Some(count) = buf.first_chunk::<4>() else {
         return Err(StoreError::Corrupt("tx.head mlt short"));
-    }
-    let n = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
-    let mut i = 4usize;
+    };
+    let n = le_u32!(count, 0) as usize;
+    let mut rest = &buf[4..];
     let mut out = HashMap::new();
     for _ in 0..n {
-        if i + 6 > buf.len() {
+        let Some((head, next)) = rest.split_first_chunk::<6>() else {
             return Err(StoreError::Corrupt("tx.head mlt truncated"));
-        }
-        let slot = u32::from_le_bytes(buf[i..i + 4].try_into().unwrap());
-        i += 4;
-        let nrel = u16::from_le_bytes(buf[i..i + 2].try_into().unwrap()) as usize;
-        i += 2;
-        if i + nrel * 4 > buf.len() {
+        };
+        let slot = le_u32!(head, 0);
+        let nrel = le_u16!(head, 4) as usize;
+        rest = next;
+        let rel_len = nrel * 4;
+        if rest.len() < rel_len {
             return Err(StoreError::Corrupt("tx.head mlt rels"));
         }
-        let mut rels = Vec::with_capacity(nrel);
-        for _ in 0..nrel {
-            rels.push(u32::from_le_bytes(buf[i..i + 4].try_into().unwrap()));
-            i += 4;
-        }
+        let (rels_buf, next) = rest.split_at(rel_len);
+        rest = next;
+        let (cells, _) = rels_buf.as_chunks::<4>();
+        let rels = cells.iter().map(|cell| le_u32!(cell, 0)).collect();
         out.insert(slot, rels);
     }
     Ok(out)

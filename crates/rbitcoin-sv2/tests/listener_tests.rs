@@ -1,13 +1,12 @@
-use crate::test_chain::shared_regtest;
+use crate::test_chain::{shared_regtest, test_tp_config};
 use common_messages_sv2::{
     SetupConnectionError, SetupConnectionSuccess, MESSAGE_TYPE_SETUP_CONNECTION_ERROR,
     MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
 };
 use rbitcoin_sv2::testutil::TpClient;
 use rbitcoin_sv2::{
-    run_sv2_tp, Sv2TpConfig, CONSTRAINTS_COOLDOWN_TEST, FEE_DELTA, MAX_IDLE_TIMEOUT, MAX_SESSIONS,
-    MAX_STALE_GRACE, MAX_TEMPLATE_INTERVAL, MIN_TEMPLATE_INTERVAL, SETUP_TIMEOUT,
-    TEMPLATE_INTERVAL, WRITE_TIMEOUT,
+    run_sv2_tp, MAX_IDLE_TIMEOUT, MAX_SESSIONS, MAX_STALE_GRACE, MAX_TEMPLATE_INTERVAL,
+    MIN_TEMPLATE_INTERVAL, TEMPLATE_INTERVAL,
 };
 use std::io;
 use std::net::SocketAddr;
@@ -47,21 +46,9 @@ async fn expect_error(c: &mut TpClient, flags: u32, code: &str) {
 async fn setup_connection_success_errors_and_session_cap() {
     let tc = shared_regtest(0);
     let chain = Arc::clone(&tc.chain);
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain,
-        authority_secret: [7; 32],
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout: SETUP_TIMEOUT,
-        idle_timeout: None,
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: FEE_DELTA,
-        template_interval: TEMPLATE_INTERVAL,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
-    })
-    .await
-    .expect("listen");
+    let tp = run_sv2_tp(test_tp_config(chain, [7; 32]))
+        .await
+        .expect("listen");
     let (addr, pk) = (tp.local_addr, tp.authority_pubkey);
 
     let mut live = Vec::new();
@@ -112,19 +99,10 @@ async fn authority_key_prints_in_key_utils_base58check() {
     let chain = Arc::clone(&tc.chain);
     let secret = bitcoin::base58::decode_check("zmBEmPhqo3A92FkiLVvyCz6htc3e53ph3ZbD4ASqGaLjwnFLi")
         .expect("vector secret");
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
+    let tp = run_sv2_tp(test_tp_config(
         chain,
-        authority_secret: secret.try_into().expect("32-byte secret"),
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout: SETUP_TIMEOUT,
-        idle_timeout: None,
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: FEE_DELTA,
-        template_interval: TEMPLATE_INTERVAL,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
-    })
+        secret.try_into().expect("32-byte secret"),
+    ))
     .await
     .expect("listen");
     let key = tp.authority_key();
@@ -151,18 +129,10 @@ async fn silent_sockets_are_dropped_at_the_setup_deadline() {
     use tokio::io::AsyncReadExt;
 
     let setup_timeout = Duration::from_millis(300);
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain,
-        authority_secret: [7; 32],
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout,
-        idle_timeout: None,
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: FEE_DELTA,
-        template_interval: TEMPLATE_INTERVAL,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
+    let tp = run_sv2_tp({
+        let mut cfg = test_tp_config(chain, [7; 32]);
+        cfg.setup_timeout = setup_timeout;
+        cfg
     })
     .await
     .expect("listen");
@@ -196,18 +166,10 @@ async fn session_without_constraints_is_dropped_at_the_setup_deadline() {
     let tc = shared_regtest(0);
     let chain = Arc::clone(&tc.chain);
     let setup_timeout = Duration::from_millis(300);
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain,
-        authority_secret: [7; 32],
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout,
-        idle_timeout: None,
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: FEE_DELTA,
-        template_interval: TEMPLATE_INTERVAL,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
+    let tp = run_sv2_tp({
+        let mut cfg = test_tp_config(chain, [7; 32]);
+        cfg.setup_timeout = setup_timeout;
+        cfg
     })
     .await
     .expect("listen");
@@ -277,18 +239,11 @@ async fn session_silent_after_constraints_is_dropped_at_the_idle_deadline() {
     let tc = shared_regtest(0);
     let chain = Arc::clone(&tc.chain);
     let setup_timeout = Duration::from_millis(300);
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain,
-        authority_secret: [7; 32],
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout,
-        idle_timeout: Some(setup_timeout),
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: FEE_DELTA,
-        template_interval: TEMPLATE_INTERVAL,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
+    let tp = run_sv2_tp({
+        let mut cfg = test_tp_config(chain, [7; 32]);
+        cfg.setup_timeout = setup_timeout;
+        cfg.idle_timeout = Some(setup_timeout);
+        cfg
     })
     .await
     .expect("listen");
@@ -317,18 +272,10 @@ async fn client_that_stops_reading_is_dropped_at_the_write_deadline() {
     let tc = shared_regtest(0);
     let chain = Arc::clone(&tc.chain);
     let write_timeout = Duration::from_millis(200);
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain,
-        authority_secret: [7; 32],
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout: SETUP_TIMEOUT,
-        idle_timeout: None,
-        write_timeout,
-        fee_delta: FEE_DELTA,
-        template_interval: TEMPLATE_INTERVAL,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
+    let tp = run_sv2_tp({
+        let mut cfg = test_tp_config(chain, [7; 32]);
+        cfg.write_timeout = write_timeout;
+        cfg
     })
     .await
     .expect("listen");
@@ -382,21 +329,9 @@ async fn client_that_stops_reading_is_dropped_at_the_write_deadline() {
 async fn oversized_client_frame_closes_the_session() {
     let tc = shared_regtest(0);
     let chain = Arc::clone(&tc.chain);
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain,
-        authority_secret: [7; 32],
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout: SETUP_TIMEOUT,
-        idle_timeout: None,
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: FEE_DELTA,
-        template_interval: TEMPLATE_INTERVAL,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
-    })
-    .await
-    .expect("listen");
+    let tp = run_sv2_tp(test_tp_config(chain, [7; 32]))
+        .await
+        .expect("listen");
     let mut c = TpClient::connect(tp.local_addr, tp.authority_pubkey)
         .await
         .expect("handshake");
@@ -444,39 +379,86 @@ async fn out_of_range_timing_refuses_to_start() {
         ),
         (hour, Duration::ZERO, MAX_TEMPLATE_INTERVAL + over),
     ] {
-        let e = run_sv2_tp(Sv2TpConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
-            chain: Arc::clone(&chain),
-            authority_secret: [7; 32],
-            cert_validity,
-            stale_grace,
-            setup_timeout: SETUP_TIMEOUT,
-            idle_timeout: None,
-            write_timeout: WRITE_TIMEOUT,
-            fee_delta: FEE_DELTA,
-            template_interval,
-            constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
+        let e = run_sv2_tp({
+            let mut cfg = test_tp_config(Arc::clone(&chain), [7; 32]);
+            cfg.cert_validity = cert_validity;
+            cfg.stale_grace = stale_grace;
+            cfg.template_interval = template_interval;
+            cfg
         })
         .await
         .err()
         .expect("out-of-range config must not start");
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
     }
-    let e = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain,
-        authority_secret: [7; 32],
-        cert_validity: hour,
-        stale_grace: Duration::ZERO,
-        setup_timeout: SETUP_TIMEOUT,
-        idle_timeout: Some(MAX_IDLE_TIMEOUT + over),
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: FEE_DELTA,
-        template_interval: TEMPLATE_INTERVAL,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
+    let e = run_sv2_tp({
+        let mut cfg = test_tp_config(chain, [7; 32]);
+        cfg.cert_validity = hour;
+        cfg.stale_grace = Duration::ZERO;
+        cfg.idle_timeout = Some(MAX_IDLE_TIMEOUT + over);
+        cfg
     })
     .await
     .err()
     .expect("out-of-range idle timeout must not start");
     assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+}
+
+/// Any client can open connections, so connect and disconnect log at DEBUG.
+/// At INFO they let an unauthenticated client fill the operator's log.
+#[tokio::test]
+async fn connect_and_disconnect_log_below_info() {
+    use rbitcoin_log::Level;
+    let tc = shared_regtest(0);
+    let chain = Arc::clone(&tc.chain);
+    rbitcoin_log::capture_logs(true);
+    let tp = run_sv2_tp(test_tp_config(chain, [7; 32]))
+        .await
+        .expect("listen");
+    let mut c = TpClient::connect(tp.local_addr, tp.authority_pubkey)
+        .await
+        .expect("handshake");
+    c.setup_connection(TDP, 2, 2, 0).await.unwrap();
+    let f = c.recv().await.expect("setup reply");
+    assert_eq!(f.msg_type, MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS);
+    drop(c);
+    let mut logs = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !logs
+        .iter()
+        .any(|(_, m): &(Level, String)| m.starts_with("sv2: disconnect"))
+    {
+        assert!(Instant::now() < deadline, "no disconnect line: {logs:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        logs.extend(rbitcoin_log::take_logs());
+    }
+    rbitcoin_log::capture_logs(false);
+    tp.shutdown().await;
+    let lines: Vec<_> = logs
+        .iter()
+        .filter(|(_, m)| m.starts_with("sv2: connect") || m.starts_with("sv2: disconnect"))
+        .collect();
+    assert_eq!(lines.len(), 2, "{logs:?}");
+    assert!(lines.iter().all(|(l, _)| *l == Level::Debug), "{lines:?}");
+}
+
+/// A client causes any socket error by closing or resetting, so that end logs
+/// at DEBUG. A session task that panicked is this side's fault and stays at WARN.
+#[tokio::test]
+async fn panicked_sv2_disconnect_logs_at_warn() {
+    use rbitcoin_log::Level;
+    let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let joined = tokio::spawn(async { panic!("handler bug") })
+        .await
+        .expect_err("the task panicked");
+    rbitcoin_log::capture_logs(true);
+    rbitcoin_sv2::log_disconnect(peer, &Ok(()));
+    rbitcoin_sv2::log_disconnect(peer, &Err(std::io::ErrorKind::UnexpectedEof.into()));
+    rbitcoin_sv2::log_disconnect(peer, &Err(std::io::Error::other(joined)));
+    let levels: Vec<Level> = rbitcoin_log::take_logs()
+        .into_iter()
+        .map(|(l, _)| l)
+        .collect();
+    rbitcoin_log::capture_logs(false);
+    assert_eq!(levels, [Level::Debug, Level::Debug, Level::Warn]);
 }

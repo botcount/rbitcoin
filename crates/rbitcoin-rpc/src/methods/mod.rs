@@ -7,7 +7,7 @@ use rbitcoin_query::Query;
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -212,10 +212,10 @@ pub fn parse_hash32_display(hex: &str) -> Result<[u8; 32], Value> {
 /// to the coins view, and its txindex skips height 0. The coin is never
 /// unspent and the tx is not an ordinary transaction.
 pub fn genesis_coinbase_txid(ctx: &RpcContext) -> [u8; 32] {
-    use bitcoin::hashes::Hash;
-    bitcoin::blockdata::constants::genesis_block(rpc_btc_network(ctx.network)).txdata[0]
-        .compute_txid()
-        .to_byte_array()
+    if let Some(txid) = ctx.query.genesis_coinbase_txid.get() {
+        return *txid;
+    }
+    rbitcoin_consensus::ChainParams::for_network(ctx.network).genesis_coinbase_txid
 }
 
 mod asm;
@@ -316,6 +316,9 @@ pub struct RpcContext {
 pub struct RpcActive {
     pub next: u64,
     pub cmds: HashMap<u64, (String, Instant)>,
+    /// Callers blocked on the API store-read budget. `dispatch` lists a
+    /// method only after that permit is held, so this is the earlier signal.
+    pub store_budget_waiters: Arc<AtomicUsize>,
 }
 
 impl RpcActive {
@@ -596,7 +599,7 @@ impl RpcParams {
             .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, format!("{name} must be an integer")))
     }
 
-    pub fn req_core_int(&self, index: usize, name: &str) -> Result<i32, Value> {
+    pub fn req_core_int<T: TryFrom<i64>>(&self, index: usize, name: &str) -> Result<T, Value> {
         core_json_int(self.req(index, name)?)
     }
 
@@ -666,6 +669,7 @@ pub fn json_u64(v: &Value) -> Option<u64> {
 
 /// Core `UniValue::getInt<T>`: a non-number is `-3`. A fraction, an
 /// exponent, or a value outside `T` is `-1` `JSON integer out of range`.
+/// An unsigned `T` refuses any leading minus, `-0` included.
 pub fn core_json_int<T: TryFrom<i64>>(v: &Value) -> Result<T, Value> {
     let Value::Number(n) = v else {
         return Err(rpc_error(
@@ -676,7 +680,9 @@ pub fn core_json_int<T: TryFrom<i64>>(v: &Value) -> Result<T, Value> {
             ),
         ));
     };
+    let unsigned_minus = T::try_from(-1).is_err() && n.to_string().starts_with('-');
     n.as_i64()
+        .filter(|_| !unsigned_minus)
         .and_then(|t| T::try_from(t).ok())
         .ok_or_else(|| rpc_error(ERR_MISC, "JSON integer out of range"))
 }
@@ -1052,7 +1058,9 @@ pub const NAMED_HELP: &[(&str, &str)] = &[
         "estimaterawfee",
         "estimaterawfee conf_target (threshold)\n\
          Regtest/harness surface matching Core's RPC name. Returns this node's \
-         10-minute inclusion frontier (same product as estimatesmartfee).",
+         10-minute inclusion frontier, as estimatesmartfee does, except that \
+         target 1 keeps the 1-block quote and `blocks` 1 (estimatesmartfee \
+         answers target 1 as 2 until mempool flow is warm).",
     ),
     (
         "getblockchaininfo",
@@ -1240,6 +1248,7 @@ pub fn chain_name(n: Network) -> &'static str {
         Network::Testnet => "test",
         Network::Signet => "signet",
         Network::Testnet4 => "testnet4",
+        Network::Testnet5 => "testnet5",
         Network::Regtest => "regtest",
     }
 }

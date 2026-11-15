@@ -840,6 +840,28 @@ fn worst_chunk_index_picks_lowest_rate_then_repairs() {
 }
 
 #[test]
+fn rebuild_from_inserts_a_mutual_cycle() {
+    let mut g = TxGraph::new();
+    let low = txid_n(1);
+    let high = txid_n(2);
+    let spend_high = make_tx(Some((high, 0)), 1, 1);
+    let spend_low = make_tx(Some((low, 0)), 1, 2);
+    let mut low_entry = entry_for(&spend_high, 10, 0);
+    low_entry.txid = low;
+    let mut high_entry = entry_for(&spend_low, 10, 1);
+    high_entry.txid = high;
+    g.rebuild_from(vec![
+        (high_entry, std::sync::Arc::new(spend_low)),
+        (low_entry, std::sync::Arc::new(spend_high)),
+    ]);
+    assert!(g.contains(&low));
+    assert!(g.contains(&high));
+    assert!(g.get(&low).unwrap().parents.contains(&high));
+    assert!(g.get(&high).unwrap().parents.contains(&low));
+    assert_eq!(g.cluster_of(&low).unwrap().members.len(), 2);
+}
+
+#[test]
 fn rebuild_from_orders_parents_first() {
     let mut g = TxGraph::new();
     // Both spenders sort before the parent. A readiness bug inserts them

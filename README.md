@@ -5,7 +5,7 @@
 Bitcoin **full node** in Rust aimed at **production server-side** use: multi-peer
 IBD, tip follow, block/tx relay (tip mode), optional **Core-class JSON-RPC**, and
 in-process **Electrum + optional Esplora REST** (scripthash index via
-`--sh-index`, default off; **0.8** Core+electrs drop-in:
+`--sh-index`, default off; Core+electrs drop-in:
 [`COMPAT.md`](./COMPAT.md)) — built
 around a **relational archive (Class A/B/C)** and a **pure-Rust
 consensus/script** path.
@@ -22,12 +22,13 @@ consensus/script** path.
 > Script and signature checks skip only when that hash and the block being
 > connected are the header-path occupants at their heights. Stored minimum
 > chain work is not that gate. `--milestone 0` checks every script. An
-> explicit height skips by height alone. Signet and testnet4 check every
-> script by default.
+> explicit height skips by height alone. Signet, testnet4, and testnet5 check
+> every script by default.
 >
 > Occupied **0.6.x** stores refuse: wipe the datadir and sync again.
-> Schema **24 and 25** open in place and rewrite to **26**. A published
-> **0.8** directory is already schema 26. Electrum and Esplora need
+> Schema **24 and 25** open in place. A published **0.8** directory is schema
+> 26. This binary rewrites that `meta` to **27**, pruned or not, and a 0.9.0
+> binary then refuses the directory. Electrum and Esplora need
 > **`--sh-index`** (default off) for address history. Report security
 > issues privately: [`SECURITY.md`](./SECURITY.md). Runbook:
 > [`docs/operator/mainnet.md`](./docs/operator/mainnet.md).
@@ -40,7 +41,7 @@ consensus/script** path.
 | **Security** | [`SECURITY.md`](./SECURITY.md) — **0.9.x** is the published line; support window and signed binaries are 1.0 |
 | **Design** | [`docs/architecture.md`](./docs/architecture.md) — why this node is different |
 | **Develop** | rustup 1.95, no Nix — [`CONTRIBUTING.md`](./CONTRIBUTING.md) |
-| **Coverage** | Live production-file LCOV (badge; last green `master` `coverage` job). Every PR **must not drop** that ratio. Highest published line coverage among bitcoin full nodes — [`TESTING.md`](./TESTING.md) |
+| **Coverage** | Production-file line coverage floor is 91% (`LH*100 >= LF*91`). [`TESTING.md`](./TESTING.md) |
 
 ## Why this node is different
 
@@ -48,12 +49,9 @@ Most full nodes center a **UTXO set + block files** (Bitcoin Core). Most Electru
 backends are **external indexers** of another node. rbitcoin does neither:
 **no UTXO set** (relational archive), **Electrum + txindex in-process**.
 
-- **~200 GiB** hot pin/annotate set (schema 17); **~730 GiB** with the cold append-only files (`seqsigwit` ~486, `txstat` ~11, `input` ~29) —
-  census in [`SCHEMA.md`](./SCHEMA.md), `--sh-index` costs in [`OPERATOR.md`](./OPERATOR.md)
-- **Under ~30 h** IBD on a laptop-class host with **`--milestone 0`**
-- **Modest RAM** during sync — no multi‑GiB `dbcache` pause
+- Store size is the dated census in [`SCHEMA.md`](./SCHEMA.md). `--sh-index` costs are in [`docs/operator/storage.md`](./docs/operator/storage.md).
+- One measured mainnet catch-up is in [`docs/operator/mainnet.md`](./docs/operator/mainnet.md).
 - **Pure-Rust** consensus/scripts (**no** `libbitcoinconsensus`)
-- **Highest published line coverage** among bitcoin full nodes (live production-file LCOV on the badge; every PR **must not drop** that ratio) — [`TESTING.md`](./TESTING.md)
 - **Reproducible static musl** for ordinary Linux hosts
 
 Core / Fulcrum contrasts: **[`docs/architecture.md`](./docs/architecture.md)**.
@@ -104,7 +102,7 @@ Actions run workspace/coverage gates — [`AGENTS.md`](./AGENTS.md).
 
 Pinned **nixpkgs + Cargo.lock** musl static binaries. Commands and
 byte-identity: [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
-Day-to-day flags: [`OPERATOR.md`](./OPERATOR.md). Mainnet:
+Day-to-day flags: [`docs/operator/`](./docs/operator/). The task index is [`OPERATOR.md`](./OPERATOR.md). Mainnet:
 [`docs/operator/mainnet.md`](./docs/operator/mainnet.md).
 
 Do **not** use `cargo build --release` inside `nix-shell` / `nix develop` as the

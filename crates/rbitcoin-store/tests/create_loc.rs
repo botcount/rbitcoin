@@ -385,6 +385,21 @@ fn create_loc_window_1024_and_1025() {
     );
 }
 
+/// Create 1025 starts where the first checkpoint says create 1024 ended.
+#[test]
+fn create_loc_open_reads_the_next_window() {
+    let dir = TempDir::labeled("create-loc-next-window").unwrap();
+    let loc = CreateLoc::create(dir.path()).unwrap();
+    loc.append(&chain(&vec![1u32; 1025], &vec![8u64; 1025]))
+        .unwrap();
+    drop(loc);
+    let loc = CreateLoc::open(dir.path()).unwrap();
+    let got = loc.range_batch(&[Fk(1025)]).unwrap();
+    let start = FILE_HEADER_LEN as u64 + 1024 * 8;
+    assert_eq!(got[0].unwrap().txout, (start, 8));
+    assert_eq!(got[0].unwrap().spent, (start, 8));
+}
+
 #[test]
 fn create_loc_n_out_zero_append_corrupt() {
     let dir = TempDir::labeled("create-loc-zero").unwrap();
@@ -448,6 +463,77 @@ fn create_loc_n_out_past_u16() {
     let loc = CreateLoc::open(dir.path()).unwrap();
     assert_eq!(loc.range_batch(&[Fk(1)]).unwrap()[0].unwrap().n_out, 65536);
     assert_eq!(ovf_data_len(dir.path()), 16);
+}
+
+#[test]
+fn create_loc_open_reads_the_overflow_row() {
+    let dir = TempDir::labeled("create-ovf-row").unwrap();
+    let loc = CreateLoc::create(dir.path()).unwrap();
+    loc.append(&chain(&[300], &[56])).unwrap();
+    drop(loc);
+    let loc = CreateLoc::open(dir.path()).unwrap();
+    let rows = loc
+        .ovf_rows
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(rows, vec![(1, 7, 300)]);
+    let got = loc.range_batch(&[Fk(1)]).unwrap();
+    assert_eq!(got[0].unwrap().n_out, 300);
+    assert_eq!(got[0].unwrap().txout, (FILE_HEADER_LEN as u64, 56));
+
+    let ragged = TempDir::labeled("create-ovf-ragged").unwrap();
+    let loc = CreateLoc::create(ragged.path()).unwrap();
+    loc.ovf.set_logical_len(FILE_HEADER_LEN as u64 + 4).unwrap();
+    drop(loc);
+    let err = match CreateLoc::open(ragged.path()) {
+        Ok(_) => panic!("open accepted a ragged overflow file"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, StoreError::Corrupt(m) if m.contains("ovf size")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn create_loc_migrates_one_v22_row() {
+    let dir = TempDir::labeled("create-ovf-v22-one").unwrap();
+    let loc = CreateLoc::create(dir.path()).unwrap();
+    loc.append(&chain(&[300], &[56])).unwrap();
+    drop(loc);
+    write_legacy_create_ovf_v22(dir.path(), &[(1, 7, 300)]);
+    let loc = CreateLoc::open(dir.path()).unwrap();
+    let rows = loc
+        .ovf_rows
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(rows, vec![(1, 7, 300)]);
+    let got = loc.range_batch(&[Fk(1)]).unwrap();
+    assert_eq!(got[0].unwrap().n_out, 300);
+    assert_eq!(got[0].unwrap().spent.1, 300 * IDX_STRIDE);
+
+    let bad = TempDir::labeled("create-ovf-v22-short").unwrap();
+    let loc = CreateLoc::create(bad.path()).unwrap();
+    drop(loc);
+    write_legacy_create_ovf_v22(bad.path(), &[]);
+    // A 4-byte body is neither a 12-byte nor a 16-byte row.
+    let path = bad.path().join("create.loc.ovf");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.truncate(FILE_HEADER_LEN);
+    bytes.extend_from_slice(&[1, 2, 3, 4]);
+    let logical = bytes.len() as u64;
+    bytes[8..16].copy_from_slice(&logical.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+    let err = match CreateLoc::open(bad.path()) {
+        Ok(_) => panic!("open accepted a short v22 overflow file"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, StoreError::Corrupt(m) if m.contains("ovf size")),
+        "{err:?}"
+    );
 }
 
 #[test]

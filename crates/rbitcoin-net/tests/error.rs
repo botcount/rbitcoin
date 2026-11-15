@@ -56,4 +56,15 @@ fn display_and_source_surface() {
     }
     let from_io: NetError = io::Error::other("z").into();
     assert!(matches!(from_io, NetError::Io(_)));
+
+    let mutated = NetError::Consensus("bad-txnmrklroot".into());
+    assert!(mutated.is_mutated(), "{mutated}");
+    let connect = NetError::ConnectFailed {
+        hash: [2u8; 32],
+        msg: "witness commitment".into(),
+        rules: None,
+    };
+    assert!(connect.is_mutated(), "{connect}");
+    let ordinary = NetError::Consensus("bad-txns-inputs-missingorspent".into());
+    assert!(!ordinary.is_mutated(), "{ordinary}");
 }

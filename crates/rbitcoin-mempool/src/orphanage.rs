@@ -4,6 +4,9 @@
 //! unique orphans; unique-count cap 3000. Per-tx max 404_000 WU.
 //!
 //! Eviction: FIFO by insert order when over weight or count.
+//!
+//! Keyed by wtxid, as Core since bitcoin/bitcoin#30000: two witnesses of one
+//! txid are two orphans. Lookups by txid go through the txid index.
 
 use bitcoin::{Transaction, Txid, Wtxid};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -25,16 +28,18 @@ pub const ORPHAN_EXPIRE_MS: u64 = 20 * 60 * 1000;
 #[doc(hidden)]
 pub struct OrphanEntry {
     pub tx: Transaction,
-    pub wtxid: Wtxid,
+    pub txid: Txid,
     pub weight: u64,
-    /// Missing parent txids (prevout.txid not in mempool/chain at insert).
+    /// Parent txids it waits on: absent from the mempool and chain when it
+    /// was parked. One may be pooled since, when this orphan's own txid is
+    /// pooled too and promote left it parked.
     pub missing: BTreeSet<Txid>,
     /// P2P peer ids that announced this orphan.
     pub announcers: BTreeSet<u64>,
     pub arrived_ms: u64,
 }
 
-/// One parked orphan (txid + announcer peer ids).
+/// One parked orphan (tx + announcer peer ids).
 #[derive(Debug, Clone)]
 pub struct OrphanSnapshot {
     pub tx: Transaction,
@@ -46,11 +51,13 @@ pub struct OrphanSnapshot {
 /// Side pool of not-yet-acceptable txs waiting on parent(s).
 #[derive(Debug, Default)]
 pub struct Orphanage {
-    pub by_txid: HashMap<Txid, OrphanEntry>,
-    pub by_wtxid: HashMap<Wtxid, Txid>,
+    pub by_wtxid: HashMap<Wtxid, OrphanEntry>,
+    /// txid → every parked witness of it, oldest first.
+    pub by_txid: HashMap<Txid, Vec<Wtxid>>,
     /// parent txid → orphan children waiting on it.
-    pub by_parent: HashMap<Txid, HashSet<Txid>>,
-    pub fifo: VecDeque<Txid>,
+    pub by_parent: HashMap<Txid, HashSet<Wtxid>>,
+    /// Eviction order, oldest first: each key of `by_wtxid` once.
+    pub fifo: VecDeque<Wtxid>,
     pub total_weight: u64,
     /// Announced weight per peer. Eviction reads this instead of scanning the set.
     peer_weight: HashMap<u64, u64>,
@@ -58,9 +65,9 @@ pub struct Orphanage {
     max_count: usize,
     /// Orphans `take_children_of` removed and that are not parked or admitted yet.
     ///
-    /// A disconnect in that gap cannot see `by_txid`. It edits this map, and
+    /// A disconnect in that gap cannot see `by_wtxid`. It edits this map, and
     /// the repark uses the result instead of the announcer list from the take.
-    taken: HashMap<Txid, TakenOrphan>,
+    taken: HashMap<Wtxid, TakenOrphan>,
     /// Next generation for [`Self::taken`]. Zero is never assigned.
     next_taken_gen: u64,
 }
@@ -88,8 +95,8 @@ impl Orphanage {
 
     pub fn with_limits(max_weight: u64, max_count: usize) -> Self {
         Self {
-            by_txid: HashMap::new(),
             by_wtxid: HashMap::new(),
+            by_txid: HashMap::new(),
             by_parent: HashMap::new(),
             fifo: VecDeque::new(),
             total_weight: 0,
@@ -102,17 +109,18 @@ impl Orphanage {
     }
 
     pub fn len(&self) -> usize {
-        self.by_txid.len()
+        self.by_wtxid.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_txid.is_empty()
+        self.by_wtxid.is_empty()
     }
 
     pub fn total_weight(&self) -> u64 {
         self.total_weight
     }
 
+    /// Any witness of `txid` is parked.
     pub fn contains(&self, txid: &Txid) -> bool {
         self.by_txid.contains_key(txid)
     }
@@ -121,21 +129,16 @@ impl Orphanage {
         self.by_wtxid.contains_key(wtxid)
     }
 
-    pub fn wtxid_of(&self, txid: &Txid) -> Option<Wtxid> {
-        self.by_txid.get(txid).map(|e| e.wtxid)
-    }
-
     pub fn tx_by_wtxid(&self, wtxid: &Wtxid) -> Option<&Transaction> {
-        let txid = self.by_wtxid.get(wtxid)?;
-        self.by_txid.get(txid).map(|e| &e.tx)
+        self.by_wtxid.get(wtxid).map(|e| &e.tx)
     }
 
-    pub fn missing_of(&self, txid: &Txid) -> Option<&BTreeSet<Txid>> {
-        self.by_txid.get(txid).map(|e| &e.missing)
+    pub fn missing_of(&self, wtxid: &Wtxid) -> Option<&BTreeSet<Txid>> {
+        self.by_wtxid.get(wtxid).map(|e| &e.missing)
     }
 
     pub fn txs(&self) -> impl Iterator<Item = &Transaction> {
-        self.by_txid.values().map(|e| &e.tx)
+        self.by_wtxid.values().map(|e| &e.tx)
     }
 
     /// Insert (or add `from` as announcer if already parked).
@@ -162,14 +165,11 @@ impl Orphanage {
         self.expire(now_ms);
         let txid = tx.compute_txid();
         let wtxid = tx.compute_wtxid();
-        if let Some(e) = self.by_txid.get(&txid) {
-            if e.wtxid == wtxid {
-                if let Some(peer) = from {
-                    self.add_announcer(&txid, peer);
-                }
-                return false;
+        if self.by_wtxid.contains_key(&wtxid) {
+            if let Some(peer) = from {
+                self.add_announcer(&wtxid, peer);
             }
-            self.remove_txid(&txid);
+            return false;
         }
         let weight = tx.weight().to_wu();
         if weight > MAX_ORPHAN_TX_WEIGHT {
@@ -184,15 +184,15 @@ impl Orphanage {
                 }
             }
         }
-        while !self.by_txid.is_empty()
-            && (self.by_txid.len() >= self.max_count
+        while !self.by_wtxid.is_empty()
+            && (self.by_wtxid.len() >= self.max_count
                 || self.total_weight.saturating_add(weight) > self.max_weight)
         {
             if !self.evict_oldest() {
                 break;
             }
         }
-        if self.by_txid.len() >= self.max_count {
+        if self.by_wtxid.len() >= self.max_count {
             return false;
         }
         // Room left is the cap minus what is already parked. A tx that lands
@@ -201,25 +201,25 @@ impl Orphanage {
             return false;
         }
         for p in &missing {
-            self.by_parent.entry(*p).or_default().insert(txid);
+            self.by_parent.entry(*p).or_default().insert(wtxid);
         }
         let mut announcers = BTreeSet::new();
         if let Some(peer) = from {
             announcers.insert(peer);
         }
-        self.by_wtxid.insert(wtxid, txid);
-        self.by_txid.insert(
-            txid,
+        self.by_txid.entry(txid).or_default().push(wtxid);
+        self.by_wtxid.insert(
+            wtxid,
             OrphanEntry {
                 tx,
-                wtxid,
+                txid,
                 weight,
                 missing,
                 announcers,
                 arrived_ms: now_ms,
             },
         );
-        self.fifo.push_back(txid);
+        self.fifo.push_back(wtxid);
         self.total_weight = self.total_weight.saturating_add(weight);
         if let Some(peer) = from {
             self.add_peer_weight(peer, weight);
@@ -229,14 +229,14 @@ impl Orphanage {
 
     #[doc(hidden)]
     pub fn expire(&mut self, now_ms: u64) {
-        let stale: Vec<Txid> = self
-            .by_txid
+        let stale: Vec<Wtxid> = self
+            .by_wtxid
             .iter()
             .filter(|(_, e)| now_ms.saturating_sub(e.arrived_ms) >= ORPHAN_EXPIRE_MS)
-            .map(|(txid, _)| *txid)
+            .map(|(wtxid, _)| *wtxid)
             .collect();
-        for txid in stale {
-            self.remove_txid(&txid);
+        for wtxid in stale {
+            self.remove_wtxid(&wtxid);
         }
     }
 
@@ -275,8 +275,8 @@ impl Orphanage {
     }
 
     #[doc(hidden)]
-    pub fn announcers_within_reserve(&self, txid: &Txid) -> bool {
-        let Some(e) = self.by_txid.get(txid) else {
+    pub fn announcers_within_reserve(&self, wtxid: &Wtxid) -> bool {
+        let Some(e) = self.by_wtxid.get(wtxid) else {
             return false;
         };
         if e.announcers.is_empty() {
@@ -294,17 +294,17 @@ impl Orphanage {
         let victim = self
             .fifo
             .iter()
-            .find(|txid| {
-                self.by_txid
-                    .get(*txid)
+            .find(|wtxid| {
+                self.by_wtxid
+                    .get(*wtxid)
                     .is_some_and(|e| e.announcers.contains(&peer))
             })
             .copied();
-        let Some(txid) = victim else {
+        let Some(wtxid) = victim else {
             return false;
         };
         let weight = {
-            let Some(e) = self.by_txid.get_mut(&txid) else {
+            let Some(e) = self.by_wtxid.get_mut(&wtxid) else {
                 return false;
             };
             if !e.announcers.remove(&peer) {
@@ -314,13 +314,12 @@ impl Orphanage {
         };
         self.sub_peer_weight(peer, weight);
         let last = self
-            .by_txid
-            .get(&txid)
+            .by_wtxid
+            .get(&wtxid)
             .is_some_and(|e| e.announcers.is_empty());
         if last {
-            self.remove_txid(&txid);
+            self.remove_wtxid(&wtxid);
         }
-        self.fifo.retain(|t| self.by_txid.contains_key(t));
         true
     }
 
@@ -337,15 +336,12 @@ impl Orphanage {
     #[doc(hidden)]
     pub fn evict_oldest_filtered(&mut self, honor_reserve: bool) -> bool {
         let mut skipped = VecDeque::new();
-        while let Some(txid) = self.fifo.pop_front() {
-            if !self.by_txid.contains_key(&txid) {
+        while let Some(wtxid) = self.fifo.pop_front() {
+            if honor_reserve && self.announcers_within_reserve(&wtxid) {
+                skipped.push_back(wtxid);
                 continue;
             }
-            if honor_reserve && self.announcers_within_reserve(&txid) {
-                skipped.push_back(txid);
-                continue;
-            }
-            self.remove_txid(&txid);
+            self.remove_wtxid(&wtxid);
             skipped.append(&mut self.fifo);
             self.fifo = skipped;
             return true;
@@ -354,50 +350,67 @@ impl Orphanage {
         false
     }
 
-    #[doc(hidden)]
-    pub fn remove_txid(&mut self, txid: &Txid) -> Option<Transaction> {
-        let e = self.by_txid.remove(txid)?;
-        self.by_wtxid.remove(&e.wtxid);
-        self.unaccount(&e);
+    /// Remove one parked tx and return it. `None` when it is not parked.
+    pub fn remove_wtxid(&mut self, wtxid: &Wtxid) -> Option<Transaction> {
+        let e = self.unlink(wtxid)?;
         for p in &e.missing {
-            if let Some(set) = self.by_parent.get_mut(p) {
-                set.remove(txid);
-                if set.is_empty() {
-                    self.by_parent.remove(p);
-                }
-            }
+            self.unlink_parent(p, wtxid);
         }
-        // fifo may still hold txid if removed mid-list; leave stale ids (skipped on pop)
         Some(e.tx)
     }
 
-    /// Remove one parked tx and return it. `None` when it is not parked.
-    pub fn take_txid(&mut self, txid: &Txid) -> Option<Transaction> {
-        self.remove_txid(txid)
+    /// Drop `wtxid` from every index but `by_parent`, the eviction order
+    /// included, so a later park of the same wtxid is the newest.
+    fn unlink(&mut self, wtxid: &Wtxid) -> Option<OrphanEntry> {
+        let e = self.by_wtxid.remove(wtxid)?;
+        self.fifo.retain(|w| w != wtxid);
+        if let Some(versions) = self.by_txid.get_mut(&e.txid) {
+            versions.retain(|w| w != wtxid);
+            if versions.is_empty() {
+                self.by_txid.remove(&e.txid);
+            }
+        }
+        self.unaccount(&e);
+        Some(e)
+    }
+
+    fn unlink_parent(&mut self, parent: &Txid, wtxid: &Wtxid) {
+        if let Some(set) = self.by_parent.get_mut(parent) {
+            set.remove(wtxid);
+            if set.is_empty() {
+                self.by_parent.remove(parent);
+            }
+        }
     }
 
     /// Take all orphans that listed `parent` as missing (for re-accept).
     ///
     /// The announcer list comes with the transaction. A child that still
     /// misses another parent is parked again under those same peers.
-    pub fn take_children_of(&mut self, parent: &Txid) -> Vec<OrphanSnapshot> {
+    ///
+    /// A child whose txid `pooled` already holds stays parked: it cannot
+    /// enter. Core leaves such an orphan when it entered the mempool other
+    /// than by relay (an RPC package), or when a version with a different
+    /// witness entered. `Find1P1CPackage`, a block, or expiry erases it.
+    pub fn take_children_of(
+        &mut self,
+        parent: &Txid,
+        pooled: impl Fn(&Txid) -> bool,
+    ) -> Vec<OrphanSnapshot> {
         let Some(children) = self.by_parent.remove(parent) else {
             return Vec::new();
         };
         let mut out = Vec::with_capacity(children.len());
+        let mut stay = HashSet::new();
         for cid in children {
-            if let Some(e) = self.by_txid.remove(&cid) {
-                self.by_wtxid.remove(&e.wtxid);
-                self.unaccount(&e);
+            if self.by_wtxid.get(&cid).is_some_and(|e| pooled(&e.txid)) {
+                stay.insert(cid);
+                continue;
+            }
+            if let Some(e) = self.unlink(&cid) {
                 for p in &e.missing {
-                    if p == parent {
-                        continue;
-                    }
-                    if let Some(set) = self.by_parent.get_mut(p) {
-                        set.remove(&cid);
-                        if set.is_empty() {
-                            self.by_parent.remove(p);
-                        }
+                    if p != parent {
+                        self.unlink_parent(p, &cid);
                     }
                 }
                 let announcers = e.announcers;
@@ -417,7 +430,35 @@ impl Orphanage {
                 });
             }
         }
+        if !stay.is_empty() {
+            self.by_parent.insert(*parent, stay);
+        }
         out
+    }
+
+    /// Core `Find1P1CPackage`: erase each of `peer`'s orphans of `parent`
+    /// whose txid `pooled` already holds.
+    pub fn erase_pooled_children(
+        &mut self,
+        parent: &Txid,
+        peer: u64,
+        pooled: impl Fn(&Txid) -> bool,
+    ) {
+        let Some(children) = self.by_parent.get(parent) else {
+            return;
+        };
+        let gone: Vec<Wtxid> = children
+            .iter()
+            .filter(|w| {
+                self.by_wtxid
+                    .get(*w)
+                    .is_some_and(|e| e.announcers.contains(&peer) && pooled(&e.txid))
+            })
+            .copied()
+            .collect();
+        for w in &gone {
+            self.remove_wtxid(w);
+        }
     }
 
     fn alloc_taken_gen(&mut self) -> u64 {
@@ -428,24 +469,9 @@ impl Orphanage {
         self.next_taken_gen
     }
 
-    /// Remember `txid` as out of the pool. A package lift uses this; promote
-    /// records the same way inside `take_children_of`.
-    pub fn note_taken(&mut self, txid: Txid, announcers: &[u64]) -> u64 {
-        let gen = self.alloc_taken_gen();
-        self.taken.insert(
-            txid,
-            TakenOrphan {
-                announcers: announcers.iter().copied().collect(),
-                drop: false,
-                gen,
-            },
-        );
-        gen
-    }
-
     /// Consume the in-flight record. `None` when this tx was not taken.
-    pub(crate) fn claim_taken(&mut self, txid: &Txid) -> Option<TakenClaim> {
-        let taken = self.taken.remove(txid)?;
+    pub(crate) fn claim_taken(&mut self, wtxid: &Wtxid) -> Option<TakenClaim> {
+        let taken = self.taken.remove(wtxid)?;
         if taken.drop {
             Some(TakenClaim::Drop)
         } else {
@@ -455,32 +481,32 @@ impl Orphanage {
 
     /// Drop the in-flight record when it is still the one `gen` inserted.
     ///
-    /// A newer take of the same txid must survive. The repark already consumed
+    /// A newer take of the same wtxid must survive. The repark already consumed
     /// its own record, so this only clears an admit or a reject that did not park.
-    pub fn forget_taken_gen(&mut self, txid: &Txid, gen: u64) {
+    pub fn forget_taken_gen(&mut self, wtxid: &Wtxid, gen: u64) {
         if gen == 0 {
             return;
         }
-        if self.taken.get(txid).is_some_and(|t| t.gen == gen) {
-            self.taken.remove(txid);
+        if self.taken.get(wtxid).is_some_and(|t| t.gen == gen) {
+            self.taken.remove(wtxid);
         }
     }
 
-    pub fn announcers_of(&self, txid: &Txid) -> Vec<u64> {
-        self.by_txid
-            .get(txid)
+    pub fn announcers_of(&self, wtxid: &Wtxid) -> Vec<u64> {
+        self.by_wtxid
+            .get(wtxid)
             .map(|e| e.announcers.iter().copied().collect())
             .unwrap_or_default()
     }
 
     pub fn has_announcer(&self, peer: u64) -> bool {
-        self.by_txid.values().any(|e| e.announcers.contains(&peer))
+        self.by_wtxid.values().any(|e| e.announcers.contains(&peer))
             || self.taken.values().any(|t| t.announcers.contains(&peer))
     }
 
-    pub fn add_announcer(&mut self, txid: &Txid, peer: u64) -> bool {
+    pub fn add_announcer(&mut self, wtxid: &Wtxid, peer: u64) -> bool {
         let weight = {
-            let Some(e) = self.by_txid.get_mut(txid) else {
+            let Some(e) = self.by_wtxid.get_mut(wtxid) else {
                 return false;
             };
             if !e.announcers.insert(peer) {
@@ -492,41 +518,33 @@ impl Orphanage {
         true
     }
 
-    pub fn add_announcer_wtxid(&mut self, wtxid: &Wtxid, peer: u64) -> bool {
-        let Some(txid) = self.by_wtxid.get(wtxid).copied() else {
-            return false;
-        };
-        self.add_announcer(&txid, peer)
-    }
-
     /// Drop `peer` as announcer; erase orphans with no remaining announcers.
     ///
     /// Also edits orphans that are out for a promote. The repark reads that.
     pub fn erase_for_peer(&mut self, peer: u64) {
-        let hit: Vec<(Txid, u64, bool)> = self
-            .by_txid
+        let hit: Vec<(Wtxid, u64, bool)> = self
+            .by_wtxid
             .iter()
-            .filter_map(|(txid, e)| {
+            .filter_map(|(wtxid, e)| {
                 if !e.announcers.contains(&peer) {
                     return None;
                 }
-                Some((*txid, e.weight, e.announcers.len() == 1))
+                Some((*wtxid, e.weight, e.announcers.len() == 1))
             })
             .collect();
         let mut drop = Vec::new();
-        for (txid, weight, last) in hit {
-            if let Some(e) = self.by_txid.get_mut(&txid) {
+        for (wtxid, weight, last) in hit {
+            if let Some(e) = self.by_wtxid.get_mut(&wtxid) {
                 e.announcers.remove(&peer);
             }
             self.sub_peer_weight(peer, weight);
             if last {
-                drop.push(txid);
+                drop.push(wtxid);
             }
         }
-        for t in drop {
-            self.remove_txid(&t);
+        for w in drop {
+            self.remove_wtxid(&w);
         }
-        self.fifo.retain(|t| self.by_txid.contains_key(t));
         for taken in self.taken.values_mut() {
             if taken.announcers.remove(&peer) && taken.announcers.is_empty() {
                 taken.drop = true;
@@ -536,12 +554,8 @@ impl Orphanage {
 
     pub fn snapshot(&self) -> Vec<OrphanSnapshot> {
         let mut out = Vec::with_capacity(self.fifo.len());
-        let mut seen = HashSet::new();
-        for txid in &self.fifo {
-            if !seen.insert(*txid) {
-                continue;
-            }
-            if let Some(e) = self.by_txid.get(txid) {
+        for wtxid in &self.fifo {
+            if let Some(e) = self.by_wtxid.get(wtxid) {
                 out.push(OrphanSnapshot {
                     tx: e.tx.clone(),
                     announcers: e.announcers.iter().copied().collect(),
@@ -559,16 +573,14 @@ impl Orphanage {
     /// Spending a parent in the block does not invalidate the orphan; the parent
     /// create is now a chain UTXO.
     pub fn erase_for_block(&mut self, block_txids: &[Txid]) {
-        let block: HashSet<Txid> = block_txids.iter().copied().collect();
-        let drop: Vec<Txid> = self
-            .by_txid
-            .keys()
-            .filter(|t| block.contains(*t))
+        let drop: Vec<Wtxid> = block_txids
+            .iter()
+            .filter_map(|t| self.by_txid.get(t))
+            .flatten()
             .copied()
             .collect();
-        for t in drop {
-            self.remove_txid(&t);
+        for w in drop {
+            self.remove_wtxid(&w);
         }
-        self.fifo.retain(|t| self.by_txid.contains_key(t));
     }
 }

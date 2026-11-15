@@ -124,3 +124,25 @@ fn append_fk_or_vin_overflow_is_corrupt() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn spender_get_reads_the_packed_record() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-spender-fields-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = SpenderTable::create(&dir).unwrap();
+    let next = Fk(0x1111_2222_3333_4444);
+    let id = t.append(Fk(0x0102_0304), 0x0107, next).unwrap();
+    assert_eq!(t.get(id).unwrap(), (Fk(0x0102_0304), 0x0107, next));
+    match t.get(Fk(99)) {
+        Err(StoreError::NotFound) => {}
+        other => panic!("missing spender must be NotFound, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

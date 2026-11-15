@@ -3,6 +3,7 @@
 //! TCP `/rest/` skips Bearer. The unix socket is filesystem auth for every path.
 
 use super::*;
+use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
 use rbitcoin_primitives::Height;
@@ -275,7 +276,8 @@ pub fn block(
 
 #[doc(hidden)]
 pub fn tx(ctx: &RpcContext, fmt: RestFmt, txid: &str) -> Result<RestReply, RestReply> {
-    if parse_hash(txid)? == genesis_coinbase_txid(ctx) {
+    let want = parse_hash(txid)?;
+    if want == genesis_coinbase_txid(ctx) {
         return Err(err(
             axum::http::StatusCode::NOT_FOUND,
             &format!("{txid} not found"),
@@ -288,19 +290,16 @@ pub fn tx(ctx: &RpcContext, fmt: RestFmt, txid: &str) -> Result<RestReply, RestR
             getrawtransaction(ctx, &params),
         )?));
     };
-    let params = RpcParams::positional(vec![json!(txid), json!(false)]);
-    let hex = map_tx_missing(txid, getrawtransaction(ctx, &params))?;
-    let hex = hex.as_str().ok_or_else(|| {
-        err(
+    let Some(hit) = locate_raw_tx(ctx, want).map_err(rpc_to_rest)? else {
+        return Err(err(
             axum::http::StatusCode::NOT_FOUND,
             &format!("{txid} not found"),
-        )
-    })?;
-    let raw = rbitcoin_primitives::hex_decode(hex)
-        .map_err(|_| err(axum::http::StatusCode::INTERNAL_SERVER_ERROR, "tx hex"))?;
+        ));
+    };
+    let tx = hit.tx();
     match wire {
-        RestWire::Bin => Ok(bin_body(raw)),
-        RestWire::Hex => Ok(hex_body(hex)),
+        RestWire::Bin => Ok(bin_body(bitcoin::consensus::serialize(tx))),
+        RestWire::Hex => Ok(hex_body(&serialize_hex(tx))),
     }
 }
 
@@ -506,19 +505,18 @@ pub fn query_flag(query: &str, name: &str, default: bool) -> Result<bool, RestRe
 
 #[doc(hidden)]
 pub fn map_tx_missing(txid: &str, r: Result<Value, Value>) -> Result<Value, RestReply> {
-    match r {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            let msg = rpc_message(&e);
-            if msg.contains("No such mempool") || msg.contains("not found") {
-                Err(err(
-                    axum::http::StatusCode::NOT_FOUND,
-                    &format!("{txid} not found"),
-                ))
-            } else {
-                Err(rpc_to_rest(e))
-            }
-        }
+    r.map_err(|e| tx_missing_reply(txid, e))
+}
+
+fn tx_missing_reply(txid: &str, e: Value) -> RestReply {
+    let msg = rpc_message(&e);
+    if msg.contains("No such mempool") || msg.contains("not found") {
+        err(
+            axum::http::StatusCode::NOT_FOUND,
+            &format!("{txid} not found"),
+        )
+    } else {
+        rpc_to_rest(e)
     }
 }
 

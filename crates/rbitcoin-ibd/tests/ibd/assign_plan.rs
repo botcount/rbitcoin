@@ -23,6 +23,8 @@ fn assign_policy_helpers_surface() {
     assert!(want_headers_beyond_soft_cap(64_000, 50_000, 100, 2048));
     // Dense but long ready_gap → no need
     assert!(!want_headers_beyond_soft_cap(64_000, 50_000, 10_000, 2048));
+    // ready_gap == gap_need is not short enough (`<`, not `<=`).
+    assert!(!want_headers_beyond_soft_cap(64_000, 50_000, 2048, 2048));
     // Empty path is not soft-cap headroom (tip 1-header storm).
     assert!(!want_headers_beyond_soft_cap(0, 0, 0, 2048));
     let dense = want_headers_beyond_soft_cap(64_000, 50_000, 100, 2048);
@@ -201,6 +203,21 @@ fn ordered_set_remove_and_compact_surface() {
     let before = ordered.len();
     compact_ordered(&mut ordered, &set);
     assert_eq!(ordered.len(), before);
+
+    // Ghost budget is half the live set once that half exceeds 64.
+    // live=200 → budget 100; 80 ghosts stay. A remainder budget of 64 compacts.
+    let mut ordered = VecDeque::new();
+    let mut set = HashSet::new();
+    for i in 1u16..=200 {
+        ordered.push_back(h(i));
+        set.insert(h(i));
+    }
+    for i in 1u16..=80 {
+        ordered.push_back(h(3000 + i));
+    }
+    assert_eq!(ordered.len(), 280);
+    compact_ordered(&mut ordered, &set);
+    assert_eq!(ordered.len(), 280);
 
     // remove front chain of ghosts after middle remove already did set.
     let mut ordered: VecDeque<_> = [h(1), h(2), h(3), h(4)].into_iter().collect();

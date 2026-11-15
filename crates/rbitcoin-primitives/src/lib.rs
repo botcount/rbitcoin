@@ -4,6 +4,8 @@
 //! store and node newtypes that must stay stable across crates.
 
 #[doc(hidden)]
+pub mod array_le;
+#[doc(hidden)]
 pub mod compact;
 #[doc(hidden)]
 pub mod hex;
@@ -105,6 +107,14 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
+/// **28:** `meta` only. A schema-27 binary does not read `spend.pages` and
+///         would hide spends it wrote into `spent.body` under a live log, so
+///         it refuses 28 `meta`. This binary rewrites 22–27 `meta` to 28.
+/// **27:** `meta` only. Historical spend slots, including the short tail
+///         page, live in `spend.pages` until fold. `--prune-seqsigwit` can
+///         leave `seqsigwit` at a header while creates remain. A 26 binary
+///         treats that empty locator as damage and truncates the chain, and
+///         it does not read the spend page log. A 27 binary refuses 28 `meta`.
 /// **26:** `header.body` is 88 B again. Occupied 24/25 strips the trailing
 ///         `size:u32` + `weight:u32`. Block size and weight come from `txstat`.
 ///         A 25 binary refuses 26 `meta`.
@@ -124,14 +134,15 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 ///         this binary opens.
 /// **21 and older:** not opened. Meta below 22 is one wipe-and-IBD refuse.
 ///         Those layouts are archaeology in `SCHEMA_HISTORY.md`.
-pub const SCHEMA_VERSION: u16 = 26;
+pub const SCHEMA_VERSION: u16 = 28;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
-/// Schema **26** is current. Meta **22** through **26** opens. Occupied **22**
+/// Schema **28** is current. Meta **22** through **28** opens. Occupied **22**
 /// rewrites `create.loc.ovf` 12 B rows to 16 B. Occupied **24/25** strips
-/// trailing size/weight from 96 B `header.body` rows. Any meta below **26**
-/// is rewritten to 26; a short `txstat.body` is aligned to the loc count.
+/// trailing size/weight from 96 B `header.body` rows. Any meta below **28**
+/// is rewritten to 28; a short `txstat.body` is aligned to the loc count.
+/// Table bytes do not change for 26. A 27 binary refuses 28 `meta`.
 /// Meta older than **22** is not
 /// openable: those Class A bodies (`tx.body`, `txout.body`, `inwit.body` /
 /// `seqsigwit.body`) were wiped, not rewritten.
@@ -204,6 +215,8 @@ pub enum Network {
     Testnet,
     Signet,
     Testnet4,
+    /// BIP 95.
+    Testnet5,
     Regtest,
 }
 
@@ -214,6 +227,7 @@ impl Network {
             Network::Testnet => "testnet",
             Network::Signet => "signet",
             Network::Testnet4 => "testnet4",
+            Network::Testnet5 => "testnet5",
             Network::Regtest => "regtest",
         }
     }
@@ -224,6 +238,7 @@ impl Network {
             "test" | "testnet" | "testnet3" => Ok(Network::Testnet),
             "signet" => Ok(Network::Signet),
             "testnet4" => Ok(Network::Testnet4),
+            "testnet5" => Ok(Network::Testnet5),
             "regtest" => Ok(Network::Regtest),
             other => Err(ParseNetworkError {
                 input: other.to_string(),
@@ -238,6 +253,7 @@ impl Network {
             Network::Testnet => 18333,
             Network::Signet => 38333,
             Network::Testnet4 => 48333,
+            Network::Testnet5 => 18353,
             Network::Regtest => 18444,
         }
     }
@@ -249,6 +265,7 @@ impl Network {
             Network::Testnet => 18332,
             Network::Signet => 38332,
             Network::Testnet4 => 48332,
+            Network::Testnet5 => 18352,
             Network::Regtest => 18443,
         }
     }

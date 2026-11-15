@@ -126,7 +126,9 @@ fn verify_job_uses_stashed_pre_for_bip143() {
         .to_byte_array();
     assert_eq!(ours, theirs);
     let pres: std::sync::Arc<[rbitcoin_consensus::TxPrecompute]> =
-        std::sync::Arc::from([rbitcoin_consensus::TxPrecompute::Script((*pre).clone())]);
+        std::sync::Arc::from([rbitcoin_consensus::TxPrecompute::Script(Box::new(
+            (*pre).clone(),
+        ))]);
     let job = ScriptCheckJob::with_txid(
         pre.txid,
         vec![TxOut {

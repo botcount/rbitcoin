@@ -16,6 +16,8 @@
 //! `build` owns fingerprints on the heap. After `write_then_map` /
 //! `read_from`, fingerprints are a read-only file map (`fuse8=` heap 0).
 
+use rbitcoin_primitives::{le_u32, le_u64};
+
 use crate::binary_fuse8::{BinaryFuse8, Fingerprints};
 use crate::error::StoreError;
 use crate::readonly_map::ReadonlyMap;
@@ -101,14 +103,14 @@ pub fn open_file(path: &Path) -> Result<SealedFuse8, StoreError> {
     let mut map = ReadonlyMap::map_path(path)?;
     let geo = {
         let bytes = map.as_file_bytes();
-        if bytes.len() < 16 {
+        let Some(head) = bytes.first_chunk::<16>() else {
+            return Err(StoreError::Corrupt("tx.head fuse magic"));
+        };
+        if &head[0..4] != MAGIC {
             return Err(StoreError::Corrupt("tx.head fuse magic"));
         }
-        if &bytes[0..4] != MAGIC {
-            return Err(StoreError::Corrupt("tx.head fuse magic"));
-        }
-        let ver = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        let len = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let ver = le_u32!(head, 4);
+        let len = le_u64!(head, 8);
         let Some(end) = 16u64.checked_add(len) else {
             return Err(StoreError::Corrupt("fuse8 v2 body unreadable"));
         };
@@ -152,20 +154,15 @@ pub struct V2Geometry {
 
 #[doc(hidden)]
 pub fn parse_v2_geometry(payload: &[u8]) -> Result<V2Geometry, StoreError> {
-    if payload.len() < 8 + 4 + 4 + 4 + 8 {
+    let Some(head) = payload.first_chunk::<28>() else {
         return Err(StoreError::Corrupt("fuse8 body short"));
-    }
-    let mut o = 0usize;
-    let seed = u64::from_le_bytes(payload[o..o + 8].try_into().unwrap());
-    o += 8;
-    let segment_length = u32::from_le_bytes(payload[o..o + 4].try_into().unwrap());
-    o += 4;
-    let segment_length_mask = u32::from_le_bytes(payload[o..o + 4].try_into().unwrap());
-    o += 4;
-    let segment_count_length = u32::from_le_bytes(payload[o..o + 4].try_into().unwrap());
-    o += 4;
-    let fp_len = u64::from_le_bytes(payload[o..o + 8].try_into().unwrap()) as usize;
-    o += 8;
+    };
+    let seed = le_u64!(head, 0);
+    let segment_length = le_u32!(head, 8);
+    let segment_length_mask = le_u32!(head, 12);
+    let segment_count_length = le_u32!(head, 16);
+    let fp_len = le_u64!(head, 20) as usize;
+    let o = 28usize;
     if fp_len > 512 * 1024 * 1024 {
         return Err(StoreError::Corrupt("fuse8 fingerprints too large"));
     }
@@ -219,8 +216,5 @@ pub fn encode_body(filter: &BinaryFuse8) -> Vec<u8> {
 /// Fold a 32-byte mixed head key into a u64 fuse key (stable, keyed via mix).
 #[inline]
 pub fn fuse_key_from_mixed(mixed: &[u8; 32]) -> u64 {
-    u64::from_le_bytes(mixed[0..8].try_into().unwrap())
-        ^ u64::from_le_bytes(mixed[8..16].try_into().unwrap())
-        ^ u64::from_le_bytes(mixed[16..24].try_into().unwrap())
-        ^ u64::from_le_bytes(mixed[24..32].try_into().unwrap())
+    le_u64!(mixed, 0) ^ le_u64!(mixed, 8) ^ le_u64!(mixed, 16) ^ le_u64!(mixed, 24)
 }

@@ -11,9 +11,15 @@
 # pushes the multi-arch manifest to GHCR, and to Docker Hub when the repo
 # variable DOCKERHUB_REPOSITORY is set, after the Release exists.
 #
+# Nightly builds master's musl binaries, smokes the image per arch, and
+# pushes it as `nightly` and `nightly-YYYYMMDD` to the same registries. It
+# skips Windows, Darwin, the NixOS VM test, and the GitHub Release.
+#
 # Triggers:
 #   - push of tag v*.*.* (publishes the Release and the image)
-#   - workflow_dispatch (build and smoke only; no tag → no Release, no push)
+#   - schedule (nightly image from master)
+#   - workflow_dispatch with nightly (the same, on demand; master only)
+#   - workflow_dispatch without nightly (build and smoke only; no push)
 
 name: release
 
@@ -21,12 +27,19 @@ on:
   push:
     tags:
       - "v*.*.*"
+  schedule:
+    - cron: "13 8 * * *"
   workflow_dispatch:
     inputs:
       ref:
         description: Git ref or SHA to build (empty = this branch tip)
         required: false
         default: ""
+      nightly:
+        description: Publish the nightly image (master tip only; ref must be empty)
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: release-${{ github.ref }}
@@ -39,6 +52,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   BUILD_REF: ${{ inputs.ref || github.sha }}
+  NIGHTLY: ${{ github.event_name == 'schedule' || inputs.nightly == true }}
 
 jobs:
   musl:
@@ -56,6 +70,19 @@ jobs:
     outputs:
       short: ${{ steps.meta.outputs.short }}
     steps:
+      # `nightly` must only ever name master. Another branch or a `ref`
+      # would publish code that is not on it.
+      - name: Nightly builds the master tip
+        if: env.NIGHTLY == 'true'
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != refs/heads/master || -n "$INPUT_REF" ]]; then
+            echo "nightly needs refs/heads/master and an empty ref (got $GITHUB_REF, ref '$INPUT_REF')" >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.BUILD_REF }}
@@ -171,6 +198,7 @@ jobs:
 
   windows:
     name: windows
+    if: github.event_name != 'schedule' && !inputs.nightly
     runs-on: windows-2022
     timeout-minutes: 120
     defaults:
@@ -214,6 +242,7 @@ jobs:
 
   macos:
     name: macos
+    if: github.event_name != 'schedule' && !inputs.nightly
     runs-on: macos-26
     timeout-minutes: 120
     env:
@@ -260,6 +289,7 @@ jobs:
 
   nixos-module-runtime:
     name: nixos-module-runtime
+    if: github.event_name != 'schedule' && !inputs.nightly
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -356,7 +386,8 @@ jobs:
             dist/rbitcoin-cli-aarch64-darwin \
             dist/SHA256SUMS.darwin
 
-  # Multi-arch manifest after the Release exists. The Dockerfile has no
+  # Multi-arch manifest after the Release exists, or after both smoke legs
+  # on a nightly (no Release). The Dockerfile has no
   # RUN, so this one runner assembles amd64 + arm64 without emulation from
   # the same staged binaries the `docker` legs smoked (sha256sum -c below).
   # GHCR always; Docker Hub when vars.DOCKERHUB_REPOSITORY is set (with
@@ -364,13 +395,18 @@ jobs:
   # scripts/docker-tags.sh.
   docker-publish:
     name: docker-publish
-    needs: [musl, publish]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    # One tag at a time across the repo. Each run picks X.Y / latest from
-    # the tags it fetches at its own start, so a tag pushed while another
-    # publishes cannot move them backwards. The workflow group above is per
-    # tag and does not serialize this. queue: max keeps every waiting tag;
-    # the default keeps one and cancels the older pending run.
+    needs: [musl, docker, publish]
+    # `publish` is skipped on a nightly, so success() cannot gate this.
+    if: >-
+      !cancelled() && needs.musl.result == 'success' && needs.docker.result == 'success' &&
+      ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.publish.result == 'success') ||
+      github.event_name == 'schedule' || inputs.nightly)
+    # One tag (or nightly) at a time across the repo. Each run picks X.Y /
+    # latest from the tags it fetches at its own start, so a tag pushed
+    # while another publishes cannot move them backwards. The workflow
+    # group above is per tag and does not serialize this. queue: max keeps
+    # every waiting tag; the default keeps one and cancels the older
+    # pending run.
     concurrency:
       group: docker-publish
       queue: max
@@ -422,11 +458,41 @@ jobs:
       - name: Build and push multi-arch image
         run: |
           set -euo pipefail
-          ver="${GITHUB_REF_NAME#v}"
-          tags="$(./scripts/docker-tags.sh "$GITHUB_REF_NAME")"
+          if [[ "$NIGHTLY" == true ]]; then
+            tags="$(./scripts/docker-tags.sh --nightly "$(date -u +%Y%m%d)")"
+          else
+            tags="$(./scripts/docker-tags.sh "$GITHUB_REF_NAME")"
+          fi
+          # The first tag is the version label: X.Y.Z, or nightly-YYYYMMDD.
+          ver="$(head -n 1 <<<"$tags")"
           images=("ghcr.io/${GITHUB_REPOSITORY,,}")
           if [[ -n "$DOCKERHUB_REPOSITORY" ]]; then
             images+=("docker.io/$DOCKERHUB_REPOSITORY")
+          fi
+          # A late nightly (a re-run, or one GitHub queued behind a newer
+          # one) must not move `nightly` back in any registry. This job's
+          # group holds the reads and the push together. Only the tag
+          # itself missing is a first nightly there. Any other read error,
+          # or a revision this clone cannot resolve, stops here rather
+          # than guess.
+          if [[ "$NIGHTLY" == true ]]; then
+            head="$(git rev-parse HEAD)"
+            for i in "${images[@]}"; do
+              if out="$(docker buildx imagetools inspect "$i:nightly" \
+                --format '{{json (index .Image "linux/amd64").Config.Labels}}' 2>&1)"; then
+                cur="$(jq -r '."org.opencontainers.image.revision" // empty' <<<"$out")"
+                [[ "$cur" =~ ^[0-9a-f]{40}$ ]] || { echo "$i:nightly revision is not a commit: '$cur'" >&2; exit 1; }
+                git cat-file -e "$cur^{commit}" 2>/dev/null ||
+                  { echo "$i:nightly names ${cur:0:12}, which this clone does not have" >&2; exit 1; }
+                if [[ "$cur" != "$head" ]] && git merge-base --is-ancestor "$head" "$cur"; then
+                  echo "$i:nightly ${cur:0:12} is newer than ${head:0:12}; not moving it back"
+                  exit 0
+                fi
+              elif [[ "$out" != "ERROR: $i:nightly: not found" ]]; then
+                echo "cannot read $i:nightly: $out" >&2
+                exit 1
+              fi
+            done
           fi
           refs=()
           for t in $tags; do

@@ -45,6 +45,15 @@ fn magic_for_all_networks() {
         Magic::from(bitcoin::Network::Signet)
     );
     assert_eq!(magic_for_params(&ChainParams::regtest()), Magic::REGTEST);
+    assert_eq!(
+        magic_for_params(&ChainParams::testnet4()),
+        Magic::from(bitcoin::Network::Testnet4)
+    );
+    assert_eq!(
+        magic_for_params(&ChainParams::testnet5()),
+        Magic::from_bytes(*b"FIVE"),
+        "BIP 95 message start"
+    );
 }
 
 #[test]
@@ -550,8 +559,9 @@ async fn redial_skips_a_connect_target_still_dialling() {
         1,
         "a dial still connecting must not be dialled again"
     );
-    // The stalled connect times out and drops the in-flight flag.
-    let deadline = std::time::Instant::now() + connect_bound * 3;
+    // The floor is the connect timeout. The in-flight flag drops when
+    // that task is polled, which is later than 3× the floor under load.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !node.peers.in_flight_nets().is_empty() {
         assert!(
             std::time::Instant::now() < deadline,
@@ -580,6 +590,145 @@ async fn redial_skips_a_connect_target_still_dialling() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `--proxy` name goes through SOCKS like an IP peer, so its connect gets
+/// the SOCKS bound, not the 8 s direct one. A proxy that accepts and never
+/// answers frees the dial when that bound runs out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxied_name_connect_gets_the_socks_bound() {
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let wake_accept = Arc::clone(&wake);
+    let stall = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = proxy.accept().await {
+            held.push(sock);
+            wake_accept.notify_one();
+        }
+    });
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("rbitcoin-proxied-name-bound-{n}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let connect_bound = Duration::from_millis(300);
+    let dialer =
+        rbitcoin_net::socks::Dialer::socks(proxy_addr, false).with_connect_floor(connect_bound);
+    let node = P2PNode::start_outbound_only(
+        Query::open_or_create_tiny(&dir).unwrap(),
+        ChainParams::regtest(),
+        Milestone::NONE,
+        "/rbitcoin:0.1.0(name-bound)/".into(),
+        0,
+        dialer.clone(),
+        rbitcoin_net::REDIAL_INTERVAL_TEST,
+    )
+    .await
+    .unwrap();
+    node.peers.set_proxies(rbitcoin_net::NetProxies {
+        dialer,
+        i2p_sam: None,
+    });
+    node.peers
+        .addnode_host("peer.invalid", "onetry", 18444)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), wake.notified())
+        .await
+        .expect("the name dial never reached the proxy");
+    let deadline = std::time::Instant::now() + connect_bound * 3;
+    while !node.peers.in_flight_nets().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a stalled SOCKS connect to a name must end at the SOCKS bound"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    stall.abort();
+    drop(node);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A silent inbound peer, and one that sends a byte every few hundred
+/// milliseconds during key exchange, must not hold an inbound slot past one
+/// peer-timeout. One address must not fill the inbound table with sockets
+/// that have not finished the handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listener_cap_silent_inbound_releases_the_slot() {
+    use tokio::io::AsyncWriteExt;
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("rbitcoin-inbound-deadline-{n}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let node = P2PNode::start_with_agent(
+        "127.0.0.1:0".parse().unwrap(),
+        Query::open_or_create_tiny(&dir).unwrap(),
+        ChainParams::regtest(),
+        Milestone::NONE,
+        "/rbitcoin:0.1.0(deadline)/".into(),
+        rbitcoin_net::DEFAULT_MAX_INBOUND,
+        rbitcoin_net::REDIAL_INTERVAL_TEST,
+    )
+    .await
+    .unwrap();
+    node.peers.set_peer_timeout_secs(1);
+    let mut silent = tokio::net::TcpStream::connect(node.local_addr)
+        .await
+        .unwrap();
+    let mut drip = tokio::net::TcpStream::connect(node.local_addr)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let mut saw_row = false;
+    let mut cleared = false;
+    while started.elapsed() < Duration::from_secs(3) {
+        if !node.peers.snapshot().is_empty() {
+            saw_row = true;
+        }
+        let _ = drip.write_all(&[0x11]).await;
+        if saw_row && node.peers.snapshot().is_empty() {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(saw_row, "the silent inbound never took a slot");
+    assert!(
+        cleared && started.elapsed() < Duration::from_secs(2),
+        "unfinished handshakes still held slots after {:?}",
+        started.elapsed()
+    );
+    let _ = silent.shutdown().await;
+    drop(silent);
+    drop(drip);
+
+    node.peers.set_peer_timeout_secs(30);
+    let mut parked = Vec::new();
+    for _ in 0..24 {
+        parked.push(
+            tokio::net::TcpStream::connect(node.local_addr)
+                .await
+                .unwrap(),
+        );
+    }
+    let cap = rbitcoin_net::peers::MAX_INCOMPLETE_INBOUND_PER_ADDR;
+    let wait = std::time::Instant::now();
+    let mut saw = 0usize;
+    while wait.elapsed() < Duration::from_secs(2) {
+        let n = node.peers.snapshot().len();
+        assert!(n <= cap, "one address held {n} unfinished handshakes");
+        saw = saw.max(n);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(saw > 0, "no unfinished handshake took a slot");
+    drop(parked);
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn outbound_connect_timeout_is_eight_seconds() {
     assert_eq!(OUTBOUND_CONNECT_TIMEOUT, Duration::from_secs(8));
@@ -597,6 +746,30 @@ fn accept_retries_a_full_fd_table_and_stops_on_a_dead_listener() {
     assert!(!accept_error_ends_listen(&emfile));
     assert!(!accept_error_ends_listen(&enfile));
     assert!(accept_error_ends_listen(&dead));
+    let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "rst");
+    let wsaemfile = std::io::Error::from_raw_os_error(10024);
+    let wsaenobufs = std::io::Error::from_raw_os_error(10055);
+    let wsaenetdown = std::io::Error::from_raw_os_error(10050);
+    let eperm = std::io::Error::from_raw_os_error(1);
+    let enobufs = std::io::Error::from_raw_os_error(105);
+    let enomem = std::io::Error::from_raw_os_error(12);
+    let ebadf = std::io::Error::from_raw_os_error(9);
+    assert!(!accept_error_ends_listen(&reset));
+    assert!(!accept_error_ends_listen(&wsaemfile));
+    assert!(!accept_error_ends_listen(&wsaenobufs));
+    assert!(!accept_error_ends_listen(&wsaenetdown));
+    assert!(!accept_error_ends_listen(&eperm));
+    assert!(!accept_error_ends_listen(&enobufs));
+    assert!(!accept_error_ends_listen(&enomem));
+    assert!(accept_error_ends_listen(&ebadf));
+}
+
+#[test]
+fn inbound_handshake_limit_cannot_exceed_sixty_seconds() {
+    use rbitcoin_net::peer::{inbound_handshake_limit, HANDSHAKE_TIMEOUT};
+    assert_eq!(inbound_handshake_limit(1), Duration::from_secs(1));
+    assert_eq!(inbound_handshake_limit(60), HANDSHAKE_TIMEOUT);
+    assert_eq!(inbound_handshake_limit(3600), HANDSHAKE_TIMEOUT);
 }
 
 #[tokio::test]

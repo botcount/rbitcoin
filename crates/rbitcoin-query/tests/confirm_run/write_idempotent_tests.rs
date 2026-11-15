@@ -1322,7 +1322,7 @@ fn fill_same_batch_abs_from_append_loc_ram() {
                 (std::sync::Arc::clone(&child_pin), child_ins),
             ],
             false,
-            &[],
+            rbitcoin_store::tx_table::SpentBodyImage::zeros(&[1, 1]),
         )
         .unwrap();
     assert_eq!(fks[0], Fk(1));
@@ -1520,7 +1520,11 @@ fn structural_same_batch_overlay_skips_meta_pread() {
         script_sig: vec![],
         witness: vec![],
     }];
-    let overlay = [vec![(0u32, Fk(2), 0)], vec![]];
+    let overlay = rbitcoin_store::tx_table::SpentBodyImage::from_pairs(
+        &[2, 1],
+        &[vec![(0u32, Fk(2), 0)], vec![]],
+    )
+    .unwrap();
     let (fks, loc) = q
         .store()
         .put_tx_full_batch_from_pins(
@@ -1529,7 +1533,7 @@ fn structural_same_batch_overlay_skips_meta_pread() {
                 (std::sync::Arc::clone(&child_pin), child_ins),
             ],
             false,
-            &overlay,
+            overlay,
         )
         .unwrap();
     assert_eq!(fks, vec![Fk(1), Fk(2)]);
@@ -1695,7 +1699,7 @@ fn structural_scratch_second_block_does_not_replay_first_slots() {
                 vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
             )],
             false,
-            &[],
+            rbitcoin_store::tx_table::SpentBodyImage::zeros(&[2]),
         )
         .unwrap();
     let mut bp = BatchParents::new();
@@ -1815,6 +1819,16 @@ fn structural_scratch_second_block_does_not_replay_first_slots() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+#[test]
+fn meta_prefetch_slice_rejects_a_shifted_offset() {
+    use rbitcoin_query::block_pipeline::meta_prefetch_slice_matches;
+    assert!(meta_prefetch_slice_matches(&[10, 18, 26], 0, &[10, 18]));
+    assert!(meta_prefetch_slice_matches(&[10, 18, 26], 2, &[26]));
+    assert!(!meta_prefetch_slice_matches(&[10, 18, 26], 0, &[10, 26]));
+    assert!(!meta_prefetch_slice_matches(&[10, 18], 1, &[18, 26]));
+    assert!(!meta_prefetch_slice_matches(&[10], usize::MAX, &[10]));
+}
+
 /// Spend index off must not write or count annotate slots structural already filled.
 #[test]
 fn post_commit_spend_index_off_leaves_slots_unwritten() {
@@ -1841,7 +1855,7 @@ fn post_commit_spend_index_off_leaves_slots_unwritten() {
                 )],
             )],
             false,
-            &[],
+            rbitcoin_store::tx_table::SpentBodyImage::zeros(&[1]),
         )
         .unwrap();
     let create_fk = fks[0];
@@ -1890,7 +1904,7 @@ fn fill_just_written_survives_until_last_started_write() {
                 )],
             )],
             false,
-            &[],
+            rbitcoin_store::tx_table::SpentBodyImage::zeros(&[1]),
         )
         .unwrap();
     q.set_lookup_started_hi(Some(496));
@@ -1968,7 +1982,7 @@ fn fill_stamp_spent_hole_from_write_tls() {
                 )],
             )],
             false,
-            &[],
+            rbitcoin_store::tx_table::SpentBodyImage::zeros(&[1]),
         )
         .unwrap();
     let mut inflight = InFlight::new();
@@ -2044,7 +2058,7 @@ fn pin_and_ensure_from_pin_loc_without_tls() {
                 vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
             )],
             false,
-            &[],
+            rbitcoin_store::tx_table::SpentBodyImage::zeros(&[1]),
         )
         .unwrap();
     parent_pin.set_loc(loc[0]);
@@ -3411,7 +3425,7 @@ fn structural_run_clears_reused_scratch_between_batches() {
                 vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
             )],
             false,
-            &[],
+            rbitcoin_store::tx_table::SpentBodyImage::zeros(&[1]),
         )
         .unwrap();
     let mut bp = BatchParents::new();
@@ -3532,6 +3546,192 @@ fn structural_run_clears_reused_scratch_between_batches() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+/// Two blocks in one write: misses that share a spend page are one peek,
+/// and a later spend of an outpoint already spent in that write is rejected.
+#[test]
+fn structural_run_reads_spend_meta_once_per_write() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version};
+    use bitcoin::hashes::Hash;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        Amount, Block, BlockHash, CompactTarget, OutPoint, Sequence, Transaction, TxIn, TxOut,
+        Witness,
+    };
+    use rbitcoin_consensus::ConsensusError;
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::confirm_run::phases::{structural_run, StructuralReuse};
+    use rbitcoin_query::confirm_run::{collect_spend_abs_after_fill, Prepared};
+    use rbitcoin_query::BatchParents;
+    use rbitcoin_query::ConfirmError;
+    use rbitcoin_store::{InputRecord, OutputRecord};
+    use std::sync::Arc;
+
+    let (path, q) = tiny_query();
+    let parent_pin = rbitcoin_query::CreatePinInner::records(
+        rec_tx(0x41, 2),
+        vec![
+            OutputRecord::unspent(1, vec![0x51]),
+            OutputRecord::unspent(1, vec![0x52]),
+        ],
+    );
+    let (fks, loc) = q
+        .store()
+        .put_tx_full_batch_from_pins(
+            &[(
+                std::sync::Arc::clone(&parent_pin),
+                vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+            )],
+            false,
+            rbitcoin_store::tx_table::SpentBodyImage::zeros(&[2]),
+        )
+        .unwrap();
+    let mut bp = BatchParents::new();
+    bp.insert_create_pin(
+        fks[0],
+        parent_pin,
+        vec![0, 1],
+        Some(false),
+        Some(loc[0].txout),
+        Vec::new(),
+    );
+    bp.set_spent_range_only(fks[0], loc[0].spent);
+    q.store()
+        .header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(100), fks[0], 1)
+        .unwrap();
+    q.store()
+        .confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), Fk(100))
+        .unwrap();
+    q.store().rebuild_height_fence().unwrap();
+
+    let params = ChainParams::regtest();
+    let bits = CompactTarget::from_consensus(0x207f_ffff);
+    let one_block = |height: u32, vout: u32, coinbase_byte: u8, hash: u8| {
+        let coinbase = Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![coinbase_byte, 0x01]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let child = Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([0x41; 32]),
+                    vout,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut block = Block {
+            header: Header {
+                version: Version::from_consensus(4),
+                prev_blockhash: BlockHash::from_byte_array([0u8; 32]),
+                merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                time: 1_300_000_000 + height,
+                bits,
+                nonce: height,
+            },
+            txdata: vec![coinbase, child],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let prepared = Prepared {
+            height: Height(height),
+            header_fk: Fk(100 + u64::from(height)),
+            tx_fks: vec![Fk(9 + u64::from(height))],
+            jobs: vec![],
+            spends: vec![([0x41; 32], vout, Fk(9 + u64::from(height)), fks[0], 0)],
+            fees: 0,
+            check_scripts: false,
+            time: 1_300_000_000 + height,
+            bits,
+            hash: [hash; 32],
+            txids: Vec::new(),
+            prev_mtp: 1_300_000_000,
+        };
+        (block, prepared)
+    };
+
+    let (b1, p1) = one_block(1, 0, 0x02, 2);
+    let (b2, p2) = one_block(2, 1, 0x03, 3);
+    let prepared = [p1, p2];
+    let jobs = collect_spend_abs_after_fill(&bp, &prepared).expect("parent abs");
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].len(), 1);
+    assert_eq!(jobs[1].len(), 1);
+    let page = jobs[0][0].2 & !4095;
+    assert_eq!(
+        jobs[1][0].2 & !4095,
+        page,
+        "the two misses share a spend page"
+    );
+    let wire = vec![Arc::new(b1), Arc::new(b2)];
+    rbitcoin_store::tx_table::reset_spend_meta_read_counts();
+    let mut reuse = StructuralReuse::default();
+    let (_ph, slots) = structural_run(
+        &q,
+        &params,
+        Milestone::NONE,
+        &prepared,
+        &wire,
+        &bp,
+        &jobs,
+        &rbitcoin_query::block_pipeline::ClassAWave::default(),
+        &mut reuse,
+    )
+    .expect("two first spends of an unspent page");
+    assert_eq!(
+        rbitcoin_store::tx_table::spend_meta_read_counts(),
+        (1, 1),
+        "one directory probe and one grouped body peek"
+    );
+    assert_eq!(slots.known.len(), 2);
+    assert!(slots.known.iter().all(|known| known.0.is_null()));
+
+    let (a1, q1) = one_block(1, 0, 0x04, 4);
+    let (a2, q2) = one_block(2, 0, 0x05, 5);
+    let again = [q1, q2];
+    let again_jobs = collect_spend_abs_after_fill(&bp, &again).expect("same outpoint");
+    let again_wire = vec![Arc::new(a1), Arc::new(a2)];
+    rbitcoin_store::tx_table::reset_spend_meta_read_counts();
+    let err = structural_run(
+        &q,
+        &params,
+        Milestone::NONE,
+        &again,
+        &again_wire,
+        &bp,
+        &again_jobs,
+        &rbitcoin_query::block_pipeline::ClassAWave::default(),
+        &mut StructuralReuse::default(),
+    )
+    .expect_err("the second block spends an outpoint the first block took");
+    assert!(matches!(
+        err,
+        ConfirmError::Rules(ConsensusError::PrevoutSpent)
+    ));
+    assert_eq!(rbitcoin_store::tx_table::spend_meta_read_counts().0, 1);
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 fn assert_spindle_schedule(trace: &[&str], hdd: bool, expect_class_a: bool) {
     let head = trace
         .iter()
@@ -3561,7 +3761,8 @@ fn assert_spindle_schedule(trace: &[&str], hdd: bool, expect_class_a: bool) {
             "hold" => depth += 1,
             "release" => depth -= 1,
             "head" | "join" => assert_eq!(depth, 0, "{trace:?}"),
-            "class-a" | "ann-begin" | "ann-end" if hdd => assert!(depth > 0, "{trace:?}"),
+            "class-a" if hdd => assert!(depth > 0, "{trace:?}"),
+            "ann-begin" | "ann-end" => assert_eq!(depth, 0, "{trace:?}"),
             _ => {}
         }
         assert!(depth >= 0, "{trace:?}");

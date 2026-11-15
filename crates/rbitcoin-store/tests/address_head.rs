@@ -420,6 +420,13 @@ fn untagged_rows_match_any_key_until_filled() {
     let _ = std::fs::remove_file(meta_path(&path));
 }
 
+#[test]
+fn fingerprint_uses_bytes_16_through_23() {
+    let mixed: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(3).wrapping_add(1));
+    assert_eq!(fingerprint(&mixed, 32), 0);
+    assert_eq!(fingerprint(&mixed, 10), 3_968_334);
+}
+
 /// Every occupied slot in the file carries its key's fingerprint, and the
 /// map sees each insert.
 #[test]
@@ -862,10 +869,10 @@ fn head_access_env_probe_stats_and_layout_helpers() {
     let roll_thr = (100_f64 * HEAD_LOAD_START).floor() as u64;
     assert_eq!(roll_thr, 80);
     assert!(81 >= roll_thr);
-    let ext = encode_layout_ext(layout, 7);
+    let ext = encode_layout_ext(layout, 0x0807_0605_0403_0201);
     let (dec, gen) = decode_layout_ext(&ext).unwrap();
     assert_eq!(dec.bits, layout.bits);
-    assert_eq!(gen, 7);
+    assert_eq!(gen, 0x0807_0605_0403_0201);
     let bad = [0u8; 16];
     assert!(decode_layout_ext(&bad).is_err());
     let path = std::env::temp_dir().join(format!(
@@ -880,4 +887,14 @@ fn head_access_env_probe_stats_and_layout_helpers() {
     std::fs::write(&meta, b"x").unwrap();
     remove_legacy_meta_sidecar(&path);
     assert!(!meta.exists());
+}
+
+#[test]
+fn entry_from_page_reads_four_and_skips_short() {
+    let word = 0x0102_0304u32.to_le_bytes();
+    assert_eq!(
+        entry_from_page_buf(&word, 0),
+        Some(u64::from(0x0102_0304u32))
+    );
+    assert_eq!(entry_from_page_buf(&word[..3], 0), None);
 }

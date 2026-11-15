@@ -11,6 +11,100 @@ fn bind() -> SocketAddr {
 }
 
 #[test]
+fn loopback_forward_does_not_inherit_loopback_net_permission() {
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let mut t = NetPermTable::default();
+    t.whitelist
+        .push(parse_whitelist("noban,relay,forcerelay@127.0.0.1").unwrap());
+    t.whitebind
+        .push(parse_whitebind("noban@127.0.0.1:8335").unwrap());
+    peers.set_net_perms(t);
+    let loopback: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+    let mapped: SocketAddr = "[::ffff:127.0.0.1]:40000".parse().unwrap();
+    let p2p: SocketAddr = "0.0.0.0:8333".parse().unwrap();
+    let wallet: SocketAddr = "127.0.0.1:8335".parse().unwrap();
+    let remote: SocketAddr = "203.0.113.9:8333".parse().unwrap();
+
+    assert!(peers
+        .permission_flags(loopback, true, p2p)
+        .has(NetPermissionFlags::NOBAN));
+
+    peers.set_overlay_loopback_forward(true);
+    for src in [loopback, mapped] {
+        let flags = peers.permission_flags(src, true, p2p);
+        assert!(
+            !flags.has(NetPermissionFlags::NOBAN),
+            "{src} took noban from the loopback subnet"
+        );
+        assert!(!flags.has(NetPermissionFlags::RELAY));
+        assert!(!flags.has(NetPermissionFlags::FORCE_RELAY));
+    }
+    assert!(peers
+        .permission_flags(loopback, true, wallet)
+        .has(NetPermissionFlags::NOBAN));
+    assert!(!peers
+        .permission_flags(loopback, true, wallet)
+        .has(NetPermissionFlags::RELAY));
+
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NONE,
+        timestamp: 0,
+        receiver: Address::new(&loopback, ServiceFlags::NONE),
+        sender: Address::new(&loopback, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let live = peers.register(
+        loopback,
+        p2p,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    assert!(
+        !live.session_noban(),
+        "a loopback inbound session still took noban"
+    );
+    assert!(!live.session_relay_perm());
+    assert!(!live.session_forcerelay());
+    let bound = peers.register(
+        loopback,
+        wallet,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    assert!(
+        bound.session_noban(),
+        "permission-bind on another port still grants"
+    );
+    assert!(!bound.session_relay_perm());
+
+    let mut wide = NetPermTable::default();
+    wide.whitelist
+        .push(parse_whitelist("relay@203.0.113.9").unwrap());
+    peers.set_net_perms(wide);
+    assert!(peers
+        .permission_flags(remote, true, p2p)
+        .has(NetPermissionFlags::RELAY));
+    assert!(!peers
+        .permission_flags(loopback, true, p2p)
+        .has(NetPermissionFlags::RELAY));
+
+    peers.set_net_perms(NetPermTable::default());
+    assert_eq!(
+        peers.permission_flags(loopback, true, p2p),
+        NetPermissionFlags::NONE
+    );
+}
+
+#[test]
 fn loopback_grant_does_not_cover_onion_or_i2p() {
     let mut t = NetPermTable::default();
     t.whitelist
@@ -197,6 +291,51 @@ fn whitelist_prefix_and_ipv6() {
 }
 
 #[test]
+fn prefix_masks_keep_the_named_bits() {
+    let host = |o: [u8; 4]| IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], o[3]));
+    let v4 = parse_whitelist("noban@10.0.0.0/8").unwrap();
+    assert!(v4.subnet.contains(host([10, 1, 2, 3])));
+    assert!(!v4.subnet.contains(host([11, 0, 0, 1])));
+    let pair = parse_whitelist("noban@10.0.0.0/31").unwrap();
+    assert!(pair.subnet.contains(host([10, 0, 0, 0])));
+    assert!(pair.subnet.contains(host([10, 0, 0, 1])));
+    assert!(!pair.subnet.contains(host([10, 0, 0, 2])));
+    let one = parse_whitelist("noban@10.1.2.3/32").unwrap();
+    assert!(one.subnet.contains(host([10, 1, 2, 3])));
+    assert!(!one.subnet.contains(host([10, 1, 2, 4])));
+    let any = parse_whitelist("noban@0.0.0.0/0").unwrap();
+    assert!(any.subnet.contains(host([8, 8, 8, 8])));
+
+    let v6 = parse_whitelist("noban@2001:db8::/32").unwrap();
+    assert!(v6
+        .subnet
+        .contains(IpAddr::V6("2001:db8:1::".parse().unwrap())));
+    assert!(!v6
+        .subnet
+        .contains(IpAddr::V6("2001:db9::".parse().unwrap())));
+}
+
+#[test]
+fn whitebind_matches_only_that_socket() {
+    let wb = parse_whitebind("noban@127.0.0.1:18444").unwrap();
+    let mut t = NetPermTable::default();
+    t.whitebind.push(wb);
+    let hit = SocketAddr::from(([127, 0, 0, 1], 18444));
+    let other = SocketAddr::from(([127, 0, 0, 1], 18445));
+    assert!(t.flags_for(ip(), true, hit).has(NetPermissionFlags::NOBAN));
+    assert!(
+        !t.flags_for(ip(), true, other)
+            .has(NetPermissionFlags::NOBAN),
+        "a different port is not this bind"
+    );
+    assert_eq!(
+        t.flags_for(ip(), false, hit),
+        NetPermissionFlags::NONE,
+        "whitebind is inbound only"
+    );
+}
+
+#[test]
 fn ipv6_cidr_matches_only_v6() {
     let g = parse_whitelist("noban@::1").unwrap();
     assert!(g.subnet.contains(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
@@ -238,6 +377,11 @@ fn flags_bitor_and_unmatched_subnet() {
     let a = NetPermissionFlags::NOBAN | NetPermissionFlags::RELAY;
     assert!(a.has(NetPermissionFlags::NOBAN));
     assert!(a.has(NetPermissionFlags::RELAY));
+    let same = NetPermissionFlags::NOBAN | NetPermissionFlags::NOBAN;
+    assert!(
+        same.has(NetPermissionFlags::NOBAN),
+        "or with the same flag must keep that bit"
+    );
     let mut b = NetPermissionFlags::BLOOM;
     b |= NetPermissionFlags::ADDR;
     assert_eq!(b.to_strings(), ["bloomfilter", "addr"]);

@@ -512,6 +512,49 @@ fn verify_one_script_job_skips_anyone_can_spend() {
 }
 
 #[test]
+fn a_later_input_is_checked_after_an_anyone_can_spend() {
+    use rbitcoin_consensus::script::verify_job_all_inputs;
+    let acs = TxOut {
+        value: Amount::from_sat(1),
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+    };
+    let job = rbitcoin_consensus::block::ScriptCheckJob::new(
+        vec![acs.clone(), acs],
+        Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid::from_byte_array([9; 32]),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid::from_byte_array([9; 32]),
+                        vout: 1,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::from_slice(&[vec![0x01]]),
+                },
+            ],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        },
+        rbitcoin_consensus::block::ScriptVerifyFlags::buried(true, true, true, true, true),
+    );
+    let err = verify_job_all_inputs(&job).expect_err("second input has a witness");
+    assert!(format!("{err}").contains("WITNESS_UNEXPECTED"), "{err:?}");
+}
+
+#[test]
 fn job_tx_traits_and_shared_mut_panic() {
     use bitcoin::block::{Header, Version};
     use bitcoin::{Block, BlockHash, CompactTarget, TxMerkleNode};

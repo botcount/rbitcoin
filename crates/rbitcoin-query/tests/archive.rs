@@ -107,6 +107,55 @@ fn append_tx_sizes_only_when_both_sides_match_packed() {
     assert_ne!(right_only.tx_sizes.len(), right_only.packed.len());
 }
 
+/// A merged plan whose later block re-spends P:0 holds two edges for it.
+/// The overlay names the first spender (lowest fk) whatever the edge map's
+/// order, and keeps the other vout. The spender fks sweep the map's buckets
+/// so the later spender comes last in iteration for some of them.
+#[test]
+fn spent_overlay_names_the_first_spender_of_a_vout() {
+    use rbitcoin_query::SpendEdge;
+    let edge = |spend: u64, vout: u32, vin: u32| SpendEdge {
+        prev_txid: [7; 32],
+        vout,
+        spend_fk: Fk(spend),
+        create_fk: Fk(1),
+        vin,
+    };
+    for later in 3..=40u64 {
+        let mut plan = size_plan(1, false);
+        plan.append(size_plan(2, false));
+        plan.append(size_plan(3, false));
+        plan.packed[0].0 = rbitcoin_query::CreatePinInner::records(
+            TxRecord {
+                txid: [1; 32],
+                version: 1,
+                locktime: 0,
+                input_count: 0,
+                output_count: 2,
+            },
+            vec![
+                OutputRecord::unspent(1, vec![0x51]),
+                OutputRecord::unspent(1, vec![0x51]),
+            ],
+        );
+        plan.planned_fks = vec![Fk(1), Fk(2), Fk(later)];
+        plan.edges.insert(2, vec![edge(2, 0, 0)]);
+        plan.edges
+            .insert(later, vec![edge(later, 0, 0), edge(later, 1, 1)]);
+        let image = plan.same_batch_spent_overlay().expect("overlay");
+        let slot = |vout: u32| {
+            let off = image.offs()[0] + (vout as usize) * OutputRecord::SPENT_SLOT_LEN;
+            let (_flags, fk, vin) = rbitcoin_store::tx_table::decode_spent_slot(
+                &image.bytes()[off..off + OutputRecord::SPENT_SLOT_LEN],
+            )
+            .expect("slot");
+            (vout, fk, vin)
+        };
+        assert_eq!(slot(0), (0, Fk(2), 0), "later spender fk {later}");
+        assert_eq!(slot(1), (1, Fk(later), 1), "later spender fk {later}");
+    }
+}
+
 fn coinbase_apply(i: u64) -> TxApply {
     let mut txid = [0u8; 32];
     txid[0..8].copy_from_slice(&i.to_le_bytes());

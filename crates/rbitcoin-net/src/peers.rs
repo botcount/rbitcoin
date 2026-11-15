@@ -21,8 +21,13 @@ use tokio::sync::{mpsc, watch, Notify};
 /// the next inbound request from that peer waits until the writer drains.
 pub const PEER_SEND_BUDGET: usize = 4 * 1024 * 1024;
 
+/// Core `HEADERS_RESPONSE_TIME`: after this long without a reply, a new
+/// getheaders may go out to the same peer.
+pub const HEADERS_RESPONSE_TIME_SECS: u64 = 120;
+
 /// Queued-byte estimate. Headers are 81 wire bytes, inv-like rows are 36,
-/// legacy addr rows are 30. Encoded block bodies use their buffer length.
+/// legacy addr rows are 30. Filter replies and compact blocks are counted
+/// from the fields they already hold. Encoded block bodies use their buffer.
 pub fn outbound_msg_bytes(msg: &NetworkMessage) -> usize {
     match msg {
         NetworkMessage::Headers(h) => h.len().saturating_mul(81),
@@ -34,14 +39,37 @@ pub fn outbound_msg_bytes(msg: &NetworkMessage) -> usize {
         NetworkMessage::BlockTxn(bt) => {
             // BlockTransactions: hash, compact count, then each transaction.
             let txs = &bt.transactions.transactions;
-            32 + bitcoin::consensus::encode::VarInt(txs.len() as u64).size()
-                + txs.iter().map(|tx| tx.total_size()).sum::<usize>()
+            32 + varint_len(txs.len()) + txs.iter().map(|tx| tx.total_size()).sum::<usize>()
         }
         NetworkMessage::Addr(a) => a.len().saturating_mul(30),
         NetworkMessage::AddrV2(a) => a.len().saturating_mul(61),
-        NetworkMessage::CmpctBlock(_) => 1024,
+        NetworkMessage::CFilter(m) => 1 + 32 + varint_len(m.filter.len()) + m.filter.len(),
+        NetworkMessage::CFHeaders(m) => 1 + 32 + 32 + hash_vec_len(m.filter_hashes.len()),
+        NetworkMessage::CFCheckpt(m) => 1 + 32 + hash_vec_len(m.filter_headers.len()),
+        NetworkMessage::CmpctBlock(m) => compact_block_len(&m.compact_block),
         _ => 64,
     }
+}
+
+fn varint_len(n: usize) -> usize {
+    bitcoin::consensus::encode::VarInt(n as u64).size()
+}
+
+fn hash_vec_len(n: usize) -> usize {
+    varint_len(n) + n.saturating_mul(32)
+}
+
+fn compact_block_len(block: &bitcoin::bip152::HeaderAndShortIds) -> usize {
+    // Header, nonce, short ids (6 bytes), then each prefilled index and tx.
+    80 + 8
+        + varint_len(block.short_ids.len())
+        + block.short_ids.len().saturating_mul(6)
+        + varint_len(block.prefilled_txs.len())
+        + block
+            .prefilled_txs
+            .iter()
+            .map(|pre| varint_len(usize::from(pre.idx)) + pre.tx.total_size())
+            .sum::<usize>()
 }
 
 pub fn outbound_queued_bytes(out: &PeerOut) -> usize {
@@ -198,6 +226,10 @@ impl DialTarget {
         match addr {
             crate::NetAddr::Ip(s) => Self::Socket(s),
             crate::NetAddr::Cjdns { ip, port } => Self::Socket(SocketAddr::from((ip, port))),
+            crate::NetAddr::Name { id, port } => Self::Domain {
+                host: id.host(),
+                port,
+            },
             other => Self::Domain {
                 host: other.host_str(),
                 port: other.port(),
@@ -217,15 +249,50 @@ impl DialTarget {
         self.version_socket()
     }
 
-    /// An overlay host is its own `NetAddr`. A DNS name (a `--proxy` seed
-    /// addr-fetch) has no address until the proxy resolves it, so it is the
-    /// [`Self::version_socket`] `0.0.0.0:port`.
+    /// Whether the target has a key of its own. False for a name once the
+    /// interner is full: such a dial is refused, never keyed `0.0.0.0:port`,
+    /// where it would share a key with every other overflow name.
+    pub fn has_key(&self) -> bool {
+        match self {
+            Self::Socket(_) => true,
+            Self::Domain { host, port } => {
+                format!("{host}:{port}").parse::<crate::NetAddr>().is_ok()
+                    || crate::NetAddr::name(host, *port).is_some()
+            }
+        }
+    }
+
+    /// An overlay host is its own `NetAddr`. A DNS name has no address until
+    /// the proxy resolves it, so the name is its key. Callers refuse a target
+    /// without [`Self::has_key`] first; the `0.0.0.0:port` fallback only keeps
+    /// this total.
     pub fn net_addr(&self) -> crate::NetAddr {
         match self {
             Self::Socket(addr) => crate::NetAddr::from_socket(*addr),
             Self::Domain { host, port } => format!("{host}:{port}")
                 .parse()
-                .unwrap_or_else(|_| crate::NetAddr::from_socket(self.version_socket())),
+                .ok()
+                .or_else(|| crate::NetAddr::name(host, *port))
+                .unwrap_or_else(|| crate::NetAddr::from_socket(self.version_socket())),
+        }
+    }
+}
+
+/// The refusal for a name past the interner cap.
+#[doc(hidden)]
+pub const NO_NAME_KEY: &str =
+    "too many distinct proxied host names this run; restart the node to dial a new one";
+
+impl DialTarget {
+    /// [`Self::net_addr`] without interning: `None` for a name nobody added,
+    /// which can be neither live nor removable.
+    fn known_net_addr(&self) -> Option<crate::NetAddr> {
+        match self {
+            Self::Socket(addr) => Some(crate::NetAddr::from_socket(*addr)),
+            Self::Domain { host, port } => format!("{host}:{port}")
+                .parse()
+                .ok()
+                .or_else(|| crate::NetAddr::known_name(host, *port)),
         }
     }
 }
@@ -359,6 +426,9 @@ pub struct LivePeer {
     last_tip_offered: Mutex<Option<BlockHash>>,
     /// Best connected block this peer advertised.
     pub best_known: Mutex<Option<BlockHash>>,
+    /// Chain work of [`Self::best_known`] when that hash was stored.
+    /// Kept after the header leaves the pending map and is not on our tip.
+    best_known_work: Mutex<Option<bitcoin::Work>>,
     /// Block hashes this peer just sent us — do not announce them back.
     pub recently_from: Mutex<HashSet<BlockHash>>,
     /// We already sent inv-triggered getheaders this session (before sync).
@@ -367,8 +437,9 @@ pub struct LivePeer {
     pub sync_started: AtomicBool,
     /// Unix seconds when initial headers sync times out (`0` = none).
     pub headers_sync_timeout: AtomicU64,
-    /// Waiting for a headers reply to our getheaders (no BIP130 cap).
-    pub awaiting_headers: AtomicBool,
+    /// Hub-clock seconds our last marked getheaders went out (`0` = none
+    /// in flight). Core `m_last_getheaders_timestamp`.
+    pub getheaders_sent_at: AtomicU64,
     /// Wtxids we INV'd to this peer. GetData for a live mempool tx is
     /// answered only if announced here or the tx is reorg-servable.
     pub announced_wtx: Mutex<CappedSet<Wtxid>>,
@@ -388,6 +459,10 @@ pub struct LivePeer {
     pub ping_start_secs: AtomicU64,
     /// RPC `ping` queued a probe.
     pub ping_queued: AtomicBool,
+    /// Latest nonce to put on the pong. Zero is a real nonce.
+    pub pong_nonce: AtomicU64,
+    /// A pong is already sitting on this session's outbound queue.
+    pub pong_pending: AtomicBool,
     pub pingtime: Mutex<Option<f64>>,
     pub minping: Mutex<Option<f64>>,
     pub owner: std::sync::Weak<PeerHub>,
@@ -395,6 +470,8 @@ pub struct LivePeer {
     pub sent: Mutex<HashMap<String, u64>>,
     pub last_block: AtomicU64,
     pub last_transaction: AtomicU64,
+    /// Unix seconds when this peer last first announced a block unknown to us.
+    pub last_block_announcement: AtomicU64,
     pub minfeefilter_sat_kvb: AtomicU64,
     /// Last BIP133 feefilter we sent (`-1` = none yet).
     pub sent_feefilter_sat_kvb: AtomicI64,
@@ -437,6 +514,8 @@ pub struct LivePeer {
     pub handshake_complete: AtomicBool,
     /// BIP324 transport finished. False while EARLY_KEY_RESPONSE / garbage.
     pub v2_transport_ready: AtomicBool,
+    /// Block hashes this session already asked other high-bandwidth peers to send.
+    hb_body_fanned: Mutex<HashSet<BlockHash>>,
     /// Plain v1 framing on a `v1@` wallet-sync listener.
     pub v1_transport: AtomicBool,
     /// Peer sent BIP155 `sendaddrv2` (use `addrv2` for self-announce / GETADDR).
@@ -445,6 +524,10 @@ pub struct LivePeer {
     pub wtxid_relay: AtomicBool,
     /// Next self-announce unix seconds (`0` = never sent).
     pub next_local_addr_send: AtomicU64,
+    /// The routable clearnet IP this outbound peer's VERSION says it reached
+    /// us at. `None` for an inbound peer: anyone can connect in and claim an
+    /// IP, and a recorded report counts as one of our own addresses.
+    pub reported_local_ip: Option<IpAddr>,
     /// VERSION timestamp (unix seconds; `0` on the connecting placeholder).
     pub version_timestamp: i64,
     /// VERSION protocol version (`0` on the connecting placeholder).
@@ -631,7 +714,7 @@ impl LivePeer {
         if self.self_announce_link(&hub) != SelfAnnounceLink::Clearnet {
             return None;
         }
-        let sock = SelfAnnounceLink::Clearnet.local_socket(&hub)?;
+        let sock = SelfAnnounceLink::Clearnet.local_socket(&hub, self.reported_local_ip)?;
         let prev = self.next_local_addr_send.load(Ordering::Relaxed);
         if prev != 0 && now < prev {
             return None;
@@ -640,7 +723,16 @@ impl LivePeer {
         self.next_local_addr_send
             .compare_exchange(prev, next, Ordering::Relaxed, Ordering::Relaxed)
             .ok()?;
+        self.note_if_reported(&hub, sock);
         Some(sock)
+    }
+
+    /// An announce of `sock` is going out. If it is this peer's report, it
+    /// is now one of this node's own addresses.
+    fn note_if_reported(&self, hub: &PeerHub, sock: SocketAddr) {
+        if self.reported_local_ip == Some(sock.ip()) {
+            hub.note_discovered(sock);
+        }
     }
 
     pub fn take_self_announce_msg(&self) -> Option<NetworkMessage> {
@@ -652,9 +744,11 @@ impl LivePeer {
         }
         let hub = self.owner.upgrade()?;
         let link = self.self_announce_link(&hub);
-        let onion = hub.p2p_onion().filter(|_| link == SelfAnnounceLink::Tor);
+        let onion = hub
+            .announced_p2p_onion()
+            .filter(|_| link == SelfAnnounceLink::Tor);
         let i2p = hub.p2p_i2p().filter(|_| link == SelfAnnounceLink::I2p);
-        let sock = link.local_socket(&hub);
+        let sock = link.local_socket(&hub, self.reported_local_ip);
         if onion.is_none() && i2p.is_none() && sock.is_none() {
             return None;
         }
@@ -668,6 +762,9 @@ impl LivePeer {
         self.next_local_addr_send
             .compare_exchange(prev, next, Ordering::Relaxed, Ordering::Relaxed)
             .ok()?;
+        if let Some(sock) = sock {
+            self.note_if_reported(&hub, sock);
+        }
         let services = crate::peer::local_service_flags(hub.is_pruned(), Some(&hub));
         let t = now as u32;
         if self.wants_addrv2() {
@@ -726,6 +823,18 @@ impl LivePeer {
             crate::NetAddr::Onion { .. } => return SelfAnnounceLink::Tor,
             crate::NetAddr::I2p { .. } => return SelfAnnounceLink::I2p,
             crate::NetAddr::Cjdns { .. } => return SelfAnnounceLink::Cjdns,
+            crate::NetAddr::Name { .. } => {
+                // Only a `--proxy` dials a name: the link is the proxy's, like a proxied IP.
+                let proxied = hub
+                    .proxies()
+                    .proxy_for(crate::OnlyNet::of(self.net))
+                    .is_some();
+                return if proxied {
+                    SelfAnnounceLink::Tor
+                } else {
+                    SelfAnnounceLink::Unknown
+                };
+            }
             crate::NetAddr::Ip(sock) => sock,
         };
         if !self.inbound {
@@ -870,11 +979,36 @@ impl LivePeer {
     }
 
     pub fn note_best_known(&self, hash: BlockHash) {
-        *self.best_known.lock().unwrap_or_else(|e| e.into_inner()) = Some(hash);
+        let mut known = self.best_known.lock().unwrap_or_else(|e| e.into_inner());
+        let mut work = self
+            .best_known_work
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *known = Some(hash);
+        *work = None;
+    }
+
+    /// Store `hash` and the work already measured for it.
+    pub fn note_best_known_with_work(&self, hash: BlockHash, work: bitcoin::Work) {
+        let mut known = self.best_known.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stored = self
+            .best_known_work
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *known = Some(hash);
+        *stored = Some(work);
     }
 
     pub fn best_known(&self) -> Option<BlockHash> {
         *self.best_known.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Work saved with [`Self::best_known`], if that store measured it.
+    pub fn best_known_work(&self) -> Option<bitcoin::Work> {
+        *self
+            .best_known_work
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn header_marks(&self) -> (Option<BlockHash>, Option<BlockHash>) {
@@ -922,15 +1056,27 @@ impl LivePeer {
     }
 
     pub fn note_awaiting_headers(&self) {
-        self.awaiting_headers.store(true, Ordering::Relaxed);
+        self.getheaders_sent_at
+            .store(self.clock_now().max(1), Ordering::Relaxed);
     }
 
+    /// A getheaders is in flight and younger than [`HEADERS_RESPONSE_TIME_SECS`].
     pub fn is_awaiting_headers(&self) -> bool {
-        self.awaiting_headers.load(Ordering::Relaxed)
+        self.getheaders_in_flight(self.getheaders_sent_at.load(Ordering::Relaxed))
     }
 
+    /// Clears the send time this call read. A getheaders noted after that
+    /// read (the headers-sync timeout runs from other sessions) keeps its time.
     pub fn take_awaiting_headers(&self) -> bool {
-        self.awaiting_headers.swap(false, Ordering::Relaxed)
+        let sent = self.getheaders_sent_at.load(Ordering::Relaxed);
+        let _ =
+            self.getheaders_sent_at
+                .compare_exchange(sent, 0, Ordering::Relaxed, Ordering::Relaxed);
+        self.getheaders_in_flight(sent)
+    }
+
+    fn getheaders_in_flight(&self, sent: u64) -> bool {
+        sent != 0 && self.clock_now().saturating_sub(sent) <= HEADERS_RESPONSE_TIME_SECS
     }
 
     pub fn note_announced_wtx(&self, wtxid: Wtxid) {
@@ -1034,6 +1180,41 @@ impl LivePeer {
 
     pub fn queue_ping(&self) {
         self.ping_queued.store(true, Ordering::Relaxed);
+    }
+
+    /// Remember the nonce a pong must carry. Does not queue the message.
+    ///
+    /// SeqCst with [`Self::claim_pong_send`] and [`Self::finish_pong_write`].
+    /// A release store on one atomic can stay invisible while the writer
+    /// loads the old nonce and the session still sees the claim held.
+    pub fn store_pong_nonce(&self, n: u64) {
+        self.pong_nonce.store(n, Ordering::SeqCst);
+    }
+
+    /// `true` when this call should queue the one pending pong.
+    pub fn claim_pong_send(&self) -> bool {
+        self.pong_pending
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    pub fn pong_nonce(&self) -> u64 {
+        self.pong_nonce.load(Ordering::Acquire)
+    }
+
+    /// Drop the pending slot after the pong is written. A ping that landed
+    /// during the write is claimed again so its nonce is not dropped.
+    ///
+    /// The clear happens before the load. Both are SeqCst, matching
+    /// [`Self::store_pong_nonce`] then [`Self::claim_pong_send`].
+    pub fn finish_pong_write(&self, written: u64) -> Option<u64> {
+        self.pong_pending.store(false, Ordering::SeqCst);
+        let now = self.pong_nonce.load(Ordering::SeqCst);
+        if now != written && self.claim_pong_send() {
+            Some(now)
+        } else {
+            None
+        }
     }
 
     pub fn queue_msg(&self, msg: NetworkMessage) -> bool {
@@ -1199,6 +1380,11 @@ impl LivePeer {
         self.last_block.store(now, Ordering::Relaxed);
     }
 
+    pub fn note_last_block_announcement(&self) {
+        self.last_block_announcement
+            .store(self.clock_now(), Ordering::Relaxed);
+    }
+
     pub fn note_last_transaction(&self) {
         self.last_transaction
             .store(self.clock_now(), Ordering::Relaxed);
@@ -1252,19 +1438,37 @@ impl LivePeer {
     }
 
     pub fn net_perm_flags(&self) -> crate::net_permissions::NetPermissionFlags {
-        self.owner
-            .upgrade()
-            .map(|h| {
-                h.net_perms
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .flags_for_net(self.net, self.inbound, self.addrbind)
-            })
-            .unwrap_or(crate::net_permissions::NetPermissionFlags::NONE)
+        let Some(h) = self.owner.upgrade() else {
+            return crate::net_permissions::NetPermissionFlags::NONE;
+        };
+        match self.net {
+            crate::NetAddr::Ip(addr) => h.permission_flags(addr, self.inbound, self.addrbind),
+            _ => h
+                .net_perms
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .flags_for_net(self.net, self.inbound, self.addrbind),
+        }
     }
 
     pub fn has_net_perm(&self, flag: crate::net_permissions::NetPermissionFlags) -> bool {
         self.net_perm_flags().has(flag)
+    }
+
+    /// First full-body ask of other high-bandwidth peers for `hash` returns true.
+    pub(crate) fn claim_hb_body_fanout(&self, hash: BlockHash) -> bool {
+        let mut set = self
+            .hb_body_fanned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !set.insert(hash) {
+            return false;
+        }
+        if set.len() > 256 {
+            set.clear();
+            set.insert(hash);
+        }
+        true
     }
 
     /// CIDR/bind table plus operator `--trusted`.
@@ -1461,7 +1665,9 @@ impl LivePeer {
         let (problem, received, finish) = if payload.len() < 8 {
             (Some("Short payload"), 0u64, true)
         } else {
-            let received = u64::from_le_bytes(payload[..8].try_into().unwrap_or([0; 8]));
+            let mut word = [0u8; 8];
+            word.copy_from_slice(&payload[..8]);
+            let received = u64::from_le_bytes(word);
             if expected == 0 {
                 (Some("Unsolicited pong without ping"), received, false)
             } else if received == expected {
@@ -1544,6 +1750,7 @@ impl LivePeer {
             pingwait,
             last_block: self.last_block.load(Ordering::Relaxed),
             last_transaction: self.last_transaction.load(Ordering::Relaxed),
+            last_block_announcement: self.last_block_announcement.load(Ordering::Relaxed),
             minfeefilter_sat_kvb: self.minfeefilter_sat_kvb.load(Ordering::Relaxed),
             last_inv_sequence: self.last_inv_sequence(),
             inv_to_send: self.inv_to_send(),
@@ -1664,6 +1871,8 @@ pub struct PeerInfo {
     pub last_block: u64,
     /// Unix seconds of last accepted tx from this peer (`0` = never).
     pub last_transaction: u64,
+    /// Unix seconds when this peer last first announced a block unknown to us (`0` = never).
+    pub last_block_announcement: u64,
     /// Fee filter they sent us, sat/kvB (`0` = none).
     pub minfeefilter_sat_kvb: u64,
     /// `getpeerinfo.last_inv_sequence`.
@@ -1717,6 +1926,7 @@ impl DiscourageKey {
             crate::NetAddr::Onion { pk, .. } => Some(Self::Onion(pk)),
             crate::NetAddr::I2p { dest, .. } => Some(Self::I2p(dest)),
             crate::NetAddr::Cjdns { ip, .. } => Some(Self::Ip(IpAddr::V6(ip))),
+            crate::NetAddr::Name { .. } => None,
             crate::NetAddr::Ip(sock) => {
                 let ip = sock.ip();
                 if ip_skips_discourage(ip) {
@@ -1812,15 +2022,27 @@ pub struct PeerHub {
     pub peer_timeout_secs: AtomicU64,
     /// Core `m_peers_downloading_from`: sessions with a block in flight.
     pub peers_downloading_from: AtomicUsize,
+    /// Live outbound full-relay catch-up sessions. Catch-up dials its own
+    /// sessions outside `live`, so it reports their count here.
+    catch_up_full_outbound: AtomicUsize,
     /// Addresses we advertise (`getnetworkinfo.localaddresses`).
     pub external_ips: Mutex<Vec<IpAddr>>,
     pub wallet_onions: Mutex<Vec<(String, u16)>>,
     pub p2p_onion: Mutex<Option<(String, u16)>>,
+    tor_wallet_onions: Mutex<Vec<(String, u16)>>,
+    tor_onions_down: AtomicBool,
     pub p2p_i2p: Mutex<Option<crate::NetAddr>>,
     /// P2P listen port used with advertised external IPs.
     pub listen_port: AtomicU16,
     /// Core `-discover`. Off: never self-announce, even with `--external-ip`.
     pub discover: AtomicBool,
+    /// `--discover-from-peers` (default off): with no clearnet `--external-ip`,
+    /// announce the IP a clearnet peer reports reaching us at.
+    pub discover_from_peers: AtomicBool,
+    /// Peer-reported sockets this node has announced, newest last. Each
+    /// counts as its own address at that port only: a peer picks the IP it
+    /// reports, so matching by IP would let it hide another node's address.
+    discovered: Mutex<VecDeque<SocketAddr>>,
     /// Clearnet P2P bind (not onion-only loopback). Needed to gossip `--external-ip`.
     pub clearnet_listen: AtomicBool,
     pub cjdns_reachable: AtomicBool,
@@ -1833,6 +2055,11 @@ pub struct PeerHub {
     pub mempool: Mutex<Option<Weak<crate::tx_relay::MempoolHub>>>,
     /// Core `-whitelist` / `-whitebind` grants (`getpeerinfo.permissions`).
     pub net_perms: Mutex<crate::net_permissions::NetPermTable>,
+    /// Tor `ADD_ONION` or I2P `STREAM FORWARD` delivers inbound TCP from
+    /// loopback. A `--net-permission` subnet that matches that address must
+    /// not apply to those peers. `--net-permission-bind` still matches the
+    /// listen address.
+    overlay_loopback_forward: AtomicBool,
     /// Misbehavior keys → unix second the refusal ends. In memory only.
     pub discouraged_addrs: Mutex<HashMap<DiscourageKey, u64>>,
     /// Netgroup → unix second a slot-loss refusal ends.
@@ -1844,6 +2071,8 @@ pub struct PeerHub {
     /// Per hub, not process-wide: one process runs many nodes in tests, and
     /// only the node whose filters reached the tip may advertise the bit.
     pub compact_filters: AtomicBool,
+    /// Inbound handshakes not yet VERSION/VERACK, by remote IP.
+    incomplete_inbound: Mutex<HashMap<IpAddr, usize>>,
 }
 
 /// Why one outbound refill or stale-tip pass declined, or that it rotated
@@ -1911,6 +2140,10 @@ pub fn addr_sample_seed(bind: SocketAddr, now: u64) -> u64 {
     s
 }
 
+/// Cap on remembered peer-reported sockets (`--discover-from-peers`).
+#[doc(hidden)]
+pub const MAX_DISCOVERED_IPS: usize = 8;
+
 /// This node's own announced addresses. A peer can gossip one back into
 /// addrman or relay it in `addrv2`; neither a `getaddr` reply nor the relay
 /// fan-out passes one on, so it never crosses to a link of another network.
@@ -1918,6 +2151,7 @@ pub(crate) struct OwnAddrs {
     onions: Vec<[u8; 32]>,
     i2p: Option<crate::NetAddr>,
     ips: Vec<IpAddr>,
+    discovered: Vec<SocketAddr>,
 }
 
 impl OwnAddrs {
@@ -1927,8 +2161,12 @@ impl OwnAddrs {
             crate::NetAddr::I2p { dest, .. } => {
                 matches!(self.i2p, Some(crate::NetAddr::I2p { dest: own, .. }) if own == dest)
             }
-            crate::NetAddr::Ip(sock) => self.has_ip(sock.ip()),
+            crate::NetAddr::Ip(sock) => {
+                let canon = SocketAddr::new(sock.ip().to_canonical(), sock.port());
+                self.has_ip(sock.ip()) || self.discovered.contains(&canon)
+            }
             crate::NetAddr::Cjdns { ip, .. } => self.has_ip(IpAddr::V6(ip)),
+            crate::NetAddr::Name { .. } => false,
         }
     }
 
@@ -1950,14 +2188,26 @@ enum SelfAnnounceLink {
 
 impl SelfAnnounceLink {
     /// The listen address this link may announce: a public IP on clearnet,
-    /// an `fc00::/8` address on CJDNS, none on an overlay.
-    fn local_socket(self, hub: &PeerHub) -> Option<SocketAddr> {
+    /// an `fc00::/8` address on CJDNS, none on an overlay. On clearnet with
+    /// no `--external-ip`, `--discover-from-peers` uses the IP the peer
+    /// reported (`reported`).
+    fn local_socket(self, hub: &PeerHub, reported: Option<IpAddr>) -> Option<SocketAddr> {
         match self {
-            Self::Clearnet => hub.advertise_local_socket_on(false),
+            Self::Clearnet => hub
+                .advertise_local_socket_on(false)
+                .or_else(|| hub.peer_reported_socket(reported?)),
             Self::Cjdns => hub.advertise_local_socket_on(true),
             Self::Tor | Self::I2p | Self::Unknown => None,
         }
     }
+}
+
+/// The address a VERSION `addr_recv` names, kept only if it is a routable
+/// clearnet IP. A CJDNS or unroutable report is never announced.
+fn reported_local_ip(receiver: &Address) -> Option<IpAddr> {
+    let ip = receiver.socket_addr().ok()?.ip().to_canonical();
+    let cjdns = matches!(ip, IpAddr::V6(v) if crate::netaddr::is_cjdns_ip(v));
+    (!cjdns && !crate::netaddr::clearnet_unroutable(ip)).then_some(ip)
 }
 
 #[doc(hidden)]
@@ -1968,6 +2218,34 @@ pub fn ip_is_advertisable(ip: &IpAddr, cjdns_reachable: bool) -> bool {
         }
     }
     !crate::netaddr::clearnet_unroutable(*ip)
+}
+
+/// Unfinished inbound handshakes one address may hold. Localhost and NAT
+/// share an address, so this is not 1.
+pub const MAX_INCOMPLETE_INBOUND_PER_ADDR: usize = 8;
+
+pub(crate) struct IncompleteInbound {
+    ip: IpAddr,
+    hub: Weak<PeerHub>,
+}
+
+impl Drop for IncompleteInbound {
+    fn drop(&mut self) {
+        let Some(hub) = self.hub.upgrade() else {
+            return;
+        };
+        let mut map = hub
+            .incomplete_inbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(n) = map.get_mut(&self.ip) else {
+            return;
+        };
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            map.remove(&self.ip);
+        }
+    }
 }
 
 impl PeerHub {
@@ -2010,12 +2288,17 @@ impl PeerHub {
             addr_response_cache: Mutex::new(HashMap::new()),
             peer_timeout_secs: AtomicU64::new(60),
             peers_downloading_from: AtomicUsize::new(0),
+            catch_up_full_outbound: AtomicUsize::new(0),
             external_ips: Mutex::new(Vec::new()),
             wallet_onions: Mutex::new(Vec::new()),
             p2p_onion: Mutex::new(None),
+            tor_wallet_onions: Mutex::new(Vec::new()),
+            tor_onions_down: AtomicBool::new(false),
             p2p_i2p: Mutex::new(None),
             listen_port: AtomicU16::new(0),
             discover: AtomicBool::new(true),
+            discover_from_peers: AtomicBool::new(false),
+            discovered: Mutex::new(VecDeque::new()),
             clearnet_listen: AtomicBool::new(true),
             cjdns_reachable: AtomicBool::new(false),
             proxies: Mutex::new(crate::socks::NetProxies::default()),
@@ -2024,10 +2307,35 @@ impl PeerHub {
             asmap: Mutex::new(None),
             mempool: Mutex::new(None),
             net_perms: Mutex::new(crate::net_permissions::NetPermTable::default()),
+            overlay_loopback_forward: AtomicBool::new(false),
             discouraged_addrs: Mutex::new(HashMap::new()),
             discouraged_groups: Mutex::new(HashMap::new()),
             rate_strikes: Mutex::new(HashMap::new()),
             compact_filters: AtomicBool::new(false),
+            incomplete_inbound: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Count one not-yet-handshaken inbound from `ip`, or `None` at the cap.
+    ///
+    /// The caller drops the guard when the handshake finishes so a live
+    /// session is not counted. Whitelist, noban, and localhost are not exempt.
+    pub(crate) fn try_reserve_incomplete(
+        self: &Arc<Self>,
+        ip: IpAddr,
+    ) -> Option<IncompleteInbound> {
+        let mut map = self
+            .incomplete_inbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let n = map.entry(ip).or_insert(0);
+        if *n >= MAX_INCOMPLETE_INBOUND_PER_ADDR {
+            return None;
+        }
+        *n += 1;
+        Some(IncompleteInbound {
+            ip,
+            hub: Arc::downgrade(self),
         })
     }
 
@@ -2039,16 +2347,24 @@ impl PeerHub {
         *self.net_perms.lock().unwrap_or_else(|e| e.into_inner()) = t;
     }
 
+    /// `--listen-onion` or `--i2p-accept-incoming` forwards onto this node.
+    pub fn set_overlay_loopback_forward(&self, on: bool) {
+        self.overlay_loopback_forward.store(on, Ordering::Relaxed);
+    }
+
     pub fn permission_flags(
         &self,
         addr: SocketAddr,
         inbound: bool,
         bind: SocketAddr,
     ) -> crate::net_permissions::NetPermissionFlags {
+        let apply_whitelist = !(inbound
+            && self.overlay_loopback_forward.load(Ordering::Relaxed)
+            && addr.ip().to_canonical().is_loopback());
         self.net_perms
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .flags_for(addr.ip(), inbound, bind)
+            .flags_for_matched(addr.ip(), inbound, bind, apply_whitelist)
     }
 
     pub fn permission_strings(
@@ -2089,6 +2405,27 @@ impl PeerHub {
 
     pub fn set_p2p_onion(&self, host: String, port: u16) {
         *self.p2p_onion.lock().unwrap_or_else(|e| e.into_inner()) = Some((host, port));
+    }
+
+    pub fn set_tor_wallet_onion(&self, host: String, port: u16) {
+        let mut onions = self
+            .tor_wallet_onions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        onions.retain(|(kept, _)| *kept != host);
+        onions.push((host, port));
+    }
+
+    pub fn set_tor_onions_down(&self, down: bool) {
+        self.tor_onions_down.store(down, Ordering::Relaxed);
+    }
+
+    fn tor_onions_up(&self) -> bool {
+        !self.tor_onions_down.load(Ordering::Relaxed)
+    }
+
+    pub fn announced_p2p_onion(&self) -> Option<crate::NetAddr> {
+        self.p2p_onion().filter(|_| self.tor_onions_up())
     }
 
     pub fn p2p_onion(&self) -> Option<crate::NetAddr> {
@@ -2170,6 +2507,17 @@ impl PeerHub {
         self.discover.store(on, Ordering::Relaxed);
     }
 
+    /// Off also forgets the IPs announced while it was on.
+    pub fn set_discover_from_peers(&self, on: bool) {
+        self.discover_from_peers.store(on, Ordering::Relaxed);
+        if !on {
+            self.discovered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
+    }
+
     /// `getnetworkinfo.localaddresses` rows for operator-advertised IPs.
     pub fn rpc_local_addresses(&self) -> Vec<(String, u16, i32)> {
         const LOCAL_MANUAL: i32 = 4;
@@ -2181,13 +2529,18 @@ impl PeerHub {
             .cloned()
             .map(|(address, port)| (address, port, LOCAL_MANUAL))
             .collect();
-        if let Some((host, port)) = self
-            .p2p_onion
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
-            rows.push((host, port, LOCAL_MANUAL));
+        if self.tor_onions_up() {
+            rows.extend(
+                self.tor_wallet_onions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .cloned()
+                    .map(|(address, port)| (address, port, LOCAL_MANUAL)),
+            );
+        }
+        if let Some(onion) = self.announced_p2p_onion() {
+            rows.push((onion.host_str(), onion.port(), LOCAL_MANUAL));
         }
         if let Some(addr) = self.p2p_i2p() {
             rows.push((addr.host_str(), addr.port(), LOCAL_MANUAL));
@@ -2241,6 +2594,33 @@ impl PeerHub {
             .copied()
             .find(|ip| keep(ip) && ip_is_advertisable(ip, cjdns))?;
         Some(SocketAddr::new(ip, port))
+    }
+
+    /// `ip`, as a clearnet peer reported it, at our listen port. Needs
+    /// `--discover-from-peers` and the same gates as `--external-ip`.
+    fn peer_reported_socket(&self, ip: IpAddr) -> Option<SocketAddr> {
+        if !self.discover_from_peers.load(Ordering::Relaxed)
+            || !self.discover.load(Ordering::Relaxed)
+            || !self.clearnet_listen.load(Ordering::Relaxed)
+        {
+            return None;
+        }
+        let port = self.listen_port.load(Ordering::Relaxed);
+        if port == 0 {
+            return None;
+        }
+        Some(SocketAddr::new(ip, port))
+    }
+
+    /// Remember an announced peer report as an own address.
+    fn note_discovered(&self, sock: SocketAddr) {
+        let mut seen = self.discovered.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.contains(&sock) {
+            if seen.len() == MAX_DISCOVERED_IPS {
+                seen.pop_front();
+            }
+            seen.push_back(sock);
+        }
     }
 
     pub fn peer_timeout_secs(&self) -> u64 {
@@ -2307,12 +2687,26 @@ impl PeerHub {
         }
     }
 
+    /// Whether `addr` is one of this node's own addresses, which `getaddr`
+    /// and `addrv2` relay never pass on.
+    #[doc(hidden)]
+    pub fn is_own_address(&self, addr: crate::NetAddr) -> bool {
+        self.own_addrs().contains(addr)
+    }
+
     pub(crate) fn own_addrs(&self) -> OwnAddrs {
-        let wallet = self
+        let mut wallet = self
             .wallet_onions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        wallet.extend(
+            self.tor_wallet_onions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .cloned(),
+        );
         let onions = wallet
             .iter()
             .filter_map(|(host, port)| format!("{host}:{port}").parse().ok())
@@ -2330,6 +2724,13 @@ impl PeerHub {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
+            discovered: self
+                .discovered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .collect(),
         }
     }
 
@@ -3040,11 +3441,12 @@ impl PeerHub {
             best_header_sent: Mutex::new(None),
             last_tip_offered: Mutex::new(None),
             best_known: Mutex::new(None),
+            best_known_work: Mutex::new(None),
             recently_from: Mutex::new(HashSet::new()),
             inv_asked_headers: AtomicBool::new(false),
             sync_started: AtomicBool::new(false),
             headers_sync_timeout: AtomicU64::new(0),
-            awaiting_headers: AtomicBool::new(false),
+            getheaders_sent_at: AtomicU64::new(0),
             announced_wtx: Mutex::new(CappedSet::new()),
             taken_cmpct: Mutex::new(Vec::new()),
             last_inv_sequence: AtomicU64::new(1),
@@ -3054,6 +3456,8 @@ impl PeerHub {
             ping_nonce_sent: AtomicU64::new(0),
             ping_start_secs: AtomicU64::new(0),
             ping_queued: AtomicBool::new(false),
+            pong_nonce: AtomicU64::new(0),
+            pong_pending: AtomicBool::new(false),
             pingtime: Mutex::new(None),
             minping: Mutex::new(None),
             owner: Arc::downgrade(self),
@@ -3061,6 +3465,7 @@ impl PeerHub {
             sent: Mutex::new(HashMap::new()),
             last_block: AtomicU64::new(0),
             last_transaction: AtomicU64::new(0),
+            last_block_announcement: AtomicU64::new(0),
             minfeefilter_sat_kvb: AtomicU64::new(0),
             sent_feefilter_sat_kvb: AtomicI64::new(-1),
             wire: Mutex::new(None),
@@ -3084,10 +3489,15 @@ impl PeerHub {
             tcp_shutdown: Mutex::new(None),
             handshake_complete: AtomicBool::new(false),
             v2_transport_ready: AtomicBool::new(false),
+            hb_body_fanned: Mutex::new(HashSet::new()),
             v1_transport: AtomicBool::new(false),
             wants_addrv2: AtomicBool::new(false),
             wtxid_relay: AtomicBool::new(false),
             next_local_addr_send: AtomicU64::new(0),
+            // The connecting placeholder's `receiver` is the peer's own socket.
+            reported_local_ip: (!inbound && ver.version != 0)
+                .then(|| reported_local_ip(&ver.receiver))
+                .flatten(),
             version_timestamp: ver.timestamp,
             version: ver.version,
             decode_enqueued: AtomicUsize::new(0),
@@ -3225,6 +3635,9 @@ impl PeerHub {
         tx: &mpsc::UnboundedSender<DialRequest>,
         target: DialTarget,
     ) -> Result<(), String> {
+        if !target.has_key() {
+            return Err(NO_NAME_KEY.to_string());
+        }
         self.trust_allows_target(&target)?;
         // Claim before the live check: a dial registers its session before
         // it drops its claim, so no window shows the endpoint as neither.
@@ -3263,9 +3676,11 @@ impl PeerHub {
     }
 
     /// `addnode` with the operator string. IP, onion, I2P, and CJDNS parse as
-    /// [`crate::NetAddr`]. Anything else is clearnet DNS, resolved at dial.
+    /// [`crate::NetAddr`]. Anything else is clearnet DNS, resolved at dial,
+    /// or by the proxy when `--proxy` is set.
     /// `add` keeps the string when DNS fails so a later redial can succeed.
-    /// `onetry` fails if the name does not resolve now.
+    /// `onetry` fails if the name does not resolve now, except under
+    /// `--proxy`, where it queues the name and returns `Ok`.
     pub fn addnode_host(&self, node: &str, cmd: &str, default_port: u16) -> Result<(), String> {
         let ready = self.dial_ready()?;
         ready.addnode_host(node, cmd, default_port)
@@ -3495,12 +3910,29 @@ impl PeerHub {
         if let Ok(net) = parse_peer_net(&with_port) {
             return Ok(DialTarget::from_net(net));
         }
+        if let Some(target) = self.proxied_domain_target(&with_port) {
+            return Ok(target);
+        }
         let addr =
             parse_peer_addr_with_port(node, self.default_port_opt()).map_err(|e| e.to_string())?;
         if self.trust_host_matches(node) {
             self.note_trust_resolved(addr);
         }
         Ok(DialTarget::Socket(addr))
+    }
+
+    /// `host:port` as a by-name target when `--proxy` is set, so the proxy
+    /// resolves it. An IP literal needs no lookup and stays a socket.
+    fn proxied_domain_target(&self, host_port: &str) -> Option<DialTarget> {
+        self.proxies().dialer.proxy_for(crate::OnlyNet::Ipv4)?;
+        if host_port.parse::<SocketAddr>().is_ok() {
+            return None;
+        }
+        let (host, port) = host_port.rsplit_once(':')?;
+        Some(DialTarget::Domain {
+            host: host.to_string(),
+            port: port.parse().ok()?,
+        })
     }
 
     fn trust_host_matches(&self, node: &str) -> bool {
@@ -3561,7 +3993,9 @@ impl PeerHub {
                 self.disconnect_addr(*addr)
             }
             DialTarget::Domain { .. } => {
-                let net = target.net_addr();
+                let Some(net) = target.known_net_addr() else {
+                    return false;
+                };
                 self.added
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -3657,9 +4091,9 @@ impl PeerHub {
         let peers = self.snapshot();
         match target {
             DialTarget::Socket(addr) => peers.iter().any(|p| p.addr == *addr),
-            DialTarget::Domain { host, port } => peers
-                .iter()
-                .any(|p| p.net.host_str() == *host && p.net.port() == *port),
+            DialTarget::Domain { .. } => target
+                .known_net_addr()
+                .is_some_and(|net| peers.iter().any(|p| p.net == net)),
         }
     }
 
@@ -3850,26 +4284,40 @@ impl PeerHub {
             .collect()
     }
 
-    pub fn outbound_full_relay_addrs(&self) -> Vec<SocketAddr> {
-        self.outbound_full_relay_rows()
-            .into_iter()
-            .map(|(_, a)| a)
-            .collect()
-    }
-
     #[doc(hidden)]
-    pub fn outbound_full_relay_rows(&self) -> Vec<(u64, SocketAddr)> {
+    pub fn outbound_full_relay_rows(&self) -> Vec<(u64, crate::NetAddr)> {
         if self.is_noban() {
             return Vec::new();
         }
-        let mut rows: Vec<(u64, SocketAddr)> = self
+        let mut rows: Vec<(u64, crate::NetAddr)> = self
             .live_peers()
             .into_iter()
             .filter(|p| p.conn_type == PeerConnType::OutboundFullRelay && !p.inbound)
-            .map(|p| (p.id, p.addr))
+            .map(|p| (p.id, p.net))
             .collect();
         rows.sort_unstable_by_key(|(id, _)| *id);
         rows
+    }
+
+    /// Catch-up's live outbound full-relay session count (0 when it ends).
+    pub fn set_catch_up_full_outbound(&self, n: usize) {
+        self.catch_up_full_outbound.store(n, Ordering::Relaxed);
+    }
+
+    /// Core `GetFullOutboundConnCount`: outbound full-relay sessions past
+    /// VERSION (`fSuccessfullyConnected`), catch-up's included. A row still
+    /// in the handshake does not count. Not `noban`-gated.
+    pub fn full_outbound_count(&self) -> usize {
+        let hub = self
+            .live_peers()
+            .into_iter()
+            .filter(|p| {
+                p.conn_type == PeerConnType::OutboundFullRelay
+                    && !p.inbound
+                    && p.handshake_complete()
+            })
+            .count();
+        hub + self.catch_up_full_outbound.load(Ordering::Relaxed)
     }
 
     /// Live outbound full-relay addrs (not `noban`-gated) for diversity occupied.
@@ -4040,6 +4488,10 @@ pub fn parse_peer_net(s: &str) -> Result<crate::NetAddr, NetError> {
 pub fn ensure_host_port(node: &str, default_port: Option<u16>) -> Result<String, String> {
     if node.parse::<SocketAddr>().is_ok() {
         return Ok(node.to_string());
+    }
+    if let Ok(ip) = node.parse::<IpAddr>() {
+        let port = default_port.ok_or_else(|| format!("bad peer address {node}"))?;
+        return Ok(SocketAddr::new(ip, port).to_string());
     }
     if let Some((host, port_s)) = node.rsplit_once(':') {
         if !host.is_empty() && !host.starts_with('[') && port_s.parse::<u16>().is_ok() {

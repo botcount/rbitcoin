@@ -4,15 +4,20 @@
 # patch on an older line, or a rerun of an old tag, moves neither. Reads
 # v*.*.* tags from --root (default: this repo), so CI must fetch tags.
 #
+# --nightly YYYYMMDD prints nightly-YYYYMMDD, then nightly. That is the
+# default branch's build for that UTC day; it reads no tags.
+#
 # Usage: ./scripts/docker-tags.sh vX.Y.Z [--root DIR]
+#        ./scripts/docker-tags.sh --nightly YYYYMMDD
 set -euo pipefail
 
 ROOT=""
 TAG=""
+NIGHTLY=""
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 usage() {
-  echo "usage: $0 vX.Y.Z [--root DIR]" >&2
+  echo "usage: $0 vX.Y.Z [--root DIR] | --nightly YYYYMMDD" >&2
   exit 2
 }
 
@@ -23,6 +28,11 @@ while [[ $# -gt 0 ]]; do
       ROOT="$2"
       shift
       ;;
+    --nightly)
+      [[ $# -ge 2 ]] || usage
+      NIGHTLY="$2"
+      shift
+      ;;
     -h|--help) usage ;;
     *)
       [[ -z "$TAG" ]] || usage
@@ -31,6 +41,14 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+if [[ -n "$NIGHTLY" ]]; then
+  [[ -z "$TAG" ]] || usage
+  [[ "$NIGHTLY" =~ ^[0-9]{8}$ ]] || { echo "error: nightly date is not YYYYMMDD: $NIGHTLY" >&2; exit 1; }
+  echo "nightly-$NIGHTLY"
+  echo nightly
+  exit 0
+fi
 
 if [[ -z "$ROOT" ]]; then
   ROOT="$(cd "$HERE/.." && pwd)"

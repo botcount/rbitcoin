@@ -40,6 +40,7 @@ pub fn tweaks_at_height(
             }
             return Ok(out);
         }
+        Ok(None) if query.prune_seqsigwit() => return pruned_keep_tweaks(query, height),
         Ok(None) => {
             rbitcoin_log::debug!(
                 "sp_tweaks: naive fallback h={} (hole or index off)",
@@ -49,6 +50,53 @@ pub fn tweaks_at_height(
         Err(e) => return Err(e.into()),
     }
     tweaks_for_height(query, params, height)
+}
+
+/// No sealed tweak row under prune. A height still above the prune height
+/// is built from the keep window. A dropped height is a hole.
+fn pruned_keep_tweaks(
+    query: &Query,
+    height: Height,
+) -> Result<BTreeMap<[u8; 32], TxTweak>, ConfirmError> {
+    match query.tweak_index_next() {
+        Some(n) if height.0 < n => Err(StoreError::Layout(
+            "silent payment tweak index does not cover this height".into(),
+        )
+        .into()),
+        None => Err(StoreError::Layout(
+            "silent payment tweaks are unavailable with --prune-seqsigwit".into(),
+        )
+        .into()),
+        Some(_) => tweaks_from_pruned_keep(query, height),
+    }
+}
+
+/// Tweaks for one pruned height from the keep window.
+pub fn tweaks_from_pruned_keep(
+    query: &Query,
+    height: Height,
+) -> Result<BTreeMap<[u8; 32], TxTweak>, ConfirmError> {
+    if query
+        .witnessed_pruneheight()
+        .is_some_and(|ph| height.0 <= ph)
+    {
+        return Err(StoreError::Layout(
+            "silent payment tweak index does not cover this height".into(),
+        )
+        .into());
+    }
+    let heights = query.index_heights(height.0, height.0, Some(0))?;
+    let window = query.read_index_window(&heights)?;
+    let Some(block) = window.blocks.first() else {
+        return Ok(BTreeMap::new());
+    };
+    let txs: Vec<&LoadedTweakTx> = block.txs.iter().collect();
+    let tweaks = tweaks_for_txs(&txs, &|fk| Some((window.txid(fk)?, window.outs(fk)?)))?;
+    Ok(txs
+        .iter()
+        .zip(tweaks)
+        .filter_map(|(t, tw)| Some((t.rec.txid, tw?)))
+        .collect())
 }
 
 /// Confirmed height → eligible txid (internal order) → tweak.

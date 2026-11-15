@@ -12,7 +12,7 @@ use crate::delta_loc::{
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::IoCtx;
-use rbitcoin_primitives::{deinterleave_pairs_u8x8, inclusive_u8x8_times_8, Fk, TableKind};
+use rbitcoin_primitives::{deinterleave_pairs_u8x8, inclusive_u8x8_times_8, le_u64, Fk, TableKind};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
@@ -108,10 +108,9 @@ impl CreateLoc {
         if n_win > 0 {
             let mut bytes = vec![0u8; (n_win * OFF_SLOT) as usize];
             off.read_at(FILE_HEADER_LEN as u64, &mut bytes)?;
-            for (i, chunk) in bytes.chunks_exact(OFF_SLOT as usize).enumerate() {
-                let txout = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
-                let spent = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
-                checkpoints[i] = (txout, spent);
+            let (rows, _) = bytes.as_chunks::<{ OFF_SLOT as usize }>();
+            for (i, row) in rows.iter().enumerate() {
+                checkpoints[i] = (le_u64!(row, 0), le_u64!(row, 8));
             }
         }
         let ovf_rows = load_create_ovf(&ovf)?;

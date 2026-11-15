@@ -12,8 +12,8 @@ is block **966143**
 Bitcoin Core 32.1 `defaultAssumeValid`): script
 and signature checks skip only when that hash and the block being connected
 are the header-path occupants at their heights. Explicit `--milestone HEIGHT`
-is height-only. `--milestone 0` checks every script. Signet and testnet4
-default to **0**.
+is height-only. `--milestone 0` checks every script. Signet, testnet4, and
+testnet5 default to **0**.
 
 Architecture and confirm pipeline: [`docs/architecture.md`](../../docs/architecture.md),
 [`docs/concurrency.md`](../../docs/concurrency.md). Download defaults to **1024**
@@ -156,8 +156,9 @@ The module options cover the operator flags in
 the node default. A bool that defaults on passes `=0` when set false
 (`proxyRandomize`, `mempool.persist`, `mempool.prefillCompact`,
 `netPermissionRelay`). `p2p.maxInbound` defaults to 200 and omits
-`--max-inbound` at that value. `esplora.hiddenService = false` passes
-`--esplora-onion=0` when Tor control is on. An onion flag with `tor.control`
+`--max-inbound` at that value. `electrum.hiddenService` and
+`esplora.hiddenService` (and their `i2p` twins) default off and pass only the
+positive flag. An onion flag with `tor.control`
 unset enables `services.tor`, opens `127.0.0.1:9051`, and writes a
 group-readable `/run/tor/control.authcookie`. An explicit `tor.control` is
 left to the operator's daemon. `rpc.unixSocket` passes `--rpc`
@@ -208,6 +209,14 @@ the maintainers enable it ([`releases.md`](../releases.md)). The image is
 the Release musl binaries on `FROM scratch`: no shell, no libc, no base
 image. Tags are `X.Y.Z`, `X.Y` (newest patch on that line), and `latest`
 (newest release). A patch on an older line does not move `latest`.
+
+Each night the master tip is also published to the same registries as
+`nightly` and `nightly-YYYYMMDD` (UTC date). A nightly is not a release:
+it skips the release gates, and it can migrate the datadir to a schema an
+older binary refuses ([schema upgrade](./storage.md#schema-upgrade)). The
+dated tag is the last nightly published that day; a second one that day
+replaces it. To hold one build, pin its digest
+(`ghcr.io/rbitcoin-org/rbitcoin@sha256:…`).
 
 ```bash
 docker volume create rbitcoin
@@ -297,6 +306,10 @@ bandwidth caps. On an otherwise idle host, these settings still allow rbitcoin
 to use the available CPU and storage. They do not limit process memory or
 network traffic. Add memory limits only from a separate, host-specific capacity
 plan; an undersized limit can terminate the node or make IBD impractically slow.
+The scripthash extract and `tx.head` rebuild size their worker pools from the
+smaller of `MemAvailable` and the cgroup v2 headroom (`MemoryMax=`,
+`MemoryHigh=`), so a limit lowers parallelism instead of inviting the OOM
+killer. One extract worker still needs about 1.5 GiB.
 
 I/O priority is also storage-stack dependent. Linux currently implements
 per-process I/O priorities in the `bfq` and `mq-deadline` schedulers; `none`

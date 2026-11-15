@@ -8,7 +8,7 @@
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::tx_table::{pack_spent_field, unpack_spent_field};
-use rbitcoin_primitives::{Fk, TableKind};
+use rbitcoin_primitives::{le_u64, Fk, TableKind};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -102,13 +102,9 @@ impl SpenderTable {
         }
         let mut buf = [0u8; SPENDER_RECORD_LEN];
         self.body.read_at(Self::offset(id), &mut buf)?;
-        let packed = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let packed = le_u64!(buf, 0);
         let (spend_tx, vin) = unpack_spent_field(packed)?;
-        Ok((
-            spend_tx,
-            vin,
-            Fk(u64::from_le_bytes(buf[8..16].try_into().unwrap())),
-        ))
+        Ok((spend_tx, vin, Fk(le_u64!(buf, 8))))
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {

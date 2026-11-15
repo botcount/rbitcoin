@@ -8,7 +8,7 @@ use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::{Fk, Height};
 
 use rbitcoin_query::{ChainView, Query, QueryError, ScriptHashHistoryItem, ScriptHashUtxo};
-use rbitcoin_store::InputRecord;
+use rbitcoin_store::InputParent;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -190,26 +190,20 @@ pub fn build_tx_json(
     network: Network,
     view: Option<&ChainView>,
 ) -> Result<Value, QueryError> {
-    let wire = match query.reconstruct_tx(tx_fk) {
-        Ok(w) => w,
+    let (wire, stored_txid, parents) = match query.reconstruct_tx_with_inputs(tx_fk) {
+        Ok(v) => v,
         Err(rbitcoin_store::StoreError::Pruned { .. }) => {
             return build_tx_json_pruned(query, tx_fk, network, view);
         }
         Err(e) => return Err(e),
     };
     let status = status_for(query, tx_fk, view)?;
-    let (_meta, stored_inputs, _outs) = query.store().get_tx_full(tx_fk)?;
-    let stored_txid = query
-        .store()
-        .txs
-        .body_txid(tx_fk)
-        .unwrap_or_else(|_| wire.compute_txid().to_byte_array());
     tx_json_from_wire(
         query,
         &wire,
         network,
         status,
-        &stored_inputs,
+        &parents,
         stored_txid,
         None,
         None,
@@ -259,9 +253,8 @@ pub fn build_tx_json_pruned(
     network: Network,
     view: Option<&ChainView>,
 ) -> Result<Value, QueryError> {
-    let tx = query.store().get_tx(tx_fk)?;
-    let (_meta, outs) = query.store().get_tx_meta_and_outputs(tx_fk)?;
-    let txid = query.store().txs.body_txid(tx_fk).unwrap_or(tx.txid);
+    let (tx, outs) = query.store().get_tx_meta_and_outputs(tx_fk)?;
+    let txid = tx.txid;
     let status = status_for(query, tx_fk, view)?;
     let vout: Vec<Value> = outs
         .iter()
@@ -334,7 +327,7 @@ pub fn tx_json_from_wire(
     wire: &Transaction,
     network: Network,
     status: Value,
-    stored_inputs: &[InputRecord],
+    stored_inputs: &[InputParent],
     txid_bytes: [u8; 32],
     fee_override: Option<i64>,
     mempool: Option<&MempoolHub>,
@@ -369,38 +362,27 @@ pub fn tx_json_from_wire(
             vin_obj["witness"] = json!(wit);
         }
 
-        let mut spk_for_inner: Option<Vec<u8>> = None;
         if is_coinbase {
             prev_spks.push(Vec::new());
-        } else if let Some(prev) = prevout_json(query, stored_inputs, i, tin, network, mempool)? {
-            if let Some(v) = prev.get("value").and_then(|x| x.as_i64()) {
-                if let Some(acc) = fee_in.as_mut() {
-                    *acc = acc.saturating_add(v);
+        } else if let Some((prev, sats, spk)) =
+            prevout_json(query, stored_inputs, i, tin, network, mempool)?
+        {
+            match i64::try_from(sats) {
+                Ok(v) => {
+                    if let Some(acc) = fee_in.as_mut() {
+                        *acc = acc.saturating_add(v);
+                    }
                 }
-            } else {
-                fee_in = None;
+                Err(_) => fee_in = None,
             }
-            let spk = prev
-                .get("scriptpubkey")
-                .and_then(|x| x.as_str())
-                .and_then(|h| {
-                    rbitcoin_primitives::hex_decode(
-                        h.strip_prefix("0x")
-                            .or_else(|| h.strip_prefix("0X"))
-                            .unwrap_or(h),
-                    )
-                    .ok()
-                })
-                .unwrap_or_default();
-            spk_for_inner = Some(spk.clone());
             prev_spks.push(spk);
+            if let Some(spk) = prev_spks.last() {
+                attach_inner_scripts(&mut vin_obj, spk, ss, &wit_raw);
+            }
             vin_obj["prevout"] = prev;
         } else {
             fee_in = None;
             prev_spks.push(Vec::new());
-        }
-        if let Some(spk) = spk_for_inner.as_deref() {
-            attach_inner_scripts(&mut vin_obj, spk, ss, &wit_raw);
         }
 
         vin.push(vin_obj);
@@ -455,35 +437,40 @@ pub fn tx_json_from_wire(
 #[doc(hidden)]
 pub fn prevout_json(
     query: &Query,
-    stored_inputs: &[InputRecord],
+    stored_inputs: &[InputParent],
     idx: usize,
     tin: &bitcoin::TxIn,
     network: Network,
     mempool: Option<&MempoolHub>,
-) -> Result<Option<Value>, QueryError> {
+) -> Result<Option<(Value, u64, Vec<u8>)>, QueryError> {
     if let Some(inp) = stored_inputs.get(idx) {
         if !inp.create_fk().is_null() {
             if let Ok(out) = query.tx_output_at_fk(inp.create_fk(), inp.prev_index()) {
-                return Ok(Some(vout_fields(&out.script, out.value, network)));
+                return Ok(Some(prevout_value(out.script, out.value, network)));
             }
         }
     }
     let prev_txid = tin.previous_output.txid.to_byte_array();
     if let Some(pfk) = query.tx_fk_by_txid(&prev_txid)? {
         if let Ok(out) = query.tx_output_at_fk(pfk, tin.previous_output.vout) {
-            return Ok(Some(vout_fields(&out.script, out.value, network)));
+            return Ok(Some(prevout_value(out.script, out.value, network)));
         }
     }
     if let Some(prev) = mempool.and_then(|m| m.get_tx(&tin.previous_output.txid)) {
         if let Some(o) = prev.output.get(tin.previous_output.vout as usize) {
-            return Ok(Some(vout_fields(
-                o.script_pubkey.as_bytes(),
+            return Ok(Some(prevout_value(
+                o.script_pubkey.as_bytes().to_vec(),
                 o.value.to_sat(),
                 network,
             )));
         }
     }
     Ok(None)
+}
+
+fn prevout_value(script: Vec<u8>, value: u64, network: Network) -> (Value, u64, Vec<u8>) {
+    let json = vout_fields(&script, value, network);
+    (json, value, script)
 }
 
 #[doc(hidden)]
@@ -518,7 +505,7 @@ pub fn attach_inner_scripts(
 ) {
     let prev = bitcoin::Script::from_bytes(spk);
     let redeem = if prev.is_p2sh() {
-        last_push_data(script_sig).filter(|b| !b.is_empty() && b.len() <= 10_000)
+        last_push_data(script_sig)
     } else {
         None
     };

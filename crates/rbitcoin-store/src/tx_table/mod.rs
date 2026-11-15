@@ -7,7 +7,7 @@ use crate::error::StoreError;
 use crate::hashhead::HeadOpenOpts;
 use crate::segmented_head::SegmentedTxHead;
 use crate::var_table::VarTable;
-use rbitcoin_primitives::{read_uleb128, write_uleb128, Fk, TableKind};
+use rbitcoin_primitives::{le_i32, read_uleb128, write_uleb128, Fk, TableKind};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -90,11 +90,11 @@ impl TxRecord {
 
     /// Decode full record with leading txid (soft / test buffers).
     pub fn decode(buf: &[u8]) -> Result<Self, StoreError> {
-        if buf.len() < 32 {
+        let Some(txid) = buf.first_chunk::<32>() else {
             return Err(StoreError::Corrupt("short tx record"));
-        }
+        };
         let (mut rec, _) = Self::decode_body_meta(&buf[32..])?;
-        rec.txid = buf[0..32].try_into().unwrap();
+        rec.txid = *txid;
         Ok(rec)
     }
 
@@ -166,10 +166,10 @@ pub fn decode_body_meta_v17(buf: &[u8]) -> Result<(TxRecord, usize), StoreError>
     }
     let mut off = 1usize;
     let version = if ver_bits == 0 {
-        if buf.len() < off + 4 {
+        let Some(raw) = buf[off..].first_chunk::<4>() else {
             return Err(StoreError::Corrupt("short v17 txout version"));
-        }
-        let v = i32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        };
+        let v = le_i32!(raw, 0);
         off += 4;
         v
     } else if ver_bits == BODY_META_V17_VER_1 {
@@ -685,6 +685,8 @@ pub struct TxTable {
     pub prune_seqsigwit_mode: std::sync::atomic::AtomicBool,
     /// `--datadir-hdd`: Class A body stems are one pwrite wave each.
     pub datadir_hdd: std::sync::atomic::AtomicBool,
+    /// Historical spend slots not yet folded into `spent.body`.
+    spend_pages: crate::spend_page_log::SpendPageLog,
     /// Per-fk packed `txout` decodes for an outs reader
     /// ([`Self::get_meta_and_outputs`], and [`Self::get`] through it), the
     /// decode the mempool and block-proposal pins count. [`Self::get_full`] is
@@ -775,10 +777,14 @@ pub fn class_a_skew_target_count(
     if let Some(n) = short_new_layout_input {
         return Some(n);
     }
-    if n_txids == n_loc && (prune_seqsigwit_mode || n_seqsigwit_loc == n_loc) {
+    // Count 0 is the finished cut. Min-ing it would drop the chain.
+    // A positive locator that is short of the creates is an unfinished
+    // commit, and the chain truncates to the rows it still names.
+    let witness_cut = prune_seqsigwit_mode && n_seqsigwit_loc == 0;
+    if n_txids == n_loc && (witness_cut || n_seqsigwit_loc == n_loc) {
         return None;
     }
-    Some(if prune_seqsigwit_mode {
+    Some(if witness_cut {
         n_loc.min(n_txids)
     } else {
         n_loc.min(n_txids).min(n_seqsigwit_loc)
@@ -834,6 +840,32 @@ pub fn short_new_layout_input(
     } else {
         Ok(None)
     }
+}
+
+/// Prune mode with a witness loc that does not cover the creates cannot
+/// rebuild a short `input` from `seqsigwit`. The input count is the prefix
+/// that landed.
+#[doc(hidden)]
+pub fn pruned_uncovered_input_floor(
+    stems: &ClassASkewStems<'_>,
+    n_loc: u64,
+    n_txids: u64,
+    n_seqsigwit_loc: u64,
+    prune_seqsigwit_mode: bool,
+    input_existed: bool,
+) -> Option<u64> {
+    if !prune_seqsigwit_mode || !input_existed {
+        return None;
+    }
+    let stem = stem_min(n_loc, n_txids, n_seqsigwit_loc, true);
+    if stem == 0 || n_seqsigwit_loc >= stem {
+        return None;
+    }
+    let n_in = stems.input.count();
+    if n_in >= stem {
+        return None;
+    }
+    Some(n_in)
 }
 
 #[doc(hidden)]
@@ -933,14 +965,24 @@ pub fn repair_class_a_count_skew(
     let n_loc = stems.create_loc.count();
     let n_txids = stems.txids.count();
     let n_seqsigwit_loc = stems.seqsigwit_loc.count();
-    let short_input = short_new_layout_input(
+    let short_input = match pruned_uncovered_input_floor(
         &stems,
         n_loc,
         n_txids,
         n_seqsigwit_loc,
         prune_seqsigwit_mode,
         input_existed,
-    )?;
+    ) {
+        Some(n) => Some(n),
+        None => short_new_layout_input(
+            &stems,
+            n_loc,
+            n_txids,
+            n_seqsigwit_loc,
+            prune_seqsigwit_mode,
+            input_existed,
+        )?,
+    };
     let skewed = class_a_skew_target_count(
         n_loc,
         n_txids,
@@ -1078,6 +1120,45 @@ fn publish_body_pair(
     Ok((fks, left_ok && right_ok))
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static SPEND_META_BATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SPEND_META_PEEK_GROUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Zero the debug counters [`spend_meta_read_counts`] returns.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn reset_spend_meta_read_counts() {
+    SPEND_META_BATCHES.with(|n| n.set(0));
+    SPEND_META_PEEK_GROUPS.with(|n| n.set(0));
+}
+
+/// `(directory-or-body batch calls, body peek groups)` since the last reset.
+///
+/// A group is one [`crate::idx_body_pipeline::plan_spend_slot_peeks`] result.
+/// Directory hits add a batch and zero groups.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn spend_meta_read_counts() -> (u64, u64) {
+    (
+        SPEND_META_BATCHES.with(|n| n.get()),
+        SPEND_META_PEEK_GROUPS.with(|n| n.get()),
+    )
+}
+
+fn note_spend_meta_read(groups: usize) {
+    #[cfg(debug_assertions)]
+    {
+        SPEND_META_BATCHES.with(|n| n.set(n.get().saturating_add(1)));
+        SPEND_META_PEEK_GROUPS.with(|n| n.set(n.get().saturating_add(groups as u64)));
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = groups;
+    }
+}
+
 impl TxTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         Self::create_with_opts(dir, HeadOpenOpts::MAINNET)
@@ -1139,6 +1220,7 @@ impl TxTable {
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(false),
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
+            spend_pages: crate::spend_page_log::SpendPageLog::create(dir),
         })
     }
 
@@ -1167,7 +1249,7 @@ impl TxTable {
                 } else {
                     tx_head_rebuild_workers_for_free_ram(
                         crate::sorted_run::logical_cpus(),
-                        crate::host_mem_available_bytes().unwrap_or(0),
+                        crate::sorted_run::mem_available_bytes().unwrap_or(0),
                     )
                 }
             });
@@ -1192,11 +1274,12 @@ impl TxTable {
         seqsigwit_dir: &Path,
         opts: HeadOpenOpts,
     ) -> Result<Self, StoreError> {
-        let prune_seqsigwit_mode = false;
         crate::store::rename_legacy_inwit_files(dir)?;
         crate::store::rename_legacy_input_files(dir)?;
         crate::store::rename_legacy_inwit_files(seqsigwit_dir)?;
         crate::store::rename_legacy_input_files(seqsigwit_dir)?;
+        // Sidecar lives on the hot store, including when the stem is cold.
+        let prune_seqsigwit_mode = dir.join("seqsigwit.prune").is_file();
         let (seal_bits, workers) = Self::resolve_open_opts(opts);
         unlink_leftover_class_a_idx(dir)?;
         if seqsigwit_dir != dir {
@@ -1209,19 +1292,22 @@ impl TxTable {
         let create_loc = open_or_create_create_loc(dir)?;
         let seqsigwit_loc = open_or_create_seqsigwit_loc(seqsigwit_dir)?;
         let loc_count = create_loc.count();
+        // The sidecar is prune mode for reads and later appends. The witness
+        // stem still seals the tip until its locator no longer covers creates.
+        let stem_retired = prune_seqsigwit_mode && seqsigwit_loc.count() < loc_count;
         let body = if had_txout {
             VarTable::open_body_only(dir, "txout", TableKind::TxOut, loc_count)?
         } else {
             VarTable::create_body_only(dir, "txout", TableKind::TxOut)?
         };
-        if had_txout && loc_count > 0 && (!had_spent || (!had_seqsigwit && !prune_seqsigwit_mode)) {
+        if had_txout && loc_count > 0 && (!had_spent || (!had_seqsigwit && !stem_retired)) {
             return Err(StoreError::Corrupt(
                 "schema 15 Class A missing seqsigwit/spent for existing txout creates; wipe + IBD \
                  (or --datadir-cold if seqsigwit is on a cold volume)",
             ));
         }
         let seqsigwit = if had_seqsigwit {
-            let in_count = if prune_seqsigwit_mode {
+            let in_count = if stem_retired {
                 seqsigwit_loc.count()
             } else {
                 loc_count
@@ -1280,7 +1366,7 @@ impl TxTable {
                 txstat: &txstat,
                 input: &input,
             },
-            prune_seqsigwit_mode,
+            stem_retired,
             input_existed,
         )?;
         let n_bodies = create_loc.count();
@@ -1353,6 +1439,7 @@ impl TxTable {
             }
         };
         let secret = crate::store_secret::StoreSecret::load_existing(dir)?;
+        let spent_body_end = spent.body_published_len();
         let t = Self {
             body,
             seqsigwit,
@@ -1371,6 +1458,7 @@ impl TxTable {
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(prune_seqsigwit_mode),
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
+            spend_pages: crate::spend_page_log::SpendPageLog::load_clipped(dir, spent_body_end)?,
         };
         match input_open_tail(t.input.count(), n_bodies, t.seqsigwit.count()) {
             InputOpenTail::Backfill { from } => {
@@ -1500,6 +1588,11 @@ impl TxTable {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Witness locator no longer names every create. Seal and skew ignore it.
+    fn seqsigwit_stem_retired(&self) -> bool {
+        self.prune_seqsigwit_mode() && self.seqsigwit_loc.count() < self.count()
+    }
+
     pub fn set_prune_seqsigwit_mode(&self, on: bool) {
         self.prune_seqsigwit_mode
             .store(on, std::sync::atomic::Ordering::Release);
@@ -1518,6 +1611,62 @@ impl TxTable {
         self.seqsigwit_loc.truncate_to_count(0)?;
         self.seqsigwit
             .truncate_body_to(0, crate::file::FILE_HEADER_LEN as u64)
+    }
+
+    /// The witness stem still holds rows or an allocation past create slack.
+    pub fn seqsigwit_stem_needs_release(&self) -> bool {
+        let header = crate::file::FILE_HEADER_LEN as u64;
+        if self.seqsigwit_loc.count() > 0 || self.seqsigwit.body_logical_len() > header {
+            return true;
+        }
+        self.seqsigwit
+            .body
+            .file_cap
+            .load(std::sync::atomic::Ordering::Acquire)
+            > header.saturating_add(crate::file::CREATE_FILE_SLACK)
+    }
+
+    /// Inputs from `seqsigwit.body` even when prune mode makes [`Self::get_full`]
+    /// return [`StoreError::NotFound`]. The locator must still name `fk`.
+    pub fn seqsigwit_inputs_from_stem(&self, fk: Fk) -> Result<Vec<InputRecord>, StoreError> {
+        let tx = self.get(fk)?;
+        let ir = self
+            .seqsigwit_loc
+            .range_batch(&[fk])?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or(StoreError::NotFound)?;
+        let seqsigwit = self
+            .seqsigwit
+            .with_bytes_at(ir.0, ir.1, |b| Ok(b.to_vec()))?;
+        let mut ins = if tx.input_count == 0 {
+            decode_seqsigwit_secret_to_end(&seqsigwit, Some(&self.secret))?
+        } else {
+            decode_seqsigwit_secret(&seqsigwit, tx.input_count, Some(&self.secret))?
+        };
+        self.stamp_seqsigwit_prevouts(fk, &mut ins)?;
+        Ok(ins)
+    }
+
+    /// Drop the witness stem's rows and its allocation back to the file header.
+    pub fn cut_seqsigwit_stem_to_header(&self) -> Result<(), StoreError> {
+        let header = crate::file::FILE_HEADER_LEN as u64;
+        // Loc header at 0 is durable before off and ovf shrink. The other
+        // order leaves a long locator and a header-only checkpoint.
+        self.seqsigwit_loc.truncate_to_zero_header_first()?;
+        self.seqsigwit_loc.loc.release_to_len(header)?;
+        self.seqsigwit_loc.off.release_to_len(header)?;
+        self.seqsigwit_loc.ovf.release_to_len(header)?;
+        self.seqsigwit.truncate_body_to(0, header)?;
+        self.seqsigwit.body.release_to_len(header)?;
+        // The short length is the durable end. A later open must not see
+        // the pre-cut allocation and treat it as witness payload.
+        self.seqsigwit_loc.loc.flush()?;
+        self.seqsigwit_loc.off.flush()?;
+        self.seqsigwit_loc.ovf.flush()?;
+        self.seqsigwit.body.flush()?;
+        Ok(())
     }
 
     /// Seal unsealed non-tails from Class A (crash/restart). Keys are not retained.
@@ -1611,11 +1760,9 @@ impl TxTable {
             if (rc as usize) != blob.len() {
                 return Err(StoreError::Corrupt("tx.head seal collect txid.body short"));
             }
-            for i in 0..n {
-                let s = i * 32;
-                let txid: [u8; 32] = blob[s..s + 32].try_into().unwrap();
+            for txid in blob.as_chunks::<32>().0 {
                 pairs.push((
-                    crate::fuse8_filter::fuse_key_from_mixed(&secret.mix_txid(&txid)),
+                    crate::fuse8_filter::fuse_key_from_mixed(&secret.mix_txid(txid)),
                     rel,
                 ));
                 rel = rel.saturating_add(1);
@@ -1661,7 +1808,7 @@ impl TxTable {
     /// overflow header. A body header is not part of this count: open
     /// truncates a body that ran ahead and refuses one that fell short.
     fn locator_header_count(&self) -> Result<u64, StoreError> {
-        let prune = self.prune_seqsigwit_mode();
+        let prune = self.seqsigwit_stem_retired();
         let mut hi = durable_loc_count(
             &self.create_loc.loc,
             &self.create_loc.off,
@@ -1694,7 +1841,7 @@ impl TxTable {
         if loc {
             return true;
         }
-        if self.prune_seqsigwit_mode() {
+        if self.seqsigwit_stem_retired() {
             return false;
         }
         file_header_behind(&self.seqsigwit_loc.loc)
@@ -1840,9 +1987,8 @@ impl TxTable {
     /// Stamped rows read `n_in` and the parent edge from `input`. Leftover
     /// unstamped rows still take the inline prevout out of legacy `seqsigwit`.
     pub fn get_meta_and_prevouts(&self, fk: Fk) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
-        if self.prune_seqsigwit_mode() {
-            return Err(StoreError::NotFound);
-        }
+        // Stamped rows read `input`. Prune drops script and witness, not edges.
+        // An unstamped row still needs the witness stem, which prune has cut.
         let mut tx = if let Some(n_in) = self.input.n_in(fk)? {
             TxRecord {
                 txid: [0u8; 32],
@@ -1851,11 +1997,15 @@ impl TxTable {
                 input_count: n_in,
                 output_count: 0,
             }
+        } else if self.prune_seqsigwit_mode() {
+            return Err(StoreError::NotFound);
         } else {
             self.get(fk)?
         };
         let prevs = if let Some(edges) = self.input.edges(fk)? {
             prevouts_from_edges(&edges)
+        } else if self.prune_seqsigwit_mode() {
+            return Err(StoreError::NotFound);
         } else {
             let ir = self
                 .seqsigwit_loc
@@ -2060,7 +2210,12 @@ impl TxTable {
 
     #[doc(hidden)]
     pub fn seqsigwit_has_inline_prevout(&self, fk: Fk) -> Result<bool, StoreError> {
-        let (off, len) = self.seqsigwit_range(fk)?;
+        // `seqsigwit_range` refuses every row once prune mode is on. The
+        // stem can still name this create. Backfill has to read that row.
+        let Some(Some((off, len))) = self.seqsigwit_loc.range_batch(&[fk])?.into_iter().next()
+        else {
+            return Ok(false);
+        };
         if len == 0 {
             return Ok(false);
         }
@@ -2099,6 +2254,9 @@ impl TxTable {
             id = next_id;
         }
         rbitcoin_log::info!("store: input backfill complete n={n}");
+        // The witness stem can be cut after this open returns. The edges
+        // have to be durable first, or the next open has no way to rebuild them.
+        self.input.flush()?;
         Ok(())
     }
 
@@ -2136,13 +2294,12 @@ impl TxTable {
 
     /// Annotate spends at known absolute spender-meta offsets.
     ///
-    /// One 4 KiB page RMW per page (uring, else the same groups via `pwrite`):
-    /// read the page, decide sole / multi / promote, write the page if dirty.
-    /// `POSIX_FADV_RANDOM` covers the sweep and restores `POSIX_FADV_NORMAL`
-    /// on every exit. `spent.ovf` appends run inline on the decision.
+    /// One read of the current slot, then a page-log insert. A slot past the
+    /// published body is cold and is not written.
+    /// Decide sole / multi / promote from that slot.
+    /// `spent.ovf` appends run inline on the decision.
     ///
-    /// Returns edges that still need a full cold path (OOB abs / deferred).
-    /// Multi-list cases are handled here when uring/`pwrite` succeed (not returned).
+    /// Returns edges past the published body. Multi-list cases are handled here.
     pub fn put_spend_batch_by_abs_meta(
         &self,
         spenders: &crate::spender_table::SpenderTable,
@@ -2151,31 +2308,77 @@ impl TxTable {
         if abs_edges.is_empty() {
             return Ok(Vec::new());
         }
-        let _sweep = self.spent.advise_random_for_sweep();
         for &(_, _, _, sfk, _) in abs_edges {
             if sfk.is_null() {
                 return Err(StoreError::InvalidFk);
             }
         }
-        if crate::bulk_io::io_uring_enabled() {
-            match crate::spend_annotate_uring::put_spend_batch_by_abs_meta_uring(
-                self, spenders, abs_edges,
-            ) {
-                Ok(cold) => return Ok(cold),
-                Err(e) => {
-                    rbitcoin_log::debug!(
-                        "store: spend annotate uring unavailable ({e}); pwrite fallback"
-                    );
-                }
+        let known = self.known_spend_slots(abs_edges)?;
+        let body_pub = self.spent.body_published_len();
+        let mut cold = Vec::new();
+        let mut live_edges = Vec::with_capacity(abs_edges.len());
+        let mut live_known = Vec::with_capacity(abs_edges.len());
+        for (edge, slot) in abs_edges.iter().copied().zip(known) {
+            let (abs, cfk, vout, sfk, vin) = edge;
+            if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > body_pub {
+                cold.push((cfk, vout, sfk, vin));
+                continue;
             }
+            live_edges.push(edge);
+            live_known.push(slot);
         }
-        self.put_spend_batch_by_abs_meta_pwrite(spenders, abs_edges)
+        if !live_edges.is_empty() {
+            cold.extend(self.put_spend_batch_by_abs_meta_known(
+                spenders,
+                &live_edges,
+                &live_known,
+            )?);
+        }
+        Ok(cold)
     }
 
-    /// Page `pwrite` RMW for [`Self::put_spend_batch_by_abs_meta`].
+    /// One directory-or-body read for the whole batch.
     ///
-    /// Same slot bytes and cold list as the uring helper. Slots that share a
-    /// 4 KiB page are one read and one write.
+    /// A slot past the published body is `(NULL, 0, 0)` and is not read. A
+    /// short or undecodable in-range slot is read again here so that error
+    /// still fails the annotate.
+    fn known_spend_slots(
+        &self,
+        abs_edges: &[(u64, Fk, u32, Fk, u32)],
+    ) -> Result<Vec<(Fk, u8, u32)>, StoreError> {
+        let offs: Vec<u64> = abs_edges.iter().map(|edge| edge.0).collect();
+        let peeked = self.get_spender_meta_at_abs_batch(&offs)?;
+        let body_pub = self.spent.body_published_len();
+        let mut known = Vec::with_capacity(abs_edges.len());
+        for (edge, slot) in abs_edges.iter().zip(peeked) {
+            let past = edge.0.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > body_pub;
+            known.push(match slot {
+                Some((field, flags, vin)) => (field, flags, vin),
+                None if past => (Fk::NULL, 0, 0),
+                None => self.body_spend_slot(edge.0)?,
+            });
+        }
+        Ok(known)
+    }
+
+    /// Body slot at `abs`. The batch peek already skipped a directory hit.
+    fn body_spend_slot(&self, abs: u64) -> Result<(Fk, u8, u32), StoreError> {
+        let published = self.spent.body_published_len();
+        let mut buf = [0u8; OutputRecord::SPENT_SLOT_LEN];
+        self.spent.read_prefix_at_published(
+            published,
+            abs,
+            OutputRecord::SPENT_SLOT_LEN as u64,
+            &mut buf,
+        )?;
+        let (flags, field, vin) = decode_spent_slot(&buf)?;
+        Ok((field, flags, vin))
+    }
+
+    /// Page read, then 8-byte slot pwrites, for [`Self::put_spend_batch_by_abs_meta`].
+    ///
+    /// Same slot bytes and cold list as the uring helper. The write does not
+    /// store the rest of the page.
     #[doc(hidden)]
     pub fn put_spend_batch_by_abs_meta_pwrite(
         &self,
@@ -2253,21 +2456,29 @@ impl TxTable {
         let body_pub = self.spent.body_published_len();
         let body_path = self.spent.body_file_path();
 
+        let mut out: Vec<Option<SpenderSlot>> = vec![None; abs_offs.len()];
+        let logged = self.spend_pages.slots_at(abs_offs);
         let mut submitted: Vec<usize> = Vec::with_capacity(abs_offs.len());
         for (i, &off) in abs_offs.iter().enumerate() {
             let end = off.saturating_add(META_LEN as u64);
             if end > body_pub {
                 continue;
             }
+            if let Some(raw) = logged[i] {
+                let (flags, field, vin) = decode_spent_slot(&raw)?;
+                out[i] = Some((field, flags, vin));
+                continue;
+            }
             submitted.push(i);
         }
         if submitted.is_empty() {
-            return Ok(vec![None; abs_offs.len()]);
+            note_spend_meta_read(0);
+            return Ok(out);
         }
 
         let live: Vec<u64> = submitted.iter().map(|&i| abs_offs[i]).collect();
         let plan = crate::idx_body_pipeline::plan_spend_slot_peeks(&live);
-        let mut out: Vec<Option<SpenderSlot>> = vec![None; abs_offs.len()];
+        note_spend_meta_read(plan.len());
         let depth = crate::uring_session::DEFAULT_ENTRIES as usize;
         for chunk in plan.chunks(depth.max(1)) {
             read_spend_peek_chunk(
@@ -2277,22 +2488,37 @@ impl TxTable {
         Ok(out)
     }
 
-    /// Page-RMW spend annotate using structural-known meta.
+    /// Directory spend annotate using structural-known meta.
     ///
     /// `known[i]` is `(field, flags, vin)` at `abs_edges[i].0` from structural spentness.
-    /// Backend: `pwrite` or `uring`. Both read a 4 KiB page, poke the prepared
-    /// slots, and write the page. Returns cold edges (OOB) — production callers
-    /// must treat non-empty as hard error.
+    /// A published slot is inserted into the spend directory. This does not
+    /// read or write a `spent.body` page. Returns cold edges (OOB). Production
+    /// callers must treat non-empty as a hard error.
     pub fn put_spend_batch_by_abs_meta_known(
         &self,
         spenders: &crate::spender_table::SpenderTable,
         abs_edges: &[(u64, Fk, u32, Fk, u32)],
         known: &[(Fk, u8, u32)],
-        backend: crate::io_backend::WriteIoBackend,
     ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
         crate::spend_annotate_uring::put_spend_batch_by_abs_meta_known(
-            self, spenders, abs_edges, known, backend,
+            self, spenders, abs_edges, known,
         )
+    }
+
+    pub(crate) fn spend_log_serves(&self, abs: u64) -> bool {
+        self.spend_pages.covers(abs)
+    }
+
+    /// True when the published body slot is exactly `(field, flags, vin)`.
+    pub(crate) fn body_slot_matches(
+        &self,
+        abs: u64,
+        field: Fk,
+        flags: u8,
+        vin: u32,
+    ) -> Result<bool, StoreError> {
+        let (got_field, got_flags, got_vin) = self.body_spend_slot(abs)?;
+        Ok(got_field == field && got_flags == flags && got_vin == vin)
     }
 
     /// Read multi + spender_field for create tx output (packed Class A body).
@@ -2317,6 +2543,10 @@ impl TxTable {
         if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > end {
             return Err(StoreError::Corrupt("spent slot OOB"));
         }
+        if let Some(raw) = self.spend_pages.slot(abs) {
+            let (flags, field, vin) = decode_spent_slot(&raw)?;
+            return Ok((flags & output_flags::MULTI_SPENDER != 0, field, vin));
+        }
         self.spent
             .with_bytes_at(abs, OutputRecord::SPENT_SLOT_LEN as u64, |raw| {
                 let (flags, field, vin) = decode_spent_slot(raw)?;
@@ -2324,9 +2554,11 @@ impl TxTable {
             })
     }
 
-    /// One packed body walk: spender meta for many vouts (ascending).
+    /// Spender meta for many vouts.
     ///
-    /// Returns `(vout, multi, field)` for each found vout. Missing vouts omitted.
+    /// The page log is read first. One `spent.body` walk fills the misses.
+    /// Returns `(vout, multi, field, vin)` for each found vout. Missing vouts
+    /// are omitted.
     pub fn get_output_spender_metas_at(
         &self,
         body_off: u64,
@@ -2337,21 +2569,189 @@ impl TxTable {
             return Ok(Vec::new());
         }
         let slot = OutputRecord::SPENT_SLOT_LEN;
+        let end = body_off.saturating_add(body_len);
+        let mut hits: Vec<Option<(bool, Fk, u32)>> = vec![None; vouts.len()];
+        let mut in_range: Vec<(usize, u64)> = Vec::new();
+        for (i, &v) in vouts.iter().enumerate() {
+            let abs = spent_abs(body_off, v);
+            if abs.saturating_add(slot as u64) <= end {
+                in_range.push((i, abs));
+            }
+        }
+        let logged = self
+            .spend_pages
+            .slots_at(&in_range.iter().map(|(_, abs)| *abs).collect::<Vec<_>>());
+        let mut misses = Vec::new();
+        for (&(i, _), raw) in in_range.iter().zip(logged) {
+            if let Some(logged) = raw {
+                hits[i] = decode_spent_slot(&logged).ok().map(|(flags, field, vin)| {
+                    (flags & output_flags::MULTI_SPENDER != 0, field, vin)
+                });
+                if hits[i].is_none() {
+                    misses.push(i);
+                }
+            } else {
+                misses.push(i);
+            }
+        }
+        if misses.is_empty() {
+            return Ok(Self::pack_spender_metas(vouts, hits));
+        }
         self.spent.with_bytes_at(body_off, body_len, |raw| {
-            let mut out = Vec::with_capacity(vouts.len());
-            for &v in vouts {
+            for i in misses {
+                let v = vouts[i];
                 let start = (v as usize).saturating_mul(slot);
-                let end = start.saturating_add(slot);
-                if end > raw.len() {
+                let stop = start.saturating_add(slot);
+                if stop > raw.len() {
                     continue;
                 }
-                let Ok((flags, field, vin)) = decode_spent_slot(&raw[start..end]) else {
-                    continue;
-                };
-                out.push((v, flags & output_flags::MULTI_SPENDER != 0, field, vin));
+                if let Ok((flags, field, vin)) = decode_spent_slot(&raw[start..stop]) {
+                    hits[i] = Some((flags & output_flags::MULTI_SPENDER != 0, field, vin));
+                }
             }
-            Ok(out)
+            Ok(Self::pack_spender_metas(vouts, hits))
         })
+    }
+
+    fn pack_spender_metas(
+        vouts: &[u32],
+        hits: Vec<Option<(bool, Fk, u32)>>,
+    ) -> Vec<(u32, bool, Fk, u32)> {
+        vouts
+            .iter()
+            .zip(hits)
+            .filter_map(|(&v, hit)| hit.map(|(multi, field, vin)| (v, multi, field, vin)))
+            .collect()
+    }
+
+    pub(crate) fn note_historical_spend_slots(
+        &self,
+        slots: &[(u64, [u8; OutputRecord::SPENT_SLOT_LEN])],
+    ) -> Result<(), StoreError> {
+        self.spend_pages.note_slots(slots)
+    }
+
+    pub(crate) fn prepare_open_spend_pages<K, B, S>(
+        &self,
+        height: u32,
+        keep: K,
+        before_freeze: B,
+        seal_tip: S,
+    ) -> Result<(), StoreError>
+    where
+        K: FnMut(&[u8; OutputRecord::SPENT_SLOT_LEN]) -> Result<bool, StoreError>,
+        B: FnOnce(&crate::spend_page_log::SpendPageLog, &dyn Fn() -> u64) -> Result<(), StoreError>,
+        S: FnOnce(&crate::spend_page_log::SpendPageLog) -> Result<u32, StoreError>,
+    {
+        let published = self.spent.body_published_len();
+        let len_now = || self.spent.body_published_len();
+        self.spend_pages.prepare_commit_in(
+            height,
+            published,
+            |off, len| {
+                let mut buf = vec![0u8; len];
+                let end = self.spent.body_published_len();
+                self.spent
+                    .read_prefix_at_published(end, off, len as u64, &mut buf)?;
+                Ok(buf)
+            },
+            keep,
+            |log| before_freeze(log, &len_now),
+            seal_tip,
+        )
+    }
+
+    pub(crate) fn install_open_spend_pages(&self) -> Result<(), StoreError> {
+        self.spend_pages.install_commit()
+    }
+
+    pub(crate) fn bind_spend_sync_wake(&self, wake: crate::spend_page_log::SpendSyncWake) {
+        self.spend_pages.bind_sync_wake(wake);
+    }
+
+    pub(crate) fn spend_checkpoint_early(&self) -> bool {
+        self.spend_pages.checkpoint_early()
+    }
+
+    pub(crate) fn relax_spend_pace(&self) {
+        self.spend_pages.relax_pace();
+    }
+
+    pub(crate) fn wait_spend_edge_room(&self) {
+        self.spend_pages.wait_open_edge_room();
+    }
+
+    #[doc(hidden)]
+    pub fn spend_log_slot(&self, abs: u64) -> Option<[u8; 8]> {
+        self.spend_pages.slot(abs)
+    }
+
+    pub(crate) fn hold_spend_fold_above(&self, tip: u32) -> Result<(), StoreError> {
+        self.spend_pages.hold_fold_above(tip)
+    }
+
+    pub(crate) fn widen_for_checkpoint(&self, height: u32) {
+        self.spend_pages.widen_for_checkpoint(height);
+    }
+
+    /// Swap open pages into `frozen` before the cooled copy.
+    ///
+    /// The confirmed tip is sealed after that copy. Sealing it here holds a
+    /// generation that does not contain the disconnected block.
+    #[doc(hidden)]
+    pub fn freeze_open_spend_pages(&self) {
+        self.spend_pages.freeze_before_cooled_copy();
+    }
+
+    pub(crate) fn spend_log_above(&self, tip: u32) -> bool {
+        self.spend_pages.above_tip(tip)
+    }
+
+    pub(crate) fn copy_cooled_spend_pages(&self) -> Result<(), StoreError> {
+        // Grow-only. `write_body_abs` samples the length, then stores that
+        // sample. Confirm can publish a longer end in between.
+        self.spend_pages.copy_cooled(
+            |off, image| self.spent.write_body_pwrite(off, image),
+            || self.spent.sync_data_only(),
+        )
+    }
+
+    pub(crate) fn finish_cooled_spend_pages(&self) -> Result<(), StoreError> {
+        self.spend_pages.finish_cooled()
+    }
+
+    /// Record one decided spend slot.
+    ///
+    /// A slot inside the published body, or one the page log already serves,
+    /// is a directory note. A later fold must not copy an older image over
+    /// that spend. A slot past the published body is the create-time overlay
+    /// and stays a `spent.body` write.
+    pub(crate) fn store_spend_slot_at(
+        &self,
+        body_off: u64,
+        body_len: u64,
+        vout: u32,
+        multi: bool,
+        field: Fk,
+        vin: u32,
+    ) -> Result<(), StoreError> {
+        let abs = spent_abs(body_off, vout);
+        let end = body_off.saturating_add(body_len);
+        if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > end {
+            return Err(StoreError::Corrupt("spent slot OOB"));
+        }
+        let flags = if multi {
+            output_flags::MULTI_SPENDER
+        } else {
+            0
+        };
+        let slot_vin = if multi { 0 } else { vin };
+        let meta = encode_spent_slot(flags, field, slot_vin)?;
+        let published = self.spent.body_published_len();
+        if self.spend_pages.covers(abs) || crate::spend_page_log::is_historical(published, abs) {
+            return self.note_historical_spend_slots(&[(abs, meta)]);
+        }
+        self.spent.write_body_pwrite(abs, &meta)
     }
 
     /// Patch multi + spender_field on create tx output (packed Class A body).
@@ -2389,7 +2789,7 @@ impl TxTable {
         };
         let slot_vin = if multi { 0 } else { vin };
         let slot = encode_spent_slot(flags, field, slot_vin)?;
-        self.spent.write_body_abs(abs, &slot)?;
+        self.spent.write_body_pwrite(abs, &slot)?;
         Ok(())
     }
 
@@ -2654,6 +3054,57 @@ impl TxTable {
         Ok(())
     }
 
+    /// Sum of output values for each create in `first..=last`, in fk order.
+    /// Adjacent `txout.body` ranges coalesce into reads of at most
+    /// `span_max` bytes (one create's range is never split). A create in the
+    /// span without a `create.loc` row is `Corrupt`: a short list would
+    /// misalign with the block's txids.
+    pub fn output_value_sums_in_fk_span(
+        &self,
+        first: u64,
+        last: u64,
+        span_max: u64,
+    ) -> Result<Vec<u64>, StoreError> {
+        if last < first {
+            return Ok(Vec::new());
+        }
+        let fks: Vec<Fk> = (first..=last).map(Fk).collect();
+        let mut locs = Vec::with_capacity(fks.len());
+        for p in self.create_loc.range_batch(&fks)? {
+            locs.push(p.ok_or(StoreError::Corrupt(
+                "invariant: create.loc missing in value-sum span",
+            ))?);
+        }
+        let mut sums = Vec::with_capacity(locs.len());
+        let mut i = 0usize;
+        while i < locs.len() {
+            let span_lo = locs[i].txout.0;
+            let mut span_hi = span_lo.saturating_add(locs[i].txout.1);
+            let mut j = i + 1;
+            while let Some(&(off, len)) = locs.get(j).map(|p| &p.txout) {
+                if off != span_hi || span_hi.saturating_sub(span_lo).saturating_add(len) > span_max
+                {
+                    break;
+                }
+                span_hi = span_hi.saturating_add(len);
+                j += 1;
+            }
+            self.body
+                .with_bytes_at_pread(span_lo, span_hi.saturating_sub(span_lo), |buf| {
+                    for p in &locs[i..j] {
+                        let rel = p.txout.0.saturating_sub(span_lo) as usize;
+                        let raw = buf
+                            .get(rel..rel.saturating_add(p.txout.1 as usize))
+                            .ok_or(StoreError::Corrupt("txout span short for fk range"))?;
+                        sums.push(packed_output_value_sum(raw, p.n_out)?);
+                    }
+                    Ok(())
+                })?;
+            i = j;
+        }
+        Ok(sums)
+    }
+
     /// Append Class A rows: `txout` + `seqsigwit` + zero `spent` + `txid.body` + `txstat.body`.
     pub fn put_full_batch_indexed(
         &self,
@@ -2686,10 +3137,6 @@ impl TxTable {
             .iter()
             .map(|(_tx, ins, _outs)| 16 + ins.iter().map(|i| i.encoded_len()).sum::<usize>())
             .sum();
-        let est_spent: usize = items
-            .iter()
-            .map(|(_tx, _ins, outs)| 16 + outs.len() * OutputRecord::SPENT_SLOT_LEN)
-            .sum();
         let base = self.body.count();
         if (!self.prune_seqsigwit_mode() && self.seqsigwit.count() != base)
             || self.spent.count() != base
@@ -2702,18 +3149,21 @@ impl TxTable {
             return Err(StoreError::Corrupt("invariant: create n_out"));
         }
         let n_outs: Vec<u32> = items.iter().map(|(_, _, o)| o.len() as u32).collect();
+        let spent_image = SpentBodyImage::zeros(&n_outs);
+        let spent = self
+            .spent
+            .prepare_exact_body(&spent_image.record_lens(), spent_image.into_bytes())?;
         let (fks, _loc) = self.append_stems_one_wave(
             items.len(),
             est_out,
             est_seqsigwit,
-            est_spent,
             &n_outs,
             |i, buf| {
                 let (tx, ins, outs) = &items[i];
                 encode_packed_tx_with_secret(tx, ins, outs, buf, Some(&self.secret));
             },
             |i, buf| encode_seqsigwit_with_secret(&items[i].1, buf, Some(&self.secret)),
-            |i, buf| encode_spent_zeros(items[i].2.len() as u32, buf),
+            spent,
         )?;
         let ids: Vec<[u8; 32]> = items.iter().map(|(tx, _, _)| tx.txid).collect();
         self.txids.append_batch(base, &ids)?;
@@ -2738,25 +3188,23 @@ impl TxTable {
     /// Like [`Self::put_full_batch_indexed`], but outs live in a shared pin
     /// ([`PackedCreate`]). Encode borrows pin fields — no outs deep clone.
     ///
-    /// `spent_overlay` is per-item `(vout, spend_fk, vin)` sole spenders written into
-    /// the Class A spent stem. Empty slice = all zeros. Non-empty must be one
-    /// inner vec per item.
+    /// `spent` is the exact `spent.body` image for this append (`8 × n_out` per create).
     pub fn put_full_batch_from_pins<P: PackedCreate>(
         &self,
         items: &[(P, Vec<InputRecord>)],
         index: bool,
-        spent_overlay: &[Vec<(u32, Fk, u32)>],
+        spent: SpentBodyImage,
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
         let rows: Vec<crate::txstat::TxStatRow> =
             items.iter().map(|_| txstat_placeholder()).collect();
-        self.put_full_batch_from_pins_with_txstat(items, index, spent_overlay, &rows, &[])
+        self.put_full_batch_from_pins_with_txstat(items, index, spent, &rows, &[])
     }
 
     pub fn put_full_batch_from_pins_with_txstat<P: PackedCreate>(
         &self,
         items: &[(P, Vec<InputRecord>)],
         index: bool,
-        spent_overlay: &[Vec<(u32, Fk, u32)>],
+        spent: SpentBodyImage,
         txstat: &[crate::txstat::TxStatRow],
         header_ranges: &[(Fk, Fk, u32)],
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
@@ -2771,7 +3219,7 @@ impl TxTable {
         self.put_pins_with_edges(
             &pins,
             index,
-            spent_overlay,
+            spent,
             txstat,
             header_ranges,
             &edges,
@@ -2788,7 +3236,7 @@ impl TxTable {
         &self,
         pins: &[&P],
         index: bool,
-        spent_overlay: &[Vec<(u32, Fk, u32)>],
+        spent: SpentBodyImage,
         txstat: &[crate::txstat::TxStatRow],
         header_ranges: &[(Fk, Fk, u32)],
         input_edges: &[Vec<crate::input::InputEdge>],
@@ -2798,7 +3246,7 @@ impl TxTable {
         self.put_pins_with_edges(
             pins,
             index,
-            spent_overlay,
+            spent,
             txstat,
             header_ranges,
             input_edges,
@@ -2813,7 +3261,7 @@ impl TxTable {
         &self,
         pins: &[&P],
         index: bool,
-        spent_overlay: &[Vec<(u32, Fk, u32)>],
+        spent: SpentBodyImage,
         txstat: &[crate::txstat::TxStatRow],
         header_ranges: &[(Fk, Fk, u32)],
         input_edges: &[Vec<crate::input::InputEdge>],
@@ -2829,14 +3277,10 @@ impl TxTable {
         if input_edges.len() != pins.len() {
             return Err(StoreError::Corrupt("input edge batch length"));
         }
-        if !spent_overlay.is_empty() && spent_overlay.len() != pins.len() {
+        if spent.create_count() != pins.len() {
             return Err(StoreError::Corrupt("spent overlay length"));
         }
         let est_out: usize = pins.iter().map(|pin| pin.packed_outs_est()).sum();
-        let est_spent: usize = pins
-            .iter()
-            .map(|pin| 16 + spent_record_len(pin.packed_n_out()) as usize)
-            .sum();
         let base = self.body.count();
         if (!self.prune_seqsigwit_mode() && self.seqsigwit.count() != base)
             || self.spent.count() != base
@@ -2845,35 +3289,30 @@ impl TxTable {
         {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
+        let mut n_outs = Vec::with_capacity(pins.len());
         for (i, pin) in pins.iter().enumerate() {
             let n_out = pin.packed_n_out();
             if n_out == 0 {
                 return Err(StoreError::Corrupt("invariant: create n_out"));
             }
-            let pairs = spent_overlay.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
-            for &(vout, fk, vin) in pairs {
-                if vout >= n_out {
-                    return Err(StoreError::Corrupt("spent overlay vout"));
-                }
-                encode_spent_slot(0, fk, vin)?;
+            if spent.n_out(i) != n_out {
+                return Err(StoreError::Corrupt("spent overlay n_out"));
             }
+            n_outs.push(n_out);
         }
-        let n_outs: Vec<u32> = pins.iter().map(|pin| pin.packed_n_out()).collect();
+        let spent = self
+            .spent
+            .prepare_exact_body(&spent.record_lens(), spent.into_bytes())?;
         let (fks, loc) = self.append_stems_one_wave(
             pins.len(),
             est_out,
             est_seqsigwit,
-            est_spent,
             &n_outs,
             |i, buf| {
                 pins[i].encode_txout_body(buf, Some(&self.secret));
             },
             encode_in,
-            |i, buf| {
-                let n_out = pins[i].packed_n_out();
-                let pairs = spent_overlay.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
-                encode_spent_slots(n_out, pairs, buf).expect("spent overlay prechecked");
-            },
+            spent,
         )?;
         let ids: Vec<[u8; 32]> = pins.iter().map(|pin| pin.packed_txid()).collect();
         self.txids.append_batch(base, &ids)?;
@@ -2927,20 +3366,16 @@ impl TxTable {
         n: usize,
         est_out: usize,
         est_seqsigwit: usize,
-        est_spent: usize,
         n_outs: &[u32],
         encode_out: impl FnMut(usize, &mut Vec<u8>),
         encode_in: impl FnMut(usize, &mut Vec<u8>),
-        encode_sp: impl FnMut(usize, &mut Vec<u8>),
+        p_sp: crate::var_table::PreparedAppend,
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
-        if n_outs.len() != n {
+        if n_outs.len() != n || p_sp.starts.len() != n {
             return Err(StoreError::Corrupt("invariant: create n_out"));
         }
         let Some(p_out) = self.body.prepare_batch_encode(n, est_out, encode_out)? else {
             return Ok((Vec::new(), Vec::new()));
-        };
-        let Some(p_sp) = self.spent.prepare_batch_encode(n, est_spent, encode_sp)? else {
-            return Err(StoreError::Corrupt("Class A spent prepare empty"));
         };
         let (recs, loc) = class_a_loc_pairs(n, n_outs, &p_out, &p_sp);
         let staged_loc = self.create_loc.stage(&recs)?;
@@ -3060,9 +3495,7 @@ impl TxTable {
                 let e = spenders.append(spend_fk, spend_vin, field)?;
                 (true, e, 0)
             };
-            self.set_output_spender_meta_at(
-                spent_off, spent_len, vout, new_multi, new_field, new_vin,
-            )?;
+            self.store_spend_slot_at(spent_off, spent_len, vout, new_multi, new_field, new_vin)?;
         }
         Ok(())
     }

@@ -113,6 +113,9 @@ pub struct ListenOpts {
     pub proxy_randomize: bool,
     /// Core `-discover` (default on). Off: no self-announce / localaddresses.
     pub discover: bool,
+    /// Announce the IP clearnet peers report reaching us at, when no
+    /// clearnet `--external-ip` is set (`--discover-from-peers`, default off).
+    pub discover_from_peers: bool,
     /// Empty = all networks. Repeatable `--only-net`.
     pub only_net: Vec<rbitcoin_net::OnlyNet>,
     /// SAM v3 TCP port (`--i2p-sam`).
@@ -149,6 +152,7 @@ impl Default for ListenOpts {
             onion: None,
             proxy_randomize: true,
             discover: true,
+            discover_from_peers: false,
             only_net: Vec::new(),
             i2p_sam: None,
             i2p_accept_incoming: false,
@@ -162,6 +166,23 @@ impl Default for ListenOpts {
 impl ListenOpts {
     pub fn has_pinned_connect(&self) -> bool {
         !self.connect.is_empty() || !self.connect_dns.is_empty()
+    }
+
+    /// Tor or I2P delivers inbound TCP from loopback, including an
+    /// operator `--external-ip` onion.
+    pub fn overlay_loopback_forward(&self) -> bool {
+        self.listen_onion || self.i2p_accept_incoming || !self.external_onions.is_empty()
+    }
+
+    /// `--only-net` leaves IPv4 or IPv6 reachable (an empty list leaves all).
+    pub fn clearnet_reachable(&self) -> bool {
+        self.only_net.is_empty()
+            || self.only_net.iter().any(|net| {
+                matches!(
+                    net,
+                    rbitcoin_net::OnlyNet::Ipv4 | rbitcoin_net::OnlyNet::Ipv6
+                )
+            })
     }
 
     pub fn dialer(&self) -> rbitcoin_net::Dialer {
@@ -449,6 +470,9 @@ pub struct NodeConfig {
     /// Max `blockchain.scripthash.subscribe` entries per Electrum connection
     /// (>= 1). Default [`rbitcoin_electrum::DEFAULT_MAX_SCRIPTHASH_SUBS`].
     pub electrum_max_subs: usize,
+    /// Max `blockchain.silentpayments.subscribe` addresses per Electrum
+    /// connection (>= 1). Default [`rbitcoin_electrum::DEFAULT_MAX_SP_SUBS`].
+    pub electrum_max_sp_subs: usize,
     /// Max Esplora requests in flight across the whole listener (>= 1).
     /// Default [`rbitcoin_electrum::DEFAULT_MAX_CONNECTIONS`].
     pub esplora_max_inflight: usize,
@@ -459,8 +483,14 @@ pub struct NodeConfig {
     pub esplora_block_template: bool,
     /// Prometheus `GET /metrics` on the health listener. Default off.
     pub metrics: bool,
-    /// ADD_ONION for `--esplora-listen` when `--tor-control` is set. Default on.
+    /// ADD_ONION for `--electrum-listen` through `--tor-control`. Default off.
+    pub electrum_onion: bool,
+    /// ADD_ONION for `--esplora-listen` through `--tor-control`. Default off.
     pub esplora_onion: bool,
+    /// SAM destination and `STREAM FORWARD` for `--electrum-listen` through `--i2p-sam`. Default off.
+    pub electrum_i2p: bool,
+    /// SAM destination and `STREAM FORWARD` for `--esplora-listen` through `--i2p-sam`. Default off.
+    pub esplora_i2p: bool,
     /// SV2 Template Provider bind (`--sv2-tp-listen`). Default off.
     pub sv2_tp_listen: Option<SocketAddr>,
     /// Authority secret key the TP signs its Noise certificates with.
@@ -603,11 +633,15 @@ impl Default for NodeConfig {
             max_sh_creates: rbitcoin_query::DEFAULT_MAX_SH_CREATES,
             heavy_sh_creates: rbitcoin_query::DEFAULT_HEAVY_SH_CREATES,
             electrum_max_subs: rbitcoin_electrum::DEFAULT_MAX_SCRIPTHASH_SUBS,
+            electrum_max_sp_subs: rbitcoin_electrum::DEFAULT_MAX_SP_SUBS,
             esplora_max_inflight: rbitcoin_electrum::DEFAULT_MAX_CONNECTIONS,
             store_read_budget: None,
             esplora_block_template: false,
             metrics: false,
-            esplora_onion: true,
+            electrum_onion: false,
+            esplora_onion: false,
+            electrum_i2p: false,
+            esplora_i2p: false,
             sv2_tp_listen: None,
             sv2_tp_authority_sec: None,
             sv2_tp_cert_validity_secs: 3600,
@@ -846,14 +880,6 @@ impl NodeConfig {
                 "signet-block-time must be greater than zero".into(),
             ));
         }
-        if self.sptweaks && self.prune_seqsigwit {
-            // Tweaks read input keys from scriptSig and witness (seqsigwit).
-            return Err(NodeError::Config(
-                "--sp-tweaks cannot be combined with --prune-seqsigwit: tweaks need the \
-                 scriptSig and witness data pruning drops"
-                    .into(),
-            ));
-        }
         if self.metrics && self.listen.health.is_none() {
             return Err(NodeError::Config("--metrics needs --health-listen".into()));
         }
@@ -872,6 +898,7 @@ impl NodeConfig {
         self.validate_trust_peer()?;
         self.validate_hidden_inbound()?;
         self.validate_v1_bind()?;
+        self.validate_wallet_overlays()?;
         self.validate_rpc_cookie()
     }
 
@@ -1110,6 +1137,84 @@ impl NodeConfig {
         Ok(())
     }
 
+    /// `--electrum-onion`, `--esplora-onion`, `--electrum-i2p`, `--esplora-i2p`.
+    /// Tor and SAM forward to `127.0.0.1:<port>`, so the listener must be a TCP
+    /// bind that address reaches.
+    #[doc(hidden)]
+    pub fn validate_wallet_overlays(&self) -> Result<(), NodeError> {
+        let electrum = self.listen.electrum.map(Some);
+        let esplora = self.listen.esplora.as_ref().map(|l| match l {
+            rbitcoin_esplora::EsploraListen::Tcp(a) => Some(*a),
+            #[cfg(unix)]
+            rbitcoin_esplora::EsploraListen::Unix(_) => None,
+        });
+        for (flag, on, listen, listen_flag, overlay, overlay_flag) in [
+            (
+                "electrum-onion",
+                self.electrum_onion,
+                electrum,
+                "--electrum-listen",
+                self.tor.control.is_some(),
+                "--tor-control",
+            ),
+            (
+                "esplora-onion",
+                self.esplora_onion,
+                esplora,
+                "--esplora-listen",
+                self.tor.control.is_some(),
+                "--tor-control",
+            ),
+            (
+                "electrum-i2p",
+                self.electrum_i2p,
+                electrum,
+                "--electrum-listen",
+                self.listen.i2p_sam.is_some(),
+                "--i2p-sam",
+            ),
+            (
+                "esplora-i2p",
+                self.esplora_i2p,
+                esplora,
+                "--esplora-listen",
+                self.listen.i2p_sam.is_some(),
+                "--i2p-sam",
+            ),
+        ] {
+            if !on {
+                continue;
+            }
+            if !overlay {
+                return Err(NodeError::Config(format!("{flag} requires {overlay_flag}")));
+            }
+            let addr = match listen {
+                None => {
+                    return Err(NodeError::Config(format!("{flag} requires {listen_flag}")));
+                }
+                Some(None) => {
+                    return Err(NodeError::Config(format!(
+                        "{flag} needs a TCP {listen_flag}; a unix socket has no 127.0.0.1 port to forward to"
+                    )));
+                }
+                Some(Some(a)) => a,
+            };
+            let reached = match addr.ip() {
+                std::net::IpAddr::V4(ip) => {
+                    ip == std::net::Ipv4Addr::LOCALHOST || ip.is_unspecified()
+                }
+                std::net::IpAddr::V6(_) => false,
+            };
+            if !reached {
+                return Err(NodeError::Config(format!(
+                    "{flag} forwards to 127.0.0.1:{port}; {listen_flag} {addr} is not reachable there (bind 127.0.0.1 or 0.0.0.0)",
+                    port = addr.port()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Fill `--rpc-listen` omitted ADDR from `--network`. Implies unix socket.
     pub fn resolve_listen_defaults(&mut self) {
         if self.rpc.listen_default && self.rpc.listen.is_none() {
@@ -1262,6 +1367,10 @@ impl NodeConfig {
                         self.network = Network::Testnet4;
                         continue;
                     }
+                    if line.eq_ignore_ascii_case("testnet5") {
+                        self.network = Network::Testnet5;
+                        continue;
+                    }
                     return Err(NodeError::Config(format!(
                         "conf {}:{}: expected key=value",
                         path.display(),
@@ -1350,9 +1459,7 @@ impl NodeConfig {
                 }
             }
             "no_listen" => {
-                if parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf no_listen: {e}")))?
-                {
+                if conf_bool("no_listen", val)? {
                     self.listen.p2p_explicit = true;
                     self.listen.p2p = P2pListen::Off;
                     self.listen.p2p_extra.clear();
@@ -1360,6 +1467,9 @@ impl NodeConfig {
             }
             "no_discover" => {
                 self.listen.discover = !is_conf_true(val);
+            }
+            "discover_from_peers" => {
+                self.listen.discover_from_peers = conf_bool("discover_from_peers", val)?
             }
             "only_net" => {
                 self.listen.only_net.push(
@@ -1429,21 +1539,11 @@ impl NodeConfig {
                 });
             }
             "i2p_accept_incoming" => {
-                self.listen.i2p_accept_incoming = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf i2p_accept_incoming: {e}")))?;
+                self.listen.i2p_accept_incoming = conf_bool("i2p_accept_incoming", val)?
             }
-            "listen_onion" => {
-                self.listen.listen_onion = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf listen_onion: {e}")))?;
-            }
-            "cjdns_reachable" => {
-                self.listen.cjdns_reachable = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf cjdns_reachable: {e}")))?;
-            }
-            "proxy_randomize" => {
-                self.listen.proxy_randomize = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf proxy_randomize: {e}")))?;
-            }
+            "listen_onion" => self.listen.listen_onion = conf_bool("listen_onion", val)?,
+            "cjdns_reachable" => self.listen.cjdns_reachable = conf_bool("cjdns_reachable", val)?,
+            "proxy_randomize" => self.listen.proxy_randomize = conf_bool("proxy_randomize", val)?,
             "seed_node" => {
                 if !val.is_empty() {
                     if val.to_ascii_lowercase().contains(".onion") {
@@ -1478,31 +1578,16 @@ impl NodeConfig {
                         .map_err(|e| NodeError::Config(format!("conf health_listen: {e}")))?
                 });
             }
-            "sh_index" => {
-                self.shindex = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf sh_index: {e}")))?;
-            }
-            "block_filter_index" => {
-                self.block_filter_index = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf block_filter_index: {e}")))?;
-            }
-            "prune_seqsigwit" => {
-                self.prune_seqsigwit = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf prune_seqsigwit: {e}")))?;
-            }
-            "datadir_hdd" => {
-                self.datadir_hdd = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf datadir_hdd: {e}")))?;
-            }
+            "sh_index" => self.shindex = conf_bool("sh_index", val)?,
+            "block_filter_index" => self.block_filter_index = conf_bool("block_filter_index", val)?,
+            "prune_seqsigwit" => self.prune_seqsigwit = conf_bool("prune_seqsigwit", val)?,
+            "datadir_hdd" => self.datadir_hdd = conf_bool("datadir_hdd", val)?,
             "prune_seqsigwit_ram_threshold_bytes" => {
                 self.prune_seqsigwit_ram_threshold_bytes = val.parse().map_err(|e| {
                     NodeError::Config(format!("conf prune_seqsigwit_ram_threshold_bytes: {e}"))
                 })?;
             }
-            "sp_tweaks" => {
-                self.sptweaks = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf sp_tweaks: {e}")))?;
-            }
+            "sp_tweaks" => self.sptweaks = conf_bool("sp_tweaks", val)?,
             "sp_tweaks_dust" => {
                 self.sptweaks_dust = val
                     .parse()
@@ -1528,6 +1613,17 @@ impl NodeConfig {
                     ));
                 }
                 self.electrum_max_subs = n;
+            }
+            "electrum_max_sp_subs" => {
+                let n: usize = val
+                    .parse()
+                    .map_err(|e| NodeError::Config(format!("conf electrum_max_sp_subs: {e}")))?;
+                if n == 0 {
+                    return Err(NodeError::Config(
+                        "conf electrum_max_sp_subs must be >= 1".into(),
+                    ));
+                }
+                self.electrum_max_sp_subs = n;
             }
             "store_read_budget" => {
                 let n: i64 = val
@@ -1555,13 +1651,12 @@ impl NodeConfig {
                 self.esplora_max_inflight = n;
             }
             "esplora_block_template" => {
-                self.esplora_block_template = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf esplora_block_template: {e}")))?;
+                self.esplora_block_template = conf_bool("esplora_block_template", val)?
             }
-            "esplora_onion" => {
-                self.esplora_onion = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf esplora_onion: {e}")))?;
-            }
+            "electrum_onion" => self.electrum_onion = conf_bool("electrum_onion", val)?,
+            "esplora_onion" => self.esplora_onion = conf_bool("esplora_onion", val)?,
+            "electrum_i2p" => self.electrum_i2p = conf_bool("electrum_i2p", val)?,
+            "esplora_i2p" => self.esplora_i2p = conf_bool("esplora_i2p", val)?,
             "sv2_tp_listen" => {
                 self.sv2_tp_listen = Some(
                     val.parse()
@@ -1634,10 +1729,7 @@ impl NodeConfig {
                     })?
                     .into();
             }
-            "rpc" => {
-                self.rpc.socket = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf rpc: {e}")))?;
-            }
+            "rpc" => self.rpc.socket = conf_bool("rpc", val)?,
             "rpc_listen" => {
                 self.rpc.socket = true;
                 if val.is_empty() {
@@ -1707,22 +1799,10 @@ impl NodeConfig {
                     NodeError::Config(format!("conf regtest_retarget_interval: {e}"))
                 })?);
             }
-            "persist_mempool" => {
-                self.mempool.persist = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf persist_mempool: {e}")))?;
-            }
-            "trusted" => {
-                self.trusted = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf trusted: {e}")))?;
-            }
-            "always_relay" => {
-                self.always_relay = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf always_relay: {e}")))?;
-            }
-            "relay" => {
-                self.relay = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf relay: {e}")))?;
-            }
+            "persist_mempool" => self.mempool.persist = conf_bool("persist_mempool", val)?,
+            "trusted" => self.trusted = conf_bool("trusted", val)?,
+            "always_relay" => self.always_relay = conf_bool("always_relay", val)?,
+            "relay" => self.relay = conf_bool("relay", val)?,
             "net_permission" | "net_permissions" => {
                 if !val.is_empty() {
                     let g = rbitcoin_net::parse_whitelist(val).map_err(NodeError::Init)?;
@@ -1745,22 +1825,13 @@ impl NodeConfig {
                 }
             }
             "net_permission_relay" => {
-                self.net_permission_relay = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf net-permission-relay: {e}")))?;
+                self.net_permission_relay = conf_bool("net-permission-relay", val)?
             }
             "net_permission_force_relay" => {
-                self.net_permission_force_relay = parse_conf_bool(val).map_err(|e| {
-                    NodeError::Config(format!("conf net-permission-force-relay: {e}"))
-                })?;
+                self.net_permission_force_relay = conf_bool("net-permission-force-relay", val)?
             }
-            "blocks_only" => {
-                self.mempool.blocksonly = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf blocks_only: {e}")))?;
-            }
-            "prefill_compact" => {
-                self.prefill_compact = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf prefill_compact: {e}")))?;
-            }
+            "blocks_only" => self.mempool.blocksonly = conf_bool("blocks_only", val)?,
+            "prefill_compact" => self.prefill_compact = conf_bool("prefill_compact", val)?,
             "min_relay_tx_fee" => {
                 if val.is_empty() {
                     return Err(NodeError::Config(
@@ -1908,18 +1979,9 @@ impl NodeConfig {
                         .map_err(|e| NodeError::Config(format!("conf max_run_secs: {e}")))?,
                 );
             }
-            "metrics" => {
-                self.metrics = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf metrics: {e}")))?;
-            }
-            "rest" => {
-                self.rpc.rest = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf rest: {e}")))?;
-            }
-            "inhibit_suspend" => {
-                self.inhibit_suspend = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf inhibit_suspend: {e}")))?;
-            }
+            "metrics" => self.metrics = conf_bool("metrics", val)?,
+            "rest" => self.rpc.rest = conf_bool("rest", val)?,
+            "inhibit_suspend" => self.inhibit_suspend = conf_bool("inhibit_suspend", val)?,
             "mock_time" => {
                 let n: i64 = val
                     .parse()
@@ -1967,31 +2029,28 @@ impl NodeConfig {
             }
             "no_seeds" => self.listen.use_seeds = !is_conf_true(val),
             "regtest" => {
-                if parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf regtest: {e}")))?
-                {
+                if conf_bool("regtest", val)? {
                     self.network = Network::Regtest;
                 }
             }
             "signet" => {
-                if parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf signet: {e}")))?
-                {
+                if conf_bool("signet", val)? {
                     self.network = Network::Signet;
                 }
             }
             "testnet" => {
-                if parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf testnet: {e}")))?
-                {
+                if conf_bool("testnet", val)? {
                     self.network = Network::Testnet;
                 }
             }
             "testnet4" => {
-                if parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf testnet4: {e}")))?
-                {
+                if conf_bool("testnet4", val)? {
                     self.network = Network::Testnet4;
+                }
+            }
+            "testnet5" => {
+                if conf_bool("testnet5", val)? {
+                    self.network = Network::Testnet5;
                 }
             }
             _ => return Ok(ConfApply::Unknown(key.to_string())),
@@ -2052,6 +2111,10 @@ pub fn parse_authority_sec(key: &str, val: &str) -> Result<Sv2AuthoritySecret, N
                 "conf {key}: want a secp256k1 secret key (64 hex or key-utils base58check)"
             ))
         })
+}
+
+fn conf_bool(key: &str, val: &str) -> Result<bool, NodeError> {
+    parse_conf_bool(val).map_err(|e| NodeError::Config(format!("conf {key}: {e}")))
 }
 
 /// Parse `1`/`true`/`yes`/`on` → true; `0`/`false`/`no`/`off` → false.
@@ -2137,5 +2200,31 @@ impl NodeConfig {
             None => true,
             Some(min) => tip_work_be >= min,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_onion_counts_as_loopback_forward() {
+        let listen = ListenOpts::default();
+        assert!(!listen.overlay_loopback_forward());
+        let onion = ListenOpts {
+            listen_onion: true,
+            ..ListenOpts::default()
+        };
+        assert!(onion.overlay_loopback_forward());
+        let i2p = ListenOpts {
+            i2p_accept_incoming: true,
+            ..ListenOpts::default()
+        };
+        assert!(i2p.overlay_loopback_forward());
+        let external = ListenOpts {
+            external_onions: vec!["external.onion".to_string()],
+            ..ListenOpts::default()
+        };
+        assert!(external.overlay_loopback_forward());
     }
 }

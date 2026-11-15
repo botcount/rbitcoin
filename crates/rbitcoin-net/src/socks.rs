@@ -129,7 +129,7 @@ impl Dialer {
                     connect_floor,
                     ..
                 },
-                crate::NetAddr::Ip(_),
+                crate::NetAddr::Ip(_) | crate::NetAddr::Name { .. },
             ) => {
                 if *connect_floor < SOCKS_CONNECT_TIMEOUT {
                     *connect_floor
@@ -278,14 +278,17 @@ impl Dialer {
             crate::NetAddr::Cjdns { .. } => Err(NetError::Encode(
                 "isolated broadcast never dials cjdns".into(),
             )),
+            crate::NetAddr::Name { .. } => Err(NetError::Encode(
+                "isolated broadcast never dials a name".into(),
+            )),
         }
     }
 
     pub async fn connect_net(&self, addr: crate::NetAddr) -> Result<TcpStream, NetError> {
         match addr {
             crate::NetAddr::Ip(s) => self.connect(s).await,
-            crate::NetAddr::Onion { port, .. } => {
-                let Some(socks) = self.proxy_for(crate::OnlyNet::Onion) else {
+            crate::NetAddr::Onion { port, .. } | crate::NetAddr::Name { port, .. } => {
+                let Some(socks) = self.proxy_for(crate::OnlyNet::of(addr)) else {
                     return Err(NetError::Encode(
                         "onion dial requires SOCKS (--proxy or --onion)".into(),
                     ));

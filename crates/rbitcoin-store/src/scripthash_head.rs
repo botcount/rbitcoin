@@ -18,7 +18,7 @@ use crate::scripthash_layout::{
     head_key_from_full, pack8_bytes, unpack8_bytes, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN,
     SH_HEAD_SLOT_SIZE, SH_HEAD_VALUE_LEN,
 };
-use rbitcoin_primitives::TableKind;
+use rbitcoin_primitives::{bytes, TableKind};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -28,6 +28,12 @@ use std::sync::Mutex;
 pub const OCC_SCAN_BYTE_CAP: u64 = 16 * 1024 * 1024;
 #[doc(hidden)]
 pub const OCC_MAGIC: &[u8; 8] = b"SHOCC001";
+
+fn sh_slot_at(buf: &[u8], off: usize) -> [u8; SH_HEAD_SLOT_SIZE] {
+    let mut rec = [0u8; SH_HEAD_SLOT_SIZE];
+    rec.copy_from_slice(&buf[off..off + SH_HEAD_SLOT_SIZE]);
+    rec
+}
 
 #[doc(hidden)]
 pub const SLOTS_PER_CHUNK: u64 = 128;
@@ -88,7 +94,9 @@ pub fn load_occ_sidecar(head_path: &Path) -> Option<u64> {
     if buf.len() < 16 || &buf[0..8] != OCC_MAGIC {
         return None;
     }
-    Some(u64::from_le_bytes(buf[8..16].try_into().ok()?))
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&buf[8..16]);
+    Some(u64::from_le_bytes(word))
 }
 
 #[doc(hidden)]
@@ -127,12 +135,9 @@ pub fn scan_occupied(file: &TableFile, slots: u64) -> Result<u64, StoreError> {
         let off = FILE_HEADER_LEN as u64 + slot * SH_HEAD_SLOT_SIZE as u64;
         let bytes = n * SH_HEAD_SLOT_SIZE;
         file.read_at(off, &mut buf[..bytes])?;
-        for i in 0..n {
-            let base = i * SH_HEAD_SLOT_SIZE;
-            let k: ShHeadKey = buf[base..base + SH_HEAD_KEY_LEN].try_into().unwrap();
-            let v: [u8; SH_HEAD_VALUE_LEN] = buf[base + SH_HEAD_KEY_LEN..base + SH_HEAD_SLOT_SIZE]
-                .try_into()
-                .unwrap();
+        for rec in buf[..bytes].as_chunks::<SH_HEAD_SLOT_SIZE>().0 {
+            let k = bytes!(rec, 0, 16);
+            let v = bytes!(rec, 16, 8);
             if !is_empty_slot(&k, &v) {
                 unpack8_bytes(&v)?;
                 occupied += 1;
@@ -443,11 +448,9 @@ impl ScriptHashHead {
             let mut placed = false;
             for _ in 0..slots {
                 let off = (slot as usize) * SH_HEAD_SLOT_SIZE;
-                let slot_key: ShHeadKey = table[off..off + SH_HEAD_KEY_LEN].try_into().unwrap();
-                let slot_v: [u8; SH_HEAD_VALUE_LEN] = table
-                    [off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE]
-                    .try_into()
-                    .unwrap();
+                let rec = sh_slot_at(&table, off);
+                let slot_key = bytes!(rec, 0, 16);
+                let slot_v = bytes!(rec, 16, 8);
                 if is_empty_slot(&slot_key, &slot_v) {
                     table[off..off + SH_HEAD_KEY_LEN].copy_from_slice(key);
                     table[off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE].copy_from_slice(&enc);
@@ -494,13 +497,9 @@ impl ScriptHashHead {
             let off = FILE_HEADER_LEN as u64 + slot * SH_HEAD_SLOT_SIZE as u64;
             let bytes = n * SH_HEAD_SLOT_SIZE;
             self.file.read_at(off, &mut buf[..bytes])?;
-            for i in 0..n {
-                let base = i * SH_HEAD_SLOT_SIZE;
-                let k: ShHeadKey = buf[base..base + SH_HEAD_KEY_LEN].try_into().unwrap();
-                let v: [u8; SH_HEAD_VALUE_LEN] = buf
-                    [base + SH_HEAD_KEY_LEN..base + SH_HEAD_SLOT_SIZE]
-                    .try_into()
-                    .unwrap();
+            for rec in buf[..bytes].as_chunks::<SH_HEAD_SLOT_SIZE>().0 {
+                let k = bytes!(rec, 0, 16);
+                let v = bytes!(rec, 16, 8);
                 if is_empty_slot(&k, &v) {
                     continue;
                 }
@@ -603,11 +602,8 @@ impl<'a> SlotPageCache<'a> {
     ) -> Result<(ShHeadKey, [u8; SH_HEAD_VALUE_LEN]), StoreError> {
         let chunk = self.ensure_chunk(slot)?;
         let rel = ((slot - chunk.base_slot) as usize) * SH_HEAD_SLOT_SIZE;
-        let k: ShHeadKey = chunk.data[rel..rel + SH_HEAD_KEY_LEN].try_into().unwrap();
-        let v: [u8; SH_HEAD_VALUE_LEN] = chunk.data[rel + SH_HEAD_KEY_LEN..rel + SH_HEAD_SLOT_SIZE]
-            .try_into()
-            .unwrap();
-        Ok((k, v))
+        let rec = sh_slot_at(&chunk.data, rel);
+        Ok((bytes!(rec, 0, 16), bytes!(rec, 16, 8)))
     }
 
     #[doc(hidden)]

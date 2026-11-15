@@ -30,7 +30,7 @@
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::seg_pair::{locate, SegDirs, SegPair};
-use rbitcoin_primitives::{Fk, Height, TableKind};
+use rbitcoin_primitives::{bytes, le_u32, le_u64, Fk, Height, TableKind};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
@@ -108,18 +108,14 @@ pub fn encode_slot(off: u32, len: u32, s: &BlockFilterSlot) -> [u8; SLOT as usiz
 }
 
 #[doc(hidden)]
-pub fn decode_slot(b: &[u8]) -> SlotRow {
-    let mut filter_hash = [0u8; 32];
-    filter_hash.copy_from_slice(&b[16..48]);
-    let mut filter_header = [0u8; 32];
-    filter_header.copy_from_slice(&b[48..80]);
+pub fn decode_slot(b: &[u8; SLOT as usize]) -> SlotRow {
     SlotRow {
-        off: u32::from_le_bytes(b[0..4].try_into().unwrap()),
-        len: u32::from_le_bytes(b[4..8].try_into().unwrap()),
+        off: le_u32!(b, 0),
+        len: le_u32!(b, 4),
         slot: BlockFilterSlot {
-            header_fk: Fk(u64::from_le_bytes(b[8..16].try_into().unwrap())),
-            filter_hash,
-            filter_header,
+            header_fk: Fk(le_u64!(b, 8)),
+            filter_hash: bytes!(b, 16, 32),
+            filter_header: bytes!(b, 48, 32),
         },
     }
 }
@@ -135,7 +131,11 @@ impl SlotRow {
 pub fn read_rows(seg: &SegPair, local: u64, n: u64) -> Result<Vec<SlotRow>, StoreError> {
     let mut b = vec![0u8; (n * SLOT) as usize];
     seg.idx.read_at(HDR + local * SLOT, &mut b)?;
-    Ok(b.chunks_exact(SLOT as usize).map(decode_slot).collect())
+    Ok(b.as_chunks::<{ SLOT as usize }>()
+        .0
+        .iter()
+        .map(decode_slot)
+        .collect())
 }
 
 /// End of the last record in `seg` (`HDR` when empty).
@@ -305,6 +305,33 @@ impl BlockFilterTable {
             left -= run;
             si += 1;
             local = 0;
+        }
+        Ok(Some(out))
+    }
+
+    /// Filter headers at heights 1,000, 2,000, … through `stop`.
+    ///
+    /// One idx pread per checkpoint. `None` when `stop` is past the watermark.
+    pub fn checkpoint_headers(&self, stop: Height) -> Result<Option<Vec<[u8; 32]>>, StoreError> {
+        let inner = self.read();
+        if inner.locate(stop).is_none() {
+            return Ok(None);
+        }
+        if stop.0 < 1000 {
+            return Ok(Some(Vec::new()));
+        }
+        let mut out = Vec::new();
+        let mut h = 1000u32;
+        while h <= stop.0 {
+            let Some((si, local)) = inner.locate(Height(h)) else {
+                return Ok(None);
+            };
+            let rows = read_rows(&inner.segs[si], local, 1)?;
+            let Some(row) = rows.first() else {
+                return Err(StoreError::Corrupt("blockfilter checkpoint slot missing"));
+            };
+            out.push(row.slot.filter_header);
+            h = h.saturating_add(1000);
         }
         Ok(Some(out))
     }

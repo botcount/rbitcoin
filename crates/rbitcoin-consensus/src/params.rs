@@ -76,6 +76,13 @@ pub struct ChainParams {
     /// Core `enforce_BIP94`: a retarget multiplies the period's first `nBits`,
     /// and a period's first header is at most 600 seconds before its parent.
     pub enforce_bip94: bool,
+    /// BIP 54 consensus cleanup from block 1 (Core
+    /// `DEPLOYMENT_CONSENSUSCLEANUP` at `ALWAYS_ACTIVE`).
+    pub enforce_bip54: bool,
+    /// BIP 95 Testnet 5. rust-bitcoin 0.32 has no such network, so `network`
+    /// is `Testnet4`, which has the same address encodings and buried
+    /// heights. This selects the genesis block and the message start.
+    pub testnet5: bool,
 }
 
 impl ChainParams {
@@ -85,6 +92,7 @@ impl ChainParams {
             rbitcoin_primitives::Network::Testnet => Self::testnet(),
             rbitcoin_primitives::Network::Signet => Self::signet(),
             rbitcoin_primitives::Network::Testnet4 => Self::testnet4(),
+            rbitcoin_primitives::Network::Testnet5 => Self::testnet5(),
             rbitcoin_primitives::Network::Regtest => Self::regtest(),
         }
     }
@@ -117,6 +125,8 @@ impl ChainParams {
                 threshold: 108,
             }),
             enforce_bip94: false,
+            enforce_bip54: false,
+            testnet5: false,
         }
     }
 
@@ -140,6 +150,8 @@ impl ChainParams {
             )),
             testdummy: None,
             enforce_bip94: false,
+            enforce_bip54: false,
+            testnet5: false,
         }
     }
 
@@ -162,6 +174,8 @@ impl ChainParams {
             )),
             testdummy: None,
             enforce_bip94: false,
+            enforce_bip54: false,
+            testnet5: false,
         }
     }
 
@@ -184,6 +198,28 @@ impl ChainParams {
             bip34_hash: None,
             testdummy: None,
             enforce_bip94: true,
+            enforce_bip54: false,
+            testnet5: false,
+        }
+    }
+
+    /// BIP 95 and Core `CTestNet5Params`. The pow limit is the genesis
+    /// block's `nBits`, and no block may fall back to it after a slow parent.
+    pub fn testnet5() -> Self {
+        let genesis = testnet5_genesis_block();
+        let pow_limit = Target::from_compact(genesis.header.bits);
+        let mut btc = BtcParams::new(Network::Testnet4);
+        btc.allow_min_difficulty_blocks = false;
+        btc.max_attainable_target = pow_limit;
+        Self {
+            genesis_hash: genesis.block_hash(),
+            genesis_coinbase_txid: genesis.txdata[0].compute_txid().to_byte_array(),
+            pow_limit,
+            btc,
+            enforce_bip94: false,
+            enforce_bip54: true,
+            testnet5: true,
+            ..Self::testnet4()
         }
     }
 
@@ -218,6 +254,8 @@ impl ChainParams {
             bip34_hash: None,
             testdummy: None,
             enforce_bip94: false,
+            enforce_bip54: false,
+            testnet5: false,
         })
     }
 
@@ -233,6 +271,41 @@ impl ChainParams {
 
     pub fn no_pow_retargeting(&self) -> bool {
         self.btc.no_pow_retargeting
+    }
+
+    /// How far before its parent a difficulty period's first header may be:
+    /// Core `MAX_TIMEWARP_TESTNET4` with BIP94, `MAX_TIMEWARP_BIP54` with
+    /// BIP 54. `None` is no rule.
+    pub fn max_timewarp(&self) -> Option<u32> {
+        if self.enforce_bip94 {
+            Some(crate::header::MAX_TIMEWARP_BIP94)
+        } else if self.enforce_bip54 {
+            Some(crate::header::MAX_TIMEWARP_BIP54)
+        } else {
+            None
+        }
+    }
+
+    /// BIP 54: `height` is the last block of a difficulty period, whose
+    /// timestamp is not before the period's first block.
+    pub fn bip54_period_last(&self, height: u32) -> bool {
+        let interval = self.difficulty_adjustment_interval();
+        self.enforce_bip54 && interval > 1 && height % interval == interval - 1
+    }
+
+    /// Height of the difficulty period's first header that the header at
+    /// `height` is checked against: the period that just ended at a retarget
+    /// height, and with BIP 54 the current period at its last height. `None`
+    /// is a height that reads no such header.
+    pub fn period_first_height(&self, height: u32) -> Option<u32> {
+        let interval = self.difficulty_adjustment_interval();
+        if self.bip54_period_last(height) {
+            return Some(height + 1 - interval);
+        }
+        if interval == 0 || !height.is_multiple_of(interval) || self.no_pow_retargeting() {
+            return None;
+        }
+        height.checked_sub(interval)
     }
 
     pub fn allow_min_difficulty_blocks(&self) -> bool {
@@ -471,7 +544,7 @@ impl ChainParams {
         let ceiling = retarget_ceiling(timespan);
         let floor = retarget_floor(timespan);
         let start_bits = match self.regtest_pow_bits_overlay {
-            Some(bits) if Target::from_compact(bits) > ceiling => {
+            Some(bits) if Target::from_compact(bits) >= ceiling => {
                 return Err("regtest_pow_bits is easier than the regtest retarget ceiling");
             }
             Some(bits) if Target::from_compact(bits) < floor => {
@@ -499,9 +572,6 @@ impl ChainParams {
             .strip_prefix("0x")
             .or_else(|| spec.strip_prefix("0X"))
             .unwrap_or(spec);
-        if hex.is_empty() || hex.len() > 8 {
-            return Err("invalid compact bits (hex, up to 8 digits)");
-        }
         u32::from_str_radix(hex, 16).map_err(|_| "invalid compact bits (hex, up to 8 digits)")
     }
 
@@ -577,6 +647,7 @@ pub fn default_milestone_height(network: rbitcoin_primitives::Network) -> u32 {
         rbitcoin_primitives::Network::Testnet => 5_128_859,
         rbitcoin_primitives::Network::Signet
         | rbitcoin_primitives::Network::Testnet4
+        | rbitcoin_primitives::Network::Testnet5
         | rbitcoin_primitives::Network::Regtest => 0,
     }
 }
@@ -591,6 +662,7 @@ pub fn default_milestone_anchor(
         rbitcoin_primitives::Network::Testnet => TESTNET_MILESTONE_HASH,
         rbitcoin_primitives::Network::Signet
         | rbitcoin_primitives::Network::Testnet4
+        | rbitcoin_primitives::Network::Testnet5
         | rbitcoin_primitives::Network::Regtest => return None,
     };
     Some(crate::milestone::MilestoneAnchor {
@@ -611,7 +683,9 @@ pub fn default_min_chain_work_be(network: rbitcoin_primitives::Network) -> Optio
         rbitcoin_primitives::Network::Testnet4 => {
             Some(min_work_from_display_hex(TESTNET4_MIN_CHAIN_WORK))
         }
-        rbitcoin_primitives::Network::Signet | rbitcoin_primitives::Network::Regtest => None,
+        rbitcoin_primitives::Network::Signet
+        | rbitcoin_primitives::Network::Testnet5
+        | rbitcoin_primitives::Network::Regtest => None,
     }
 }
 
@@ -629,7 +703,24 @@ pub fn check_genesis_hash(params: &ChainParams, hash: BlockHash) -> bool {
 }
 
 pub fn genesis_block(params: &ChainParams) -> bitcoin::block::Block {
+    if params.testnet5 {
+        return testnet5_genesis_block();
+    }
     constants::genesis_block(params.network)
+}
+
+/// BIP 95 genesis block, mined at mainnet height 975,744.
+const TESTNET5_GENESIS_HEX: &str = "\
+    00c0302200000000000000000000000000000000000000000000000000000000000000008de2a6b556ecb5\
+    6779c34481ede767f09b2ae214f37ab1ad34085b5cb699588c91ebf76affff0f1a31913d65010100000001\
+    0000000000000000000000000000000000000000000000000000000000000000ffffffff5b04ffff001d01\
+    044c52323032362d31312d313420393735373434203030303030303030303030303030303030303031323365\
+    3236383165326638326163646362393433306131356565633234636338356234303036393164343739ffff\
+    ffff0100f2052a010000000a6a0895ebf76a0200000000000000";
+
+fn testnet5_genesis_block() -> bitcoin::block::Block {
+    bitcoin::consensus::encode::deserialize_hex(TESTNET5_GENESIS_HEX)
+        .expect("testnet5 genesis block hex")
 }
 
 /// Largest target `t` with `t * 4 * timespan` at most `2^256 - 1`: that
@@ -639,7 +730,7 @@ fn retarget_ceiling(timespan: u64) -> Target {
     let mut bytes = [0u8; 32];
     let mut rem = 0u128;
     for byte in &mut bytes {
-        rem = (rem << 8) | u128::from(u8::MAX);
+        rem = (rem << 8) + u128::from(u8::MAX);
         // rem < divisor * 256 here, so the quotient fits a byte.
         *byte = u8::try_from(rem / divisor).unwrap_or(u8::MAX);
         rem %= divisor;

@@ -63,6 +63,7 @@ release_parse_semver "$ver" || release_die "Cargo.toml workspace version is not 
 
 nix_ver="$(release_nix_package_version)"
 [[ "$nix_ver" == "$ver" ]] || release_die "nix/rbitcoin.nix version=$nix_ver != Cargo.toml $ver"
+release_check_lock_versions "$ver"
 
 grep -qE '^## \[Unreleased\]' "$ROOT/CHANGELOG.md" || \
   release_die "CHANGELOG.md has no ## [Unreleased] heading"

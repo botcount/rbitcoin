@@ -45,6 +45,30 @@ pub fn verify_tx_scripts_detached(
     verify_tx_scripts_detached_forks(prevouts, tx, true, true, true, true, true)
 }
 
+/// Mempool admit. Constant scriptCode and the legacy sighash byte cap.
+/// Block connect keeps [`ScriptVerifyFlags::consensus_at`].
+pub fn verify_tx_scripts_unconfirmed(
+    prevouts: Vec<bitcoin::TxOut>,
+    tx: bitcoin::Transaction,
+) -> Result<(), ConsensusError> {
+    script_pool::run_detached_join(move || {
+        verify_scripts_with_flags(prevouts, tx, crate::block::ScriptVerifyFlags::unconfirmed())
+    })
+    .unwrap_or(Err(ConsensusError::BadBlock("script worker disconnected")))
+}
+
+/// Await [`verify_tx_scripts_unconfirmed`] on the script pool.
+pub async fn verify_tx_scripts_unconfirmed_cpu(
+    prevouts: Vec<bitcoin::TxOut>,
+    tx: bitcoin::Transaction,
+) -> Result<(), ConsensusError> {
+    script_pool::run_cpu(move || {
+        verify_scripts_with_flags(prevouts, tx, crate::block::ScriptVerifyFlags::unconfirmed())
+    })
+    .await
+    .unwrap_or(Err(ConsensusError::BadBlock("script worker disconnected")))
+}
+
 fn verify_scripts_with_flags(
     prevouts: Vec<bitcoin::TxOut>,
     tx: bitcoin::Transaction,
@@ -80,25 +104,6 @@ pub fn verify_tx_scripts_detached_forks(
     .unwrap_or(Err(ConsensusError::BadBlock("script worker disconnected")))
 }
 
-/// Await [`verify_tx_scripts_detached`] on `rbtc-scripts-*` without a blocking thread.
-///
-/// The caller parks. Mempool admit uses this from the request task. Sync admit
-/// keeps [`verify_tx_scripts_detached`].
-pub async fn verify_tx_scripts_cpu(
-    prevouts: Vec<bitcoin::TxOut>,
-    tx: bitcoin::Transaction,
-) -> Result<(), ConsensusError> {
-    script_pool::run_cpu(move || {
-        verify_scripts_with_flags(
-            prevouts,
-            tx,
-            crate::block::ScriptVerifyFlags::buried(true, true, true, true, true),
-        )
-    })
-    .await
-    .unwrap_or(Err(ConsensusError::BadBlock("script worker disconnected")))
-}
-
 /// Same worker as [`verify_tx_scripts_detached`], with the caller's flag word.
 ///
 /// Block confirm and mempool admission keep [`ScriptVerifyFlags::consensus_at`]
@@ -116,15 +121,17 @@ pub fn verify_tx_scripts_with_flags(
 pub use block::validate_block_structure_hashed;
 pub use block::{
     bip34_height_script, bip68_active_for_tx, block_has_witness, block_mutated_without_coinbase,
-    block_subsidy, check_block_wire, is_final_tx, sequence_locks_satisfied, tx_sigop_cost,
-    validate_block_structure, witness_commitment_script, witness_commitment_vout_index, InputIndex,
-    ScriptVerifyFlags, ValidationContext, BIP16_EXCEPTION_MAINNET, MAX_BLOCK_TX_COUNT,
-    MAX_BLOCK_WEIGHT, MIN_TX_WEIGHT, TAPROOT_EXCEPTION_MAINNET,
+    block_subsidy, check_block_wire, is_final_tx, sequence_locks_satisfied, tx_has_relative_lock,
+    tx_sigop_cost, validate_block_structure, witness_commitment_script,
+    witness_commitment_vout_index, InputIndex, ScriptVerifyFlags, ValidationContext,
+    BIP16_EXCEPTION_MAINNET, MAX_BLOCK_TX_COUNT, MAX_BLOCK_WEIGHT, MIN_TX_WEIGHT,
+    SEQUENCE_LOCKTIME_DISABLE_FLAG, SEQUENCE_LOCKTIME_TYPE_FLAG, TAPROOT_EXCEPTION_MAINNET,
 };
 pub use clock::{with_now, NodeClock};
 pub use error::{block_reject_log_line, block_reject_reason, script_flag_paren, ConsensusError};
 pub use header::{
-    check_header, next_work_bits, validate_header_on_parent, ParentHeader, PeriodFirst,
+    check_header, next_work_bits, time_too_new, validate_header_on_parent, ParentHeader,
+    PeriodFirst, MAX_FUTURE_BLOCK_TIME,
 };
 pub use id_map::{IdMap, OutPointHasher, OutPointSet, TxidHasher, TxidMap, TxidSet};
 pub use milestone::{Milestone, MilestoneAnchor};

@@ -5,14 +5,7 @@ use rbitcoin_store::file::FILE_HEADER_LEN;
 use std::sync::atomic::Ordering;
 
 fn tmp_path() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "rbitcoin-array-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+    rbitcoin_store::testutil::fresh_path("array")
 }
 
 /// `get` samples `len` and the slot under one sequence counter. A `truncate`
@@ -710,5 +703,41 @@ fn sparse_set_after_truncate_is_corrupt() {
     assert_eq!(t.get(5).unwrap(), 0);
     assert_eq!(t.get(6).unwrap(), 60);
     assert_eq!(t.get(0).unwrap(), 1);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Open copies each flushed 8-byte slot into the in-RAM image.
+/// A body that is not a multiple of 8 stays corrupt.
+#[test]
+fn array_open_reads_flushed_slots() {
+    let path = tmp_path();
+    let _ = std::fs::remove_file(&path);
+    {
+        let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
+        t.set_many(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            &[(0, 0x1111), (1, 0x2222_3333_4444_5555)],
+        )
+        .unwrap();
+        t.flush().unwrap();
+    }
+    let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
+    assert_eq!(t.len(), 2);
+    assert_eq!(t.get(0).unwrap(), 0x1111);
+    assert_eq!(t.get(1).unwrap(), 0x2222_3333_4444_5555);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn array_open_rejects_a_ragged_body() {
+    let path = tmp_path();
+    let _ = std::fs::remove_file(&path);
+    let f = rbitcoin_store::file::TableFile::create(&path, TableKind::Confirmed).unwrap();
+    f.set_logical_len(FILE_HEADER_LEN as u64 + 1).unwrap();
+    drop(f);
+    assert!(matches!(
+        ArrayTable::open(&path, TableKind::Confirmed),
+        Err(StoreError::Corrupt("array table size"))
+    ));
     let _ = std::fs::remove_file(&path);
 }

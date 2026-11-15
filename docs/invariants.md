@@ -50,7 +50,7 @@ wire / body-queue
   → structural spentness (pin abs bulk pread of spent.body; multi-list protocol cold only)
   → Class C tip
   → index append (filter and tweak bytes from the scripts stage; no store read)
-  → abs spend annotate (put_spend_batch_by_abs_meta on spent.body only)
+  → abs spend annotate (every published slot, including the short tail, into the page log)
 ```
 
 Startup, before this pipeline, may `read_index_window` to seal a filter or tweak
@@ -93,7 +93,7 @@ clears the shared slot. A `PinOuts` taken while the slot was full keeps its own
 | Pin create identity | Pin must carry non-zero create txid from **lookup stamp** (plan reverse map / wire prev_txid / `txid.body`) | Soft zero-identity pin → assemble mismatch → cold recovery is **forbidden** |
 | Tip already-archived | `plan=None`: lookup still stamps parent pin material; load `txout` by range | Soft spentness recovery for zero pin identity is **not** OK |
 | Tip-ahead cascade | `fk mismatch` / `connect height not tip+1` after tip+1 fail | **Soft requeue** (not permanent blacklist) |
-| Spend annotate | Structural emits abs+meta jobs; `post_commit` `put_spend_batch_by_abs_meta` only (no pin `get_spender_abs`). Class A commit does not annotate. Cold OOB/IO is hard Err. Annotate RMW is **`spent.body` only** (no `RWF_DONTCACHE`) | No ranged/by_create annotate tiers; no second spend walk; **no** `txout.body` annotate; **no** Class A `put_spend_batch` |
+| Spend annotate | Structural emits abs+meta jobs; `post_commit` `put_spend_batch_by_abs_meta` only (no pin `get_spender_abs`). Class A commit does not annotate. A block whose body this wave did not append (reorg reconnect, `reconsiderblock`, an all-archived retry) also emits its same-block spends: write reads those parents' `create.loc` spent ranges and slot meta in one batch each, as open replay does, because only the append pre-fills them. Cold OOB/IO is hard Err. Every published slot is a directory insert, not a `spent.body` write, and does not set `POSIX_FADV_RANDOM` (no `RWF_DONTCACHE`) | No ranged/by_create annotate tiers. The only extra read is the same-block spends of a block this wave did not append (one spent-range batch and one slot-meta batch). **no** `txout.body` annotate; **no** Class A `put_spend_batch` |
 | Tip scripts | Optional `ScriptPreverified` (mempool) | IBD empty set |
 | Reorg | Disconnect outside confirm; connect tip+1 with normal pipeline | — |
 

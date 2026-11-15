@@ -36,3 +36,20 @@ fn force_rebuild_resets_seal_and_clears_runs() {
     assert_eq!(store.scripthash.include_hwm(), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn load_seal_reads_eight_and_ignores_short() {
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("rbitcoin-seal-width-{n}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(load_seal(&dir), 0);
+    store_seal(&dir, 64).unwrap();
+    assert_eq!(load_seal(&dir), 64);
+    std::fs::write(seal_path(&dir), [1u8, 2, 3]).unwrap();
+    assert_eq!(load_seal(&dir), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

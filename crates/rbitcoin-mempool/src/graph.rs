@@ -1225,7 +1225,7 @@ impl TxGraph {
         let mut pending: BTreeMap<Txid, (TxEntry, std::sync::Arc<Transaction>)> =
             items.into_iter().map(|(e, tx)| (e.txid, (e, tx))).collect();
         let all: HashSet<Txid> = pending.keys().copied().collect();
-        while !pending.is_empty() {
+        while let Some(forced) = pending.keys().next().copied() {
             let ready: Vec<Txid> = pending
                 .iter()
                 .filter(|(_, (_, tx))| {
@@ -1238,7 +1238,7 @@ impl TxGraph {
                 .collect();
             let batch = if ready.is_empty() {
                 // Cycle — force one.
-                vec![*pending.keys().next().unwrap()]
+                vec![forced]
             } else {
                 ready
             };

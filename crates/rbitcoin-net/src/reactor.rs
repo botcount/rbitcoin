@@ -6,12 +6,14 @@
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::thread;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 tokio::task_local! {
     static API_STORE_BUDGET: Arc<Semaphore>;
+    static STORE_BUDGET_WAITERS: Arc<AtomicUsize>;
 }
 
 thread_local! {
@@ -61,14 +63,6 @@ fn reject_off_pool_reentry() {
     }
 }
 
-struct LeaveOffPool;
-
-impl Drop for LeaveOffPool {
-    fn drop(&mut self) {
-        ON_OFF_POOL.with(|c| c.set(false));
-    }
-}
-
 fn off_pool_tx() -> mpsc::Sender<Box<dyn FnOnce() + Send>> {
     static TX: OnceLock<mpsc::Sender<Box<dyn FnOnce() + Send>>> = OnceLock::new();
     TX.get_or_init(|| {
@@ -97,8 +91,9 @@ pub async fn off_pool<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static)
     reject_off_pool_reentry();
     let (tx, rx) = tokio::sync::oneshot::channel();
     let job = Box::new(move || {
+        // The flag lives on this thread. The next job sets it again, and
+        // nothing here reads it between jobs.
         ON_OFF_POOL.with(|c| c.set(true));
-        let _leave = LeaveOffPool;
         let result = catch_unwind(AssertUnwindSafe(f));
         let _ = tx.send(result);
     });
@@ -115,6 +110,49 @@ pub async fn off_pool<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static)
 /// and admits that are not an API read).
 pub async fn with_store_budget<R>(budget: Arc<Semaphore>, fut: impl Future<Output = R>) -> R {
     API_STORE_BUDGET.scope(budget, fut).await
+}
+
+/// Same task as [`with_store_budget`]. [`acquire_armed_store_budget`] counts a
+/// caller that found the budget empty.
+pub async fn with_store_budget_waiters<R>(
+    waiters: Arc<AtomicUsize>,
+    fut: impl Future<Output = R>,
+) -> R {
+    STORE_BUDGET_WAITERS.scope(waiters, fut).await
+}
+
+struct StoreBudgetWait(Arc<AtomicUsize>);
+
+impl StoreBudgetWait {
+    fn enter(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for StoreBudgetWait {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Whether `e` carries a [`tokio::task::JoinError`]: a task this side spawned
+/// panicked or was cancelled. Socket errors a client can cause are not.
+pub fn is_join_error(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<tokio::task::JoinError>())
+}
+
+/// The child's `Ok` value. A panicked child resumes that payload. Cancel
+/// still aborts the caller.
+pub fn finish_join<T>(joined: Result<T, tokio::task::JoinError>, cancel: &'static str) -> T {
+    match joined {
+        Ok(value) => value,
+        Err(err) => match err.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(err) => panic!("{cancel}: {err}"),
+        },
+    }
 }
 
 /// `tokio::spawn` does not keep the task-local budget. Copy it into the
@@ -139,7 +177,16 @@ pub async fn acquire_armed_store_budget() -> Option<OwnedSemaphorePermit> {
     let Ok(sem) = API_STORE_BUDGET.try_with(Arc::clone) else {
         return None;
     };
-    Some(sem.acquire_owned().await.expect("store budget"))
+    match Arc::clone(&sem).try_acquire_owned() {
+        Ok(permit) => Some(permit),
+        Err(_) => {
+            let _waiting = STORE_BUDGET_WAITERS
+                .try_with(Arc::clone)
+                .ok()
+                .map(StoreBudgetWait::enter);
+            Some(sem.acquire_owned().await.expect("store budget"))
+        }
+    }
 }
 
 /// Park `permit` on this thread. [`release_store_permit`] drops it before
@@ -210,6 +257,32 @@ mod off_pool_reentry {
     }
 }
 
+#[cfg(test)]
+mod store_permit_drop {
+    use super::{acquire_armed_store_budget, hold_store_permit, with_store_budget};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+
+    #[tokio::test]
+    async fn dropping_the_guard_returns_the_permit() {
+        let sem = Arc::new(Semaphore::new(1));
+        with_store_budget(sem, async {
+            let first = acquire_armed_store_budget().await;
+            let guard = hold_store_permit(first);
+            drop(guard);
+            let again =
+                tokio::time::timeout(Duration::from_millis(200), acquire_armed_store_budget())
+                    .await;
+            assert!(
+                again.is_ok(),
+                "the dropped guard must release the store permit"
+            );
+        })
+        .await;
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod off_pool_lane {
     use super::off_pool;
@@ -234,6 +307,26 @@ mod off_pool_lane {
     /// Eight callers blocked inside `off_pool` still share one OS thread.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_thread_runs_every_off_pool_job() {
+        off_pool(|| ()).await;
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let extra = std::thread::Builder::new()
+            .name("rbtc-off-pool".into())
+            .spawn(move || {
+                let _ = stop_rx.recv();
+            })
+            .expect("extra off-pool thread");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut named = off_pool_threads();
+        while named < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "named rbtc-off-pool threads stayed at {named}"
+            );
+            tokio::task::yield_now().await;
+            named = off_pool_threads();
+        }
+        drop(stop_tx);
+        extra.join().expect("extra off-pool thread");
         let started = Arc::new(AtomicUsize::new(0));
         let arrived = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new((Mutex::new(false), Condvar::new()));

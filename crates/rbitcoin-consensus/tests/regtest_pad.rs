@@ -72,6 +72,11 @@ fn regtest_grind_past_one_nonce_span_is_an_error() {
     assert!(regtest_mine_fits_one_nonce_span(easy));
     assert!(regtest_mine_fits_one_nonce_span(changelog));
     assert!(!regtest_mine_fits_one_nonce_span(signet_retarget));
+    // Exponent three below the regtest limit, mantissa 0x010000. The limit
+    // mantissa is the low 23 bits; widening that mask with `|` misses this.
+    assert!(regtest_mine_fits_one_nonce_span(
+        CompactTarget::from_consensus(0x1d01_0000)
+    ));
     assert!(Target::from_compact(signet_retarget) <= ChainParams::signet().pow_limit);
 
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
@@ -100,6 +105,21 @@ fn regtest_grind_past_one_nonce_span_is_an_error() {
         .header
         .validate_pow(Target::from_compact(easy))
         .is_ok());
+}
+
+#[test]
+fn tip_accept_thread_is_the_named_lane() {
+    assert!(!on_tip_accept_thread());
+    let named = std::thread::Builder::new()
+        .name("tip-accept".into())
+        .spawn(on_tip_accept_thread)
+        .unwrap();
+    assert!(named.join().unwrap());
+    let other = std::thread::Builder::new()
+        .name("other".into())
+        .spawn(on_tip_accept_thread)
+        .unwrap();
+    assert!(!other.join().unwrap());
 }
 
 #[test]

@@ -6,8 +6,6 @@ use rbitcoin_primitives::Network;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 /// [`NodeEnv::from_lookup`] over literal pairs, matched exactly. The last pair
 /// for a name wins.
 fn env_of(vars: &[(&str, &str)]) -> Result<NodeEnv, rbitcoin_node::NodeError> {
@@ -20,11 +18,7 @@ fn env_of(vars: &[(&str, &str)]) -> Result<NodeEnv, rbitcoin_node::NodeError> {
 }
 
 fn tmp_datadir() -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("rbitcoin-cli-{n}"))
+    rbitcoin_store::testutil::fresh_path("node-cli")
 }
 
 /// `ExitCode` is not `PartialEq`; compare via `Debug` (stable, sufficient for tests).
@@ -103,7 +97,10 @@ fn operator_conf_and_argv() {
         "--sp-tweaks",
         "--sp-tweaks-dust",
         "--esplora-block-template",
+        "--electrum-onion",
         "--esplora-onion",
+        "--electrum-i2p",
+        "--esplora-i2p",
         "--sv2-tp-listen",
         "--sv2-tp-authority-sec",
         "--sv2-tp-authority-sec-file",
@@ -124,6 +121,7 @@ fn operator_conf_and_argv() {
         "--proxy-randomize",
         "--no-listen",
         "--no-discover",
+        "--discover-from-peers",
         "--listen-onion",
         "--cjdns-reachable",
         "--tor-control",
@@ -171,7 +169,7 @@ fn operator_conf_and_argv() {
     ] {
         assert!(!h.contains(concat), "help must not advertise {concat}");
     }
-    assert!(h.contains("Networks: mainnet|testnet|testnet4|signet|regtest."));
+    assert!(h.contains("Networks: mainnet|testnet|testnet4|testnet5|signet|regtest."));
     assert!(h.contains("[--signet-block-time SECS]"));
     assert!(matches!(
         operator_config_from_args(["rbitcoin-node", "-V"], &NodeEnv::default()),
@@ -260,6 +258,7 @@ fn operator_conf_and_argv() {
         ("signet", Network::Signet),
         ("testnet", Network::Testnet),
         ("testnet4", Network::Testnet4),
+        ("testnet5", Network::Testnet5),
     ] {
         let conf = dir.join(format!("{bare}.conf"));
         std::fs::write(&conf, format!("{bare}\n; also a comment\n\nno_seeds=1\n")).unwrap();
@@ -340,6 +339,15 @@ fn operator_conf_and_argv() {
         rbitcoin_consensus::default_min_chain_work_be(Network::Testnet4)
     );
     assert!(testnet4.minimum_chain_work.is_some());
+    let testnet5 = ready_config(["rbitcoin-node", "--network=testnet5"]);
+    assert_eq!(testnet5.network, Network::Testnet5);
+    assert_eq!(testnet5.milestone_height, 0);
+    assert!(testnet5.milestone().anchor.is_none());
+    assert!(testnet5.minimum_chain_work.is_none());
+    assert_eq!(
+        testnet5.chain_params().unwrap().genesis_hash,
+        rbitcoin_consensus::ChainParams::testnet5().genesis_hash
+    );
     let signet_skip = ready_config([
         "rbitcoin-node",
         "--network=signet",
@@ -489,16 +497,14 @@ fn operator_conf_and_argv() {
     over.mempool.block_reserved_sigops = Some(80_000);
     over.validate().expect("consensus maximum is accepted");
 
-    let tweaks = ready_config(["rbitcoin-node", "--sp-tweaks", "--prune-seqsigwit"]);
-    let err = tweaks.validate().unwrap_err().to_string();
-    assert!(
-        err.contains("--sp-tweaks") && err.contains("--prune-seqsigwit"),
-        "{err}"
-    );
+    ready_config(["rbitcoin-node", "--sp-tweaks", "--prune-seqsigwit"])
+        .validate()
+        .expect("prune and tweaks validate together");
     let mut conf = NodeConfig::default();
     conf.apply_kv("prune_seqsigwit", "1").unwrap();
     conf.apply_kv("sp_tweaks", "1").unwrap();
-    assert!(conf.validate().is_err());
+    conf.validate()
+        .expect("conf prune_seqsigwit with sp_tweaks validates");
 
     // Electrum and Esplora do not require the scripthash index. The index
     // may also stand alone, or run with either listener.
@@ -617,6 +623,33 @@ fn sv2_tp_idle_timeout_argv_default_off() {
 }
 
 #[test]
+fn electrum_max_sp_subs_cli_conf_and_bounds() {
+    assert_eq!(
+        ready_config(["rbitcoin-node"]).electrum_max_sp_subs,
+        rbitcoin_electrum::DEFAULT_MAX_SP_SUBS
+    );
+    assert_eq!(
+        ready_config(["rbitcoin-node", "--electrum-max-sp-subs", "100"]).electrum_max_sp_subs,
+        100
+    );
+    assert_eq!(
+        ready_config(["rbitcoin-node", "--electrum-max-sp-subs=2"]).electrum_max_sp_subs,
+        2
+    );
+    let mut c = NodeConfig::default();
+    c.apply_kv("electrum_max_sp_subs", "40").unwrap();
+    assert_eq!(c.electrum_max_sp_subs, 40);
+    let zero = c.apply_kv("electrum_max_sp_subs", "0").unwrap_err();
+    assert!(format!("{zero}").contains(">= 1"), "{zero}");
+    let bad = c.apply_kv("electrum_max_sp_subs", "nope").unwrap_err();
+    assert!(format!("{bad}").contains("electrum_max_sp_subs"), "{bad}");
+    assert_eq!(
+        c.electrum_max_sp_subs, 40,
+        "a refused value changes nothing"
+    );
+}
+
+#[test]
 fn electrum_max_subs_cli_conf_and_bounds() {
     assert_eq!(
         ready_config(["rbitcoin-node"]).electrum_max_subs,
@@ -666,9 +699,107 @@ fn max_sh_creates_and_esplora_block_template_cli_hyphens() {
     assert!(gbt_eq.esplora_block_template);
     let off = ready_config(["rbitcoin-node", "--esplora-block-template=0"]);
     assert!(!off.esplora_block_template);
-    assert!(NodeConfig::default().esplora_onion);
-    let onion_off = ready_config(["rbitcoin-node", "--esplora-onion=0"]);
-    assert!(!onion_off.esplora_onion);
+    let d = NodeConfig::default();
+    assert!(!d.electrum_onion && !d.esplora_onion && !d.electrum_i2p && !d.esplora_i2p);
+    let tor = [
+        "rbitcoin-node",
+        "--tor-control",
+        "--electrum-listen",
+        "--esplora-listen",
+    ];
+    let on = ready_config(tor.into_iter().chain(["--electrum-onion"]));
+    assert!(on.electrum_onion && !on.esplora_onion && !on.electrum_i2p && !on.esplora_i2p);
+    let on = ready_config(tor.into_iter().chain(["--esplora-onion=1"]));
+    assert!(on.esplora_onion && !on.electrum_onion && !on.electrum_i2p && !on.esplora_i2p);
+    let sam = [
+        "rbitcoin-node",
+        "--i2p-sam",
+        "--electrum-listen",
+        "--esplora-listen",
+    ];
+    let on = ready_config(sam.into_iter().chain(["--electrum-i2p"]));
+    assert!(on.electrum_i2p && !on.esplora_i2p && !on.electrum_onion && !on.esplora_onion);
+    let on = ready_config(sam.into_iter().chain(["--esplora-i2p", "--electrum-i2p=0"]));
+    assert!(on.esplora_i2p && !on.electrum_i2p && !on.electrum_onion && !on.esplora_onion);
+}
+
+/// Each wallet overlay switch needs its overlay, its listener, and a TCP
+/// bind that `127.0.0.1:<port>` reaches, since Tor and SAM forward there.
+#[test]
+fn wallet_overlay_switches_refuse_what_they_cannot_publish() {
+    for (flag, key, listen, listen_key, overlay, overlay_key) in [
+        (
+            "electrum-onion",
+            "electrum_onion",
+            "--electrum-listen",
+            "electrum_listen",
+            "--tor-control",
+            "tor_control",
+        ),
+        (
+            "esplora-onion",
+            "esplora_onion",
+            "--esplora-listen",
+            "esplora_listen",
+            "--tor-control",
+            "tor_control",
+        ),
+        (
+            "electrum-i2p",
+            "electrum_i2p",
+            "--electrum-listen",
+            "electrum_listen",
+            "--i2p-sam",
+            "i2p_sam",
+        ),
+        (
+            "esplora-i2p",
+            "esplora_i2p",
+            "--esplora-listen",
+            "esplora_listen",
+            "--i2p-sam",
+            "i2p_sam",
+        ),
+    ] {
+        let mut c = NodeConfig::default();
+        c.validate().unwrap();
+        c.apply_kv(key, "1").unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains(&format!("{flag} requires {overlay}")), "{err}");
+        c.apply_kv(overlay_key, "").unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains(&format!("{flag} requires {listen}")), "{err}");
+        for unreached in [
+            "10.0.0.5:50001",
+            "127.0.0.2:50001",
+            "[::1]:50001",
+            "[::]:50001",
+        ] {
+            c.apply_kv(listen_key, unreached).unwrap();
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains("not reachable"), "{flag} {unreached}: {err}");
+        }
+        c.apply_kv(listen_key, "0.0.0.0:50001").unwrap();
+        c.validate().unwrap();
+        c.apply_kv(listen_key, "").unwrap();
+        c.validate().unwrap();
+        // Off again, any bind is fine: the switch is the only thing refused.
+        c.apply_kv(listen_key, "10.0.0.5:50001").unwrap();
+        c.apply_kv(key, "0").unwrap();
+        c.validate().unwrap();
+    }
+    #[cfg(unix)]
+    for key in ["esplora_onion", "esplora_i2p"] {
+        let mut c = NodeConfig::default();
+        c.apply_kv("tor_control", "").unwrap();
+        c.apply_kv("i2p_sam", "").unwrap();
+        c.apply_kv("esplora_listen", "/run/rbitcoin/esplora.sock")
+            .unwrap();
+        c.validate().unwrap();
+        c.apply_kv(key, "1").unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("unix socket"), "{key}: {err}");
+    }
 }
 
 include!("overlay_config_journey.rs");
@@ -716,6 +847,348 @@ fn testnet3_default_milestone_is_anchored() {
         explicit.milestone(),
         rbitcoin_consensus::Milestone::height(10)
     );
+}
+
+/// An empty datadir has not reached taproot, so both flags smoke.
+#[test]
+fn smoke_allows_sp_tweaks_with_prune_before_taproot() {
+    let dir = tmp_datadir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let code = cli_main(
+        [
+            "rbitcoin-node",
+            "--smoke",
+            "--network",
+            "regtest",
+            "--datadir",
+            dir.to_str().unwrap(),
+            "--log-level",
+            "error",
+            "--no-seeds",
+            "--sp-tweaks",
+            "--prune-seqsigwit",
+        ],
+        NodeEnv::default(),
+    );
+    assert_exit(code, ExitCode::SUCCESS);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regtest taproot is genesis. Nothing has been dropped yet, so startup
+/// still turns the index on. A watermark that does not cover a dropped
+/// height is refused.
+#[test]
+fn pruned_datadir_at_taproot_allows_tweaks_until_a_height_is_dropped() {
+    let _gate = rbitcoin_consensus::script_pool::steal_test_gate();
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("node-late-tweaks");
+    q.set_prune_seqsigwit(true).unwrap();
+    let params = rbitcoin_consensus::ChainParams::regtest();
+    let genesis = rbitcoin_consensus::genesis_block(&params);
+    rbitcoin_query::accept_and_connect_block(
+        &q,
+        &params,
+        rbitcoin_primitives::Height(0),
+        &genesis,
+        rbitcoin_consensus::Milestone::height(u32::MAX),
+    )
+    .unwrap();
+    assert_eq!(q.pruneheight(), None);
+    let cfg = ready_config([
+        "rbitcoin-node",
+        "--network",
+        "regtest",
+        "--sp-tweaks",
+        "--prune-seqsigwit",
+    ]);
+    rbitcoin_node::run::apply_startup_index_mode(&q, &cfg, params.taproot_height()).unwrap();
+    assert!(q.sptweaks_enabled());
+    drop(q);
+    let _ = std::fs::remove_dir_all(dir.path());
+
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("node-late-tweaks-dropped");
+    q.set_prune_seqsigwit(true).unwrap();
+    rbitcoin_query::accept_and_connect_block(
+        &q,
+        &params,
+        rbitcoin_primitives::Height(0),
+        &genesis,
+        rbitcoin_consensus::Milestone::height(u32::MAX),
+    )
+    .unwrap();
+    q.set_pruneheight(Some(rbitcoin_primitives::Height(0)))
+        .unwrap();
+    let err = rbitcoin_node::run::apply_startup_index_mode(&q, &cfg, params.taproot_height())
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("prune-seqsigwit"), "{msg}");
+    assert!(msg.contains("taproot"), "{msg}");
+    drop(q);
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+/// Regtest is already at taproot at genesis, and nothing is dropped on a
+/// one-block chain. Both flags start, and the genesis witness stays in the
+/// keep window.
+#[test]
+fn both_flags_on_a_short_unpruned_chain_start() {
+    let _gate = rbitcoin_consensus::script_pool::steal_test_gate();
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("node-late-both");
+    let params = rbitcoin_consensus::ChainParams::regtest();
+    let genesis = rbitcoin_consensus::genesis_block(&params);
+    rbitcoin_query::accept_and_connect_block(
+        &q,
+        &params,
+        rbitcoin_primitives::Height(0),
+        &genesis,
+        rbitcoin_consensus::Milestone::height(u32::MAX),
+    )
+    .unwrap();
+    let cfg = ready_config([
+        "rbitcoin-node",
+        "--network",
+        "regtest",
+        "--sp-tweaks",
+        "--prune-seqsigwit",
+    ]);
+    rbitcoin_node::run::apply_startup_index_mode(&q, &cfg, params.taproot_height()).unwrap();
+    assert!(q.prune_seqsigwit());
+    assert!(q.sptweaks_enabled());
+    assert_eq!(q.pruneheight(), None);
+    assert!(q.store().path().join("seqsigwit.window/0.bin").is_file());
+    drop(q);
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+/// A fresh process loads the tweak flag as off. Files on disk are still the
+/// index. Nothing has been dropped on a one-block chain, so prune starts and
+/// the genesis witness stays in the keep window.
+#[test]
+fn adding_prune_beside_existing_tweaks_on_a_short_chain_starts() {
+    let _gate = rbitcoin_consensus::script_pool::steal_test_gate();
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("node-tweaks-then-prune");
+    let params = rbitcoin_consensus::ChainParams::regtest();
+    let genesis = rbitcoin_consensus::genesis_block(&params);
+    rbitcoin_query::accept_and_connect_block(
+        &q,
+        &params,
+        rbitcoin_primitives::Height(0),
+        &genesis,
+        rbitcoin_consensus::Milestone::height(u32::MAX),
+    )
+    .unwrap();
+    q.set_sptweaks_enabled(true, rbitcoin_primitives::Height(0))
+        .unwrap();
+    let before = q.store().txs.seqsigwit.body_logical_len();
+    let path = dir.path().to_path_buf();
+    drop(q);
+    let q = rbitcoin_query::Query::open_or_create_tiny(&path).unwrap();
+    assert!(!q.sptweaks_enabled());
+    let cfg = ready_config([
+        "rbitcoin-node",
+        "--network",
+        "regtest",
+        "--sp-tweaks",
+        "--prune-seqsigwit",
+    ]);
+    rbitcoin_node::run::apply_startup_index_mode(&q, &cfg, params.taproot_height()).unwrap();
+    assert!(q.prune_seqsigwit());
+    assert!(q.sptweaks_enabled());
+    assert!(path.join("seqsigwit.window/0.bin").is_file());
+    assert!(q.store().txs.seqsigwit.body_logical_len() < before);
+    drop(q);
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+/// Prune is on, tweak files exist, and this start left `--sp-tweaks` off.
+/// Startup says how many blocks remain before that index cannot be enabled.
+#[test]
+fn prune_without_sp_tweaks_warns_how_many_blocks_remain() {
+    let _gate = rbitcoin_consensus::script_pool::steal_test_gate();
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("node-omit-tweaks");
+    let params = rbitcoin_consensus::ChainParams::regtest();
+    let genesis = rbitcoin_consensus::genesis_block(&params);
+    rbitcoin_query::accept_and_connect_block(
+        &q,
+        &params,
+        rbitcoin_primitives::Height(0),
+        &genesis,
+        rbitcoin_consensus::Milestone::height(u32::MAX),
+    )
+    .unwrap();
+    q.set_sptweaks_enabled(true, rbitcoin_primitives::Height(0))
+        .unwrap();
+    let path = dir.path().to_path_buf();
+    drop(q);
+    let q = rbitcoin_query::Query::open_or_create_tiny(&path).unwrap();
+    let cfg = ready_config(["rbitcoin-node", "--network", "regtest", "--prune-seqsigwit"]);
+    rbitcoin_log::capture_logs(true);
+    rbitcoin_node::run::apply_startup_index_mode(&q, &cfg, params.taproot_height()).unwrap();
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    assert!(!q.sptweaks_enabled());
+    assert!(q.prune_seqsigwit());
+    let joined = lines
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("287 more blocks"),
+        "startup should say how many blocks remain:\n{joined}"
+    );
+    drop(q);
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+/// The tip flush can land before the tweak rows. Those spills are still
+/// on disk while the prune height lags. Startup has to seal the gap
+/// before it advances that height, or the witnesses are deleted and the
+/// index can never be built.
+#[test]
+fn restart_seals_a_pruned_tweak_gap_before_the_prune_height_advances() {
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::testutil::FixtureChain;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("node-tweak-gap");
+    q.enter_direct_index_mode_sh(false).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    let mut prev = Fk::NULL;
+    let mut parent_hash: Option<[u8; 32]> = None;
+    for h in 0..290u32 {
+        let version = 1i32;
+        let timestamp = h + 1;
+        let bits = 0x207fffff;
+        let nonce = h;
+        let mut merkle = [0u8; 32];
+        merkle[0..4].copy_from_slice(&h.to_le_bytes());
+        merkle[4] = 0xab;
+        let hash = match parent_hash {
+            None => merkle,
+            Some(ph) => {
+                rbitcoin_store::block_header_hash(version, &ph, &merkle, timestamp, bits, nonce)
+            }
+        };
+        let mut header = HeaderRecord {
+            prev_fk: prev,
+            version,
+            timestamp,
+            bits,
+            nonce,
+            merkle_root: merkle,
+            hash,
+            size: 0,
+            weight: 0,
+        };
+        if h > 0 {
+            header.merkle_root = {
+                let mut txid = [0u8; 32];
+                txid[0..4].copy_from_slice(&h.to_le_bytes());
+                txid[31] = 0xcb;
+                txid
+            };
+            let ph = parent_hash.expect("parent");
+            header.hash = rbitcoin_store::block_header_hash(
+                version,
+                &ph,
+                &header.merkle_root,
+                timestamp,
+                bits,
+                nonce,
+            );
+        }
+        let mut txid = [0u8; 32];
+        txid[0..4].copy_from_slice(&h.to_le_bytes());
+        txid[31] = 0xcb;
+        let ta = rbitcoin_query::TxApply {
+            tx: TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_count: 1,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                parent: rbitcoin_store::InputParent::Coinbase,
+                sequence: u32::MAX,
+                script_sig: vec![h as u8],
+                witness: vec![vec![0x11]],
+            }],
+            outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+        };
+        parent_hash = Some(header.hash);
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        if h == 0 {
+            q.set_sptweaks_enabled(true, Height(0)).unwrap();
+            q.put_sp_tweaks_block(Height(0), prev, &[None]).unwrap();
+            q.set_sptweaks_enabled(false, Height(0)).unwrap();
+        }
+    }
+    q.join_tip_flush().unwrap();
+    assert_eq!(q.tip_height(), Some(Height(289)));
+    assert!(
+        q.pruneheight().is_none_or(|ph| ph.0 < 1),
+        "prune height must still lag the tip, got {:?}",
+        q.pruneheight()
+    );
+    assert!(
+        dir.path().join("seqsigwit.window/1.bin").is_file(),
+        "the height startup would drop is still on disk"
+    );
+    q.store().sync_spend_durable(289).unwrap();
+    let path = dir.path().to_path_buf();
+    drop(q);
+    let q = rbitcoin_query::Query::open_or_create_tiny(&path).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(289)));
+    let cfg = ready_config([
+        "rbitcoin-node",
+        "--network",
+        "regtest",
+        "--sp-tweaks",
+        "--prune-seqsigwit",
+    ]);
+    rbitcoin_node::run::apply_startup_index_mode(&q, &cfg, 0).unwrap();
+    let next = q.sptweaks_next_height().unwrap().0;
+    let ph = q.pruneheight().expect("tip 289 drops height 1").0;
+    assert!(next > ph, "next {next} prune {ph}");
+    assert!(
+        next > 289,
+        "the gap through the tip was sealed, next {next}"
+    );
+    drop(q);
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+/// A damaged tweak table used to stop an unpruned node. Startup logs the
+/// failure and keeps running. A prune refusal is still fatal.
+#[test]
+fn unpruned_tweak_enable_failure_logs_and_starts() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("node-bad-tweaks");
+    q.set_sptweaks_enabled(true, rbitcoin_primitives::Height(0))
+        .unwrap();
+    let path = dir.path().to_path_buf();
+    drop(q);
+    let meta = path.join("sp_tweaks.idx").join("meta");
+    std::fs::write(&meta, [0u8; 4]).unwrap();
+    let q = rbitcoin_query::Query::open_or_create_tiny(&path).unwrap();
+    let cfg = ready_config(["rbitcoin-node", "--network", "regtest", "--sp-tweaks"]);
+    rbitcoin_log::capture_logs(true);
+    rbitcoin_node::run::apply_startup_index_mode(&q, &cfg, 0).unwrap();
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    assert!(!q.sptweaks_enabled());
+    let joined = lines
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("sp_tweaks: enable failed"),
+        "startup should keep running:\n{joined}"
+    );
+    drop(q);
+    let _ = std::fs::remove_dir_all(&path);
 }
 
 /// RPC binds only after catch-up, so a bad `--rpc-cookie-file` must fail
@@ -1320,4 +1793,52 @@ fn regtest_retarget_from_argv_and_conf() {
     )
     .is_err());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Help and version are requested output: stdout, exit 0, nothing on stderr.
+#[test]
+fn help_and_version_print_to_stdout() {
+    for (flag, want) in [
+        ("--help", "usage:"),
+        ("-h", "usage:"),
+        ("--version", env!("CARGO_PKG_VERSION")),
+        ("-V", env!("CARGO_PKG_VERSION")),
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_rbitcoin-node"))
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{flag} must exit 0");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(stdout.contains(want), "{flag} stdout: {stdout:?}");
+        assert!(out.stderr.is_empty(), "{flag} wrote to stderr");
+    }
+}
+
+#[test]
+fn help_names_ibd_download_defaults() {
+    let h = operator_usage();
+    let want = format!(
+        "up to {} concurrent getdata, max {} in transit per peer",
+        rbitcoin_ibd::DEFAULT_IBD_WINDOW,
+        rbitcoin_ibd::DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER,
+    );
+    assert!(h.contains(&want), "help must say {want:?}");
+}
+
+/// A reader that already closed stdout is not an error: exit 0, no panic.
+#[test]
+fn help_and_version_to_a_closed_stdout_exit_zero() {
+    for args in [&["--help"][..], &["-h"], &["--version"], &["-V"]] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_rbitcoin-node"))
+            .args(args)
+            .stdout(writer)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{args:?}: {:?} {stderr}", out.status);
+        assert!(!stderr.contains("panicked"), "{args:?}: {stderr}");
+    }
 }

@@ -5,7 +5,7 @@
 
 use crate::error::StoreError;
 use crate::file::write_synced_tmp_rename;
-use rbitcoin_primitives::{schema_file_openable, SCHEMA_VERSION, STORE_MAGIC};
+use rbitcoin_primitives::{le_u16, le_u32, schema_file_openable, SCHEMA_VERSION, STORE_MAGIC};
 use std::path::Path;
 
 /// `store/spend_durable`. Annotated-through and durable-through heights.
@@ -42,19 +42,19 @@ impl SpendDurable {
             return Ok(None);
         }
         let buf = std::fs::read(&path).map_err(|e| StoreError::io(&path, e))?;
-        if buf.len() != 16 {
+        let Ok(raw) = <[u8; 16]>::try_from(buf.as_slice()) else {
             return Err(StoreError::Corrupt("spend_durable short"));
-        }
-        if buf[0..4] != STORE_MAGIC {
+        };
+        if raw[0..4] != STORE_MAGIC {
             return Err(StoreError::BadMagic);
         }
-        let ver = u16::from_le_bytes(buf[4..6].try_into().unwrap());
+        let ver = le_u16!(raw, 4);
         if !schema_file_openable(ver) {
             return Err(StoreError::BadSchema(ver));
         }
         Ok(Some(Self {
-            annotated_through: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            durable_through: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            annotated_through: le_u32!(raw, 8),
+            durable_through: le_u32!(raw, 12),
         }))
     }
 

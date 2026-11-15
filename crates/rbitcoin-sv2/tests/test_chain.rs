@@ -5,8 +5,30 @@ use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::Height;
 use rbitcoin_query::testutil::{tiny_query_labeled, TempDir};
 use rbitcoin_query::{accept_and_connect_block, pad_empty_from};
+use rbitcoin_sv2::{
+    Sv2TpConfig, CONSTRAINTS_COOLDOWN_TEST, FEE_DELTA, SETUP_TIMEOUT, TEMPLATE_INTERVAL,
+    WRITE_TIMEOUT,
+};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Listener used by the SV2 tests. Callers override the fields a case changes.
+pub(crate) fn test_tp_config(chain: Arc<ChainHub>, authority_secret: [u8; 32]) -> Sv2TpConfig {
+    Sv2TpConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        chain,
+        authority_secret,
+        cert_validity: Duration::from_secs(3600),
+        stale_grace: Duration::from_secs(10),
+        setup_timeout: SETUP_TIMEOUT,
+        idle_timeout: None,
+        write_timeout: WRITE_TIMEOUT,
+        fee_delta: FEE_DELTA,
+        template_interval: TEMPLATE_INTERVAL,
+        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
+    }
+}
 
 pub(crate) struct TestChain {
     pub _dir: TempDir,

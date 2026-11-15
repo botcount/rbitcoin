@@ -17,12 +17,12 @@ security model by itself.
 methods return `scripthash index disabled`; the listener still binds.
 
 `server.version[0]` is `rbitcoin-electrs <ver> electrumx` so Cake Wallet
-`getNodeIsElectrs()` will probe silent-payment tweaks and Sparrow and
-BlueWallet will send JSON-RPC batches. Other tweaks clients
-do not need that substring. We are **not** electrs — see `COMPAT.md`.
+`getNodeIsElectrs()` probes silent-payment tweaks, and Sparrow and
+BlueWallet send JSON-RPC batches. Other tweaks clients
+do not need that substring. This node is not electrs. See `COMPAT.md`.
 
-**Not a search-box explorer.** We serve clients that already know their
-scripthashes / txids. Address-prefix autocomplete is out.
+The listener is not a search-box explorer. It serves clients that already
+know their scripthashes or txids. Address-prefix autocomplete is absent.
 **0.8** electrs HTTP drop-in (mempool.space nginx `/api/`): [`COMPAT.md`](../../COMPAT.md).
 
 ```bash
@@ -47,7 +47,7 @@ proxy, or a public bind if the proxy sits elsewhere and you accept that risk).
 | Unconfirmed history/balance/mempool | from cluster mempool |
 | `transaction.get` | chain then mempool fallback |
 | `relayfee` / `estimatefee` / histogram | from Libre min + live mempool |
-| Silent Payments tweaks | `blockchain.tweaks.subscribe` — with `--sp-tweaks` index: multi-height load (default ≤128 heights / ≤16384 eligible txs per wave) then per-height notifies, **one TCP flush per wave**. Indexed JSON-RPC result shares the first wave's Class A `txout` span; remaining heights of that wave are notifies; further waves overlap the next load with the previous write. Class A join is **one sequential `txout` span** from first..=last eligible fk in the wave (not one body pread per eligible tx; `seqsigwit` stays out). Pre-taproot: **one** notify with ≤1024 empty height keys (no store; Cake last key = progress). Cake `historicalMode=false` (param `[2]`): omit confirmed-spent P2TR outs. `--sp-tweaks-dust` (default 1000; 546 = Cake electrs): omit P2TR outs with `value <=` the floor. Without index / hole: naive per height (Class A + parent outs). **Not** request/response: JSON-RPC result is the **first** height (1-height probe `[0,1,false]` → `{"0": {}}`); further heights are notifications, then `{"message":"done"}` at a **wave boundary after 60s wall** (or when `count`/tip finishes first). Cake resubscribes; kiss-bdk one-shot stops until it loops. `server.features.genesis_hash` is the chain check. `server.version[0]` contains `electrs` (Cake probe). On 9p-class IO expect slower than local disk. |
+| Silent Payments tweaks | `blockchain.tweaks.subscribe` — with `--sp-tweaks` index: multi-height load (default ≤128 heights / ≤16384 eligible txs per wave) then per-height notifies, **one TCP flush per wave**. Indexed JSON-RPC result shares the first wave's Class A `txout` span; remaining heights of that wave are notifies; further waves overlap the next load with the previous write. Class A join is **one sequential `txout` span** from first..=last eligible fk in the wave (not one body pread per eligible tx; `seqsigwit` stays out). Pre-taproot: **one** notify with ≤1024 empty height keys (no store; Cake last key = progress). Cake `historicalMode=false` (param `[2]`): omit confirmed-spent P2TR outs. `--sp-tweaks-dust` (default 1000; 545 = Cake electrs floor of 546): omit P2TR outs with `value <=` the floor. Without index / hole, and without `--prune-seqsigwit`: naive per height (Class A + parent outs). With prune, that walk is refused: a sealed height comes from the index, an unsealed tip still in the keep window is built from that window, and a height the index does not cover is an error. **Not** request/response: JSON-RPC result is the **first** height (1-height probe `[0,1,false]` → `{"0": {}}`); further heights are notifications, then `{"message":"done"}` at a **wave boundary after 60s wall** (or when `count`/tip finishes first). Cake resubscribes; kiss-bdk one-shot stops until it loops. `server.features.genesis_hash` is the chain check. `server.version[0]` contains `electrs` (Cake probe). On 9p-class IO expect slower than local disk. |
 
 ### API request log
 
@@ -96,18 +96,20 @@ Re-measure fat keys on the operator host (`rbitcoin-bench --suite casa
 
 ### App DoS floor (always on)
 
-Shared [`ServeLimits`](../../crates/rbitcoin-electrum) defaults (also the future Esplora
-floor). Excess Electrum connections are **rejected immediately** (no hang);
-oversize lines and idle clients fail closed. Excess Esplora requests wait for a
-slot, and the wait counts against the request timeout (**408** when it runs out).
+Shared [`ServeLimits`](../../crates/rbitcoin-electrum/src/server.rs) defaults.
+Electrum and Esplora both use them. Excess Electrum connections are rejected
+at accept. An oversize line and an idle client fail closed. An Esplora request
+that finds the in-flight cap full waits. The wait counts against the request
+timeout (`TimeoutLayer`, status 408). `admit_connection` holds the wait.
 
 | Limit | Default | Role |
 |-------|---------|------|
-| Max connections | 256 | Concurrent Electrum TCP clients |
+| Max connections | 256 | Concurrent Electrum TCP clients. Esplora accepts up to 8× `--esplora-max-inflight` sockets; a further socket is closed. A socket that sends no headers is closed at the idle timeout |
 | Max Esplora in flight | 256 (`--esplora-max-inflight`) | Esplora requests in flight across the listener, every route together. Further requests wait for a slot, within the request timeout (408) |
 | Max request line | 1 MiB | One JSON-RPC line including `\n` |
 | Idle timeout | 120 s | No complete request → disconnect |
 | Max scripthash subs / conn | 10000 (`--electrum-max-subs`) | Notify fan-out cap. A wallet subscribes every address up to its gap limit; each sub is ~170 B (≈0.45 GB worst case at 256 connections) plus one posting check per block against that block's shared touch set; a reorg restatuses every sub |
+| Max silent-payment addresses / conn | 16 (`--electrum-max-sp-subs`) | Each address scans every new block with its own key, and its subscribe scans history from its start. At most 32 history scans run in the process; a subscribe past that is refused. They share three process-wide permits, 256 heights at a time. |
 | Max broadcast hex | ~8 MiB | `transaction.broadcast` hex length |
 | Max batch items | 345 | Requests in one JSON-RPC batch line; more is one `-32600`. The reply is written one slot at a time, so a slow reader holds back the server, not RAM |
 | Batch reads at once | half the blocking pool, at least 1 (2 at 4 threads) | Read-only batch items in flight per connection (tasks and unwritten replies). Node-wide disk slots are `--store-read-budget`, not half the pool. One batch no longer keeps half the pool by occupying it. The tasks wait asynchronously when the budget is taken |
@@ -190,7 +192,8 @@ it those routes are 503 `scripthash index disabled`; the listener still binds.
 mempool.space `/api/v1/` catalogue. Opt-in `GET /block-template` is GBT
 (`--esplora-block-template`), not a stratum/pool stack. Compact
 `/address|scripthash/…/txs/summary` is a mempool.space-shaped dialect (not
-Blockstream Esplora `API.md`); surface: [`COMPAT.md`](../../COMPAT.md).
+Blockstream Esplora `API.md`), and so is per-block `/block/:hash/txs/summary`;
+surface: [`COMPAT.md`](../../COMPAT.md).
 
 ```bash
 ./target/release/rbitcoin-node \
@@ -204,6 +207,9 @@ Blockstream Esplora `API.md`); surface: [`COMPAT.md`](../../COMPAT.md).
 
 Conf: `sh_index=1` and `esplora_listen=127.0.0.1:3000`. Default is **disabled**.
 Leave `--max-sh-creates` at **10000** (or **0** for an unlimited unpaged join) for explorer backends. Paged history still stops at the page.
+An explorer on the unix socket can read one script's totals above the cap with
+`GET /internal/address/:address` or `/internal/scripthash/:hash`, without
+raising the cap for Electrum or TCP Esplora ([`storage.md`](storage.md)).
 
 TCP Esplora does not keep a mempool of `Arc<Transaction>`. `GET /mempool` loads
 the fee snapshot (count/vsize/total_fee + histogram). Unix `/internal` mempool-tx
@@ -213,7 +219,7 @@ the first page; dirty/singleflight; not FIFO/LRU). RAM: [`docs/ibd-memory.md`](.
 | Feature | Behavior |
 |---------|----------|
 | Transport | plain HTTP (axum + tower body/concurrency/timeout from `ServeLimits`) |
-| Tip / blocks | tip height/hash; `/blocks[/:start_height]` (10 summaries); `/block/:hash` JSON + **raw** + status |
+| Tip / blocks | tip height/hash; `/blocks[/:start_height]` (10 summaries); `/block/:hash` JSON + **raw** + status; compact `/block/:hash/txs/summary` (dialect; [`COMPAT.md`](../../COMPAT.md)) |
 | Tx | full JSON, hex, **raw**, status, Electrum merkle-proof, **BIP37 merkleblock-proof**, outspends |
 | Address / scripthash | chain_stats, utxo, `/txs` + `/txs/chain` + `/txs/mempool`, compact `/txs/summary` (dialect; [`COMPAT.md`](../../COMPAT.md)); complete after SH tip finalize |
 | Mempool | `/mempool`, `/mempool/txids`, `/mempool/recent`, `/fee-estimates`; `POST /tx` and **`POST /txs/package`** when hub open |
@@ -222,8 +228,6 @@ the first page; dirty/singleflight; not FIFO/LRU). RAM: [`docs/ibd-memory.md`](.
 
 **Large responses:** `GET /block/:hash/raw` may be multi‑MB; concurrency/timeout from `ServeLimits` still apply.
 **Package broadcast:** body is a JSON array of tx hex (max 25); uses the same libre-relay mempool policy as single `POST /tx`.
-
-DoS knobs share Electrum’s `ServeLimits` defaults (256 conns, 1 MiB body, 120 s timeout).
 
 ### mempool.space
 
@@ -294,6 +298,17 @@ is no plaintext mode.
 `sv2 TP on ADDR (authority pubkey KEY)`. KEY is in the SRI `key-utils`
 base58check form (`9b…`); configure it as the TP authority public key in the
 client. No templates are sent while the node is in IBD.
+The template time is `next_block_mintime`: above the tip median, with the
+BIP94 and BIP54 floors applied on every network. On testnet5 `NewTemplate`
+carries the coinbase BIP 54 requires: `coinbase_tx_locktime` is the height
+before the block's and `coinbase_tx_input_sequence` is `0xfffffffe`. Every
+other network sends locktime 0 and a final sequence. On testnet3 and testnet4,
+`SetNewPrevHash` carries nBits for that previous hash and `NewTemplate` has
+no bits field. A solution whose time rolls past the previous block by two
+target spacings needs the minimum-difficulty bits. Those bits are inside
+the header hash, so the session drops the solution before `accept_block`
+(`submit_solution_past_the_min_diff_gap_is_dropped`). Mainnet and signet
+bits depend only on the previous hash.
 At most 8 sessions run at once. A connection that has not finished the
 Noise handshake and `SetupConnection` and sent its first
 `CoinbaseOutputConstraints` within 10 s is closed; after that a client may
@@ -343,7 +358,9 @@ services.rbitcoin.sv2.tp = {
 
 ## Core-class JSON-RPC
 
-Optional HTTP JSON-RPC subset (default **off**). `--rpc` binds
+Optional HTTP JSON-RPC subset (default **off**). TCP and the unix socket
+share a 256-connection cap; the deadlines are in [`docs/rpc.md`](../../docs/rpc.md).
+`--rpc` binds
 `{datadir}/rpc.sock` (mode **0600**, filesystem auth, no HTTP header).
 `--rpc-socket PATH` binds that socket at PATH instead, mode **0660**, so a
 client in rbitcoin's group can connect without traversing the `0700` datadir.

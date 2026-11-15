@@ -5,7 +5,7 @@ source. On-chain wallets are [`wallets.md`](./wallets.md). This is not a
 Core wallet. 0.x — do not put mainnet channel funds here until this file
 says the contract is boring.
 
-Operator flags: [`OPERATOR.md`](../OPERATOR.md). RPC JSON:
+Operator flags: [`docs/operator/`](./operator/). RPC JSON:
 [`rpc.md`](./rpc.md). Electrum/Esplora surface: [`COMPAT.md`](../COMPAT.md).
 Fee math: [`mempool-fee-estimation.md`](./mempool-fee-estimation.md).
 Cookie file for TCP clients: [`wallets.md`](./wallets.md#tcp-rpc-cookie).

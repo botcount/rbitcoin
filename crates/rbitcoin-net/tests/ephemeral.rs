@@ -381,8 +381,7 @@ async fn ephemeral_broadcast() {
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("ephemeral-broadcast");
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
-        .expect("pad");
+    hub.confirm_empty_regtest(102).expect("pad");
     let mp = MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
     mp.set_relay_enabled(true);
     assert!(hub.attach_mempool(mp.clone()).is_ok());
@@ -662,7 +661,9 @@ async fn ephemeral_broadcast() {
     )
     .await;
     assert!(!h.is_finished(), "a local tx with no targets is a no-op");
-    h.abort();
+    // Join before another loop shares this mempool. abort() leaves the
+    // direct loop able to take the next isolated txid.
+    stop_task(h).await;
 
     let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dest = closed.local_addr().unwrap();

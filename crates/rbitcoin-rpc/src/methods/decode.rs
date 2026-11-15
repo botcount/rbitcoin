@@ -24,7 +24,7 @@ pub fn decoderawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
             )
         })
         .ok_or_else(|| rpc_error(ERR_DESERIALIZATION, "TX decode failed"))?;
-    Ok(tx_to_json(&tx, None, rpc_btc_network(ctx.network)))
+    Ok(tx_to_json(&tx, None, None, rpc_btc_network(ctx.network)))
 }
 
 pub fn decodescript(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {

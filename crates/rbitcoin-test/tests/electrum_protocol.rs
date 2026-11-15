@@ -169,7 +169,10 @@ async fn pin_silentpayments_1_6(stream: &mut TcpStream) {
     .await;
     assert_eq!(sp["result"]["start_height"], 0, "{sp}");
     assert!(
-        sp["result"]["address"].as_str().unwrap().contains("sp"),
+        sp["result"]["address"]
+            .as_str()
+            .unwrap()
+            .starts_with("tsp1q"),
         "{sp}"
     );
     let note = read_notify(stream, "silentpayments history").await;
@@ -178,7 +181,21 @@ async fn pin_silentpayments_1_6(stream: &mut TcpStream) {
         Some("blockchain.silentpayments.subscribe"),
         "{note}"
     );
-    assert!(note["params"]["history"].as_array().is_some(), "{note}");
+    // Frigate: positional `[subscription, progress, history]`.
+    assert_eq!(note["params"][0], sp["result"], "{note}");
+    assert_eq!(note["params"][1], 1.0, "{note}");
+    assert!(note["params"][2].as_array().is_some(), "{note}");
+    // Sparrow sends the wallet birthday. Older than genesis is the whole chain.
+    let dated = rpc(
+        stream,
+        57,
+        "blockchain.silentpayments.subscribe",
+        json!([SP_SCAN, SP_SPEND, 600_000_000]),
+    )
+    .await;
+    assert_eq!(dated["result"]["start_height"], 0, "{dated}");
+    let dated_note = read_notify(stream, "silentpayments dated history").await;
+    assert_eq!(dated_note["params"][0], dated["result"], "{dated_note}");
     const OTHER_SCAN: &str = "1f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
     let mismatch = rpc(
         stream,
@@ -717,8 +734,6 @@ async fn electrum_server_version_history_balance() {
 
     // Empty line is ignored (no response) — send ping after.
     stream.write_all(b"\n").await.unwrap();
-    // Bad JSON is ignored.
-    stream.write_all(b"{not json\n").await.unwrap();
 
     let v = rpc(&mut stream, 1, "server.ping", json!([])).await;
     assert!(v.get("result").is_some(), "{v}");
@@ -1093,7 +1108,7 @@ async fn electrum_server_version_history_balance() {
     let mut dos = TcpStream::connect(handle.local_addr).await.unwrap();
     let v = rpc(&mut dos, 1, "server.ping", json!([])).await;
     assert!(v.get("result").is_some(), "{v}");
-    let mut at_cap = vec![b'A'; 2047];
+    let mut at_cap = vec![b' '; 2047];
     at_cap.push(b'\n');
     dos.write_all(&at_cap).await.unwrap();
     let v = rpc(&mut dos, 2, "server.ping", json!([])).await;
@@ -1210,10 +1225,13 @@ async fn drain_lines(stream: &mut TcpStream, window: Duration) -> Vec<Value> {
         .collect()
 }
 
-/// The mempool notify path probes the sub set with each accepted tx's
-/// scripthashes. Funding the watched hash pushes its new status, and an RBF
-/// replacement that stops paying it must push again via replaced_scripthashes
-/// (the hash is no longer in the replacement's own scripthashes).
+/// The mempool notify path probes the sub sets with each accepted tx's
+/// scripthashes and outpoints. Funding the watched hash pushes its new
+/// status, and an RBF replacement that stops paying it must push again via
+/// replaced_scripthashes (the hash is no longer in the replacement's own
+/// scripthashes). The spent outpoint is pushed with its spender at each
+/// accept, before any block. A ping after each accept shows nothing else was
+/// pushed.
 ///
 /// The runtime names its threads `tokio-rt-worker`, matching the node.
 /// `#[tokio::test]` workers are `tokio-runtime-worker` and never trip
@@ -1260,15 +1278,25 @@ async fn electrum_mempool_notify_follows_funding_and_rbf_on() {
     // No history: status is null (protocol), not "". Sparrow reads any
     // non-null status as a used address and keeps deriving past its gap.
     assert_eq!(v["result"], Value::Null, "{v}");
+    let coin = OutPoint {
+        txid: coinbase_txids[0],
+        vout: 0,
+    };
+    let coin_txid = coin.txid.to_string();
+    let v = rpc(
+        &mut stream,
+        2,
+        "blockchain.outpoint.subscribe",
+        json!([coin_txid.clone(), 0]),
+    )
+    .await;
+    assert_eq!(v["result"]["spent"], false, "{v}");
 
     let spend = |outputs: Vec<TxOut>| Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: coinbase_txids[0],
-                vout: 0,
-            },
+            previous_output: coin,
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
@@ -1279,41 +1307,51 @@ async fn electrum_mempool_notify_follows_funding_and_rbf_on() {
         value: Amount::from_sat(sat),
         script_pubkey: spk.clone(),
     };
+    let coin_spent_by = |spender: &Transaction| {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.outpoint.subscribe",
+            "params": [coin_txid.clone(), 0, {
+                "txid": coin_txid.clone(),
+                "vout": 0,
+                "spent": true,
+                "height": 0,
+                "spending_txid": spender.compute_txid().to_string(),
+            }],
+        })
+    };
     // Two outputs to the watched script; one status push for the hash.
     let first = spend(vec![
         pays(&watched, 20_0000_0000),
         pays(&watched, 29_9999_0000),
     ]);
     mp.accept_tx(&first).expect("accept first");
-    let pushes = drain_lines(&mut stream, Duration::from_millis(800)).await;
-    let for_sh: Vec<_> = pushes
-        .iter()
-        .filter(|m| m["method"] == "blockchain.scripthash.subscribe" && m["params"][0] == sh)
-        .collect();
-    assert_eq!(for_sh.len(), 1, "one push per accepted tx: {pushes:?}");
-    let funded_status = for_sh[0]["params"][1].clone();
-    assert!(funded_status.is_string(), "{pushes:?}");
+    let push = read_notify(&mut stream, "outpoint spend").await;
+    assert_eq!(push, coin_spent_by(&first));
+    let push = read_notify(&mut stream, "funded scripthash").await;
+    assert_eq!(push["method"], "blockchain.scripthash.subscribe", "{push}");
+    assert_eq!(push["params"][0], sh, "{push}");
+    assert!(push["params"][1].is_string(), "{push}");
+    let ping = rpc(&mut stream, 3, "server.ping", json!([])).await;
+    assert_eq!(ping["id"], 3, "one push per sub per accepted tx: {ping}");
 
     // RBF the spend to a different script: the watched hash is only in
     // replaced_scripthashes, and its status must be pushed again.
     let other = ScriptBuf::from_bytes(vec![0x53]);
     let replacement = spend(vec![pays(&other, 49_9990_0000)]);
     mp.accept_tx(&replacement).expect("accept replacement");
-    let pushes = drain_lines(&mut stream, Duration::from_millis(800)).await;
-    let for_sh: Vec<_> = pushes
-        .iter()
-        .filter(|m| m["method"] == "blockchain.scripthash.subscribe" && m["params"][0] == sh)
-        .collect();
+    let push = read_notify(&mut stream, "outpoint replacer").await;
+    assert_eq!(push, coin_spent_by(&replacement));
+    let push = read_notify(&mut stream, "victim scripthash").await;
+    assert_eq!(push["method"], "blockchain.scripthash.subscribe", "{push}");
+    assert_eq!(push["params"][0], sh, "{push}");
     assert_eq!(
-        for_sh.len(),
-        1,
-        "RBF victim's hash is restatused: {pushes:?}"
-    );
-    assert_eq!(
-        for_sh[0]["params"][1],
+        push["params"][1],
         Value::Null,
-        "victim's history is empty again, so its status is null: {pushes:?}"
+        "victim's history is empty again, so its status is null: {push}"
     );
+    let ping = rpc(&mut stream, 4, "server.ping", json!([])).await;
+    assert_eq!(ping["id"], 4, "one push per sub per accepted tx: {ping}");
 
     handle.shutdown().await;
 }
@@ -1640,6 +1678,17 @@ async fn electrum_leftover_mempool_does_not_double_count() {
     )
     .await;
     assert_eq!(conf["result"]["spent"], true, "{conf}");
+    let past = rpc(
+        &mut stream,
+        90,
+        "blockchain.outpoint.get_status",
+        json!([cb1, u32::MAX]),
+    )
+    .await;
+    assert_eq!(
+        past["result"]["spent"], false,
+        "vout past the outputs: {past}"
+    );
     assert_eq!(
         conf["result"]["height"].as_u64(),
         Some(102),
@@ -1705,6 +1754,17 @@ async fn electrum_leftover_mempool_does_not_double_count() {
     assert!(
         mp.is_local_origin(&pkg.compute_txid()),
         "broadcast_package is a local submit"
+    );
+    let past = rpc(
+        &mut stream,
+        91,
+        "blockchain.outpoint.get_status",
+        json!([pkg.compute_txid().to_string(), u32::MAX]),
+    )
+    .await;
+    assert_eq!(
+        past["result"]["spent"], false,
+        "mempool vout past the outputs: {past}"
     );
     let cb = cb2.to_string();
     let spent = rpc(

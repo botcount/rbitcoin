@@ -331,29 +331,47 @@ impl NetPermTable {
         bind: SocketAddr,
     ) -> NetPermissionFlags {
         match net {
-            crate::NetAddr::Onion { .. } | crate::NetAddr::I2p { .. } => NetPermissionFlags::NONE,
+            crate::NetAddr::Onion { .. }
+            | crate::NetAddr::I2p { .. }
+            | crate::NetAddr::Name { .. } => NetPermissionFlags::NONE,
             crate::NetAddr::Ip(s) => self.flags_for(s.ip(), inbound, bind),
             crate::NetAddr::Cjdns { ip, .. } => self.flags_for(IpAddr::V6(ip), inbound, bind),
         }
     }
 
     pub fn flags_for(&self, ip: IpAddr, inbound: bool, bind: SocketAddr) -> NetPermissionFlags {
+        self.flags_for_matched(ip, inbound, bind, true)
+    }
+
+    /// `apply_whitelist` is false for an inbound whose TCP address is the
+    /// Tor or I2P forwarder. `--net-permission-bind` still matches `bind`.
+    pub fn flags_for_matched(
+        &self,
+        ip: IpAddr,
+        inbound: bool,
+        bind: SocketAddr,
+        apply_whitelist: bool,
+    ) -> NetPermissionFlags {
         let mut flags = NetPermissionFlags::NONE;
-        for g in &self.whitelist {
-            if !g.subnet.contains(ip) {
-                continue;
+        if apply_whitelist {
+            for g in &self.whitelist {
+                if !g.subnet.contains(ip) {
+                    continue;
+                }
+                if inbound && !g.inbound {
+                    continue;
+                }
+                if !inbound && !g.outbound {
+                    continue;
+                }
+                flags |= g.flags;
             }
-            if inbound && !g.inbound {
-                continue;
-            }
-            if !inbound && !g.outbound {
-                continue;
-            }
-            flags |= g.flags;
         }
         if inbound {
             for g in &self.whitebind {
-                if g.addr == bind || (g.addr.ip() == bind.ip() && g.addr.port() == bind.port()) {
+                // `SocketAddr` equality is the IP and the port. A second
+                // copy of that compare does not change the match.
+                if g.addr == bind {
                     flags |= g.flags;
                 }
             }

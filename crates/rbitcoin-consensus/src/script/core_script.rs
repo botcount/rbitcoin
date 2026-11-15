@@ -9,7 +9,7 @@ pub fn assemble_script(src: &str) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let mut i = 0;
     let b = src.as_bytes();
-    while i < b.len() {
+    loop {
         while i < b.len() && b[i].is_ascii_whitespace() {
             i += 1;
         }

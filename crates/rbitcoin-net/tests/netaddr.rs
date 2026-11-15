@@ -20,7 +20,7 @@ fn netaddr_onion_parse_roundtrip() {
             );
             assert_eq!(port, 8333);
         }
-        NetAddr::Ip(_) | NetAddr::I2p { .. } | NetAddr::Cjdns { .. } => {
+        NetAddr::Ip(_) | NetAddr::I2p { .. } | NetAddr::Cjdns { .. } | NetAddr::Name { .. } => {
             panic!("expected onion")
         }
     }
@@ -133,4 +133,52 @@ fn cjdns_rejects_global_unicast() {
         port: 8333,
     };
     assert!(NetAddr::from_addrv2(&msg).is_none());
+}
+
+#[test]
+fn clearnet_bogon_conjunctions_stay_tight() {
+    let v6 = |s: &str| IpAddr::V6(s.parse().unwrap());
+    let v4 = |a, b, c, d| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+    for ip in [
+        v6("2001:db8::1"),
+        v6("3fff::1"),
+        v6("64:ff9b:1::"),
+        v6("::ffff:0:0:0"),
+        v6("::1"),
+        v6("fe80::1"),
+        v6("fd00::1"),
+        v6("ff02::1"),
+        v4(255, 255, 255, 255),
+        v4(224, 0, 0, 1),
+    ] {
+        assert!(clearnet_unroutable(ip), "{ip} is a clearnet bogon");
+    }
+    for ip in [
+        v6("0000:00b8::"),
+        v6("3f00::"),
+        v6("00ff:ff9b:0001:0100::"),
+        v6("0064:009b:0001:0100::"),
+        v6("100:100::ffff:0:0"),
+        v6("100:1::ffff:0:0:0"),
+        v6("100:0:0:100:ff::"),
+        v4(1, 2, 3, 4),
+        v6("2001:4860:4860::8888"),
+    ] {
+        assert!(!clearnet_unroutable(ip), "{ip} stays routable");
+    }
+}
+
+#[test]
+fn name_key_is_per_host_and_port_and_never_enters_the_book() {
+    let a = NetAddr::name("Peer.Example", 8333).unwrap();
+    assert_eq!(a, NetAddr::name("peer.example", 8333).unwrap());
+    assert_ne!(a, NetAddr::name("peer.example", 8334).unwrap());
+    assert_ne!(a, NetAddr::name("other.example", 8333).unwrap());
+    assert_eq!(a.to_string(), "peer.example:8333");
+    let mut book = rbitcoin_net::seeds::AddrMan::new();
+    book.add_addr(a);
+    assert!(
+        book.is_empty(),
+        "a name is dialed, never gossiped or booked"
+    );
 }

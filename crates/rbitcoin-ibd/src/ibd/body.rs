@@ -14,6 +14,32 @@ pub struct BodyPresenceSizes {
     pub rejected: usize,
 }
 
+/// One hash in the presence cache.
+///
+/// `KnownPending` is an archived hash that is also waiting on confirm.
+/// `mark_pending` does not clear the archived bit.
+#[derive(Clone, Copy)]
+enum Slot {
+    Known,
+    Missing,
+    Rejected,
+    Pending(Instant),
+    KnownPending(Instant),
+}
+
+impl Slot {
+    fn pending_at(self) -> Option<Instant> {
+        match self {
+            Self::Pending(since) | Self::KnownPending(since) => Some(since),
+            _ => None,
+        }
+    }
+
+    fn is_known(self) -> bool {
+        matches!(self, Self::Known | Self::KnownPending(_))
+    }
+}
+
 /// Process-local Class A body presence cache.
 ///
 /// Assign/status used to call `is_archived` (store) for every ordered hash every
@@ -26,14 +52,13 @@ pub struct BodyPresenceSizes {
 ///
 /// `rejected` covers Class C permanent failures: never re-offer or re-download.
 pub struct BodyPresence {
-    pub known: HashSet<BlockHash>,
-    /// Received on the wire / in body queue, not yet tip-confirmed.
-    /// Membership **is** the pending set; value is when marked (stale expire).
-    pub pending_since: HashMap<BlockHash, Instant>,
-    /// Store-probed and not archived yet (safe to request getdata).
-    pub missing: HashSet<BlockHash>,
-    /// Confirm rejected this hash; do not re-offer or re-download.
-    pub rejected: HashSet<BlockHash>,
+    slots: HashMap<BlockHash, Slot>,
+    /// Pending hashes only, so a stale check does not walk archived rows.
+    pending_keys: HashSet<BlockHash>,
+    known: usize,
+    pending: usize,
+    missing: usize,
+    rejected: usize,
 }
 
 impl Default for BodyPresence {
@@ -45,64 +70,125 @@ impl Default for BodyPresence {
 impl BodyPresence {
     pub fn new() -> Self {
         Self {
-            known: HashSet::new(),
-            pending_since: HashMap::new(),
-            missing: HashSet::new(),
-            rejected: HashSet::new(),
+            slots: HashMap::new(),
+            pending_keys: HashSet::new(),
+            known: 0,
+            pending: 0,
+            missing: 0,
+            rejected: 0,
+        }
+    }
+
+    fn note(&mut self, slot: Slot) {
+        match slot {
+            Slot::Known => self.known += 1,
+            Slot::Missing => self.missing += 1,
+            Slot::Rejected => self.rejected += 1,
+            Slot::Pending(_) => self.pending += 1,
+            Slot::KnownPending(_) => {
+                self.known += 1;
+                self.pending += 1;
+            }
+        }
+    }
+
+    fn unnote(&mut self, slot: Slot) {
+        match slot {
+            Slot::Known => self.known -= 1,
+            Slot::Missing => self.missing -= 1,
+            Slot::Rejected => self.rejected -= 1,
+            Slot::Pending(_) => self.pending -= 1,
+            Slot::KnownPending(_) => {
+                self.known -= 1;
+                self.pending -= 1;
+            }
+        }
+    }
+
+    fn put(&mut self, hash: BlockHash, next: Option<Slot>) {
+        if let Some(prev) = self.slots.remove(&hash) {
+            if prev.pending_at().is_some() {
+                self.pending_keys.remove(&hash);
+            }
+            self.unnote(prev);
+        }
+        if let Some(slot) = next {
+            if slot.pending_at().is_some() {
+                self.pending_keys.insert(hash);
+            }
+            self.note(slot);
+            self.slots.insert(hash, slot);
         }
     }
 
     #[inline]
     #[doc(hidden)]
     pub fn is_pending_hash(&self, h: &BlockHash) -> bool {
-        self.pending_since.contains_key(h)
+        self.slots
+            .get(h)
+            .and_then(|slot| slot.pending_at())
+            .is_some()
     }
 
     pub fn mark_pending(&mut self, h: BlockHash) {
-        if self.rejected.contains(&h) {
-            return;
+        match self.slots.get(&h).copied() {
+            Some(Slot::Rejected | Slot::Pending(_) | Slot::KnownPending(_)) => {}
+            Some(Slot::Known) => self.put(h, Some(Slot::KnownPending(Instant::now()))),
+            Some(Slot::Missing) | None => self.put(h, Some(Slot::Pending(Instant::now()))),
         }
-        self.missing.remove(&h);
-        self.pending_since.entry(h).or_insert_with(Instant::now);
+    }
+
+    /// Set the pending instant. An archived hash stays archived.
+    #[doc(hidden)]
+    pub fn set_pending_since(&mut self, h: BlockHash, since: Instant) {
+        match self.slots.get(&h).copied() {
+            Some(Slot::Rejected) => {}
+            Some(Slot::Known | Slot::KnownPending(_)) => {
+                self.put(h, Some(Slot::KnownPending(since)));
+            }
+            Some(Slot::Pending(_) | Slot::Missing) | None => {
+                self.put(h, Some(Slot::Pending(since)));
+            }
+        }
     }
 
     pub fn mark_archived(&mut self, h: BlockHash) {
-        if self.rejected.contains(&h) {
+        if matches!(self.slots.get(&h), Some(Slot::Rejected)) {
             return;
         }
-        self.missing.remove(&h);
-        self.pending_since.remove(&h);
-        self.known.insert(h);
+        self.put(h, Some(Slot::Known));
     }
 
     pub fn mark_missing(&mut self, h: BlockHash) {
-        if self.rejected.contains(&h) {
+        if matches!(self.slots.get(&h), Some(Slot::Rejected)) {
             return;
         }
-        self.known.remove(&h);
-        self.pending_since.remove(&h);
-        self.missing.insert(h);
+        self.put(h, Some(Slot::Missing));
     }
 
     /// Stop asking for `h` without blacklisting it. A halted tip-child retry
     /// must not stay on the missing set from the earlier attempts.
     pub(crate) fn stop_reget(&mut self, h: BlockHash) {
-        self.missing.remove(&h);
-        self.pending_since.remove(&h);
+        match self.slots.get(&h).copied() {
+            Some(Slot::Known | Slot::KnownPending(_)) => self.put(h, Some(Slot::Known)),
+            Some(Slot::Pending(_) | Slot::Missing) => self.put(h, None),
+            Some(Slot::Rejected) | None => {}
+        }
     }
 
     /// Drop optimistic Class A cache only — next [`Self::ready`] re-probes the store.
     pub fn demote_known(&mut self, h: BlockHash) {
-        self.known.remove(&h);
+        match self.slots.get(&h).copied() {
+            Some(Slot::Known) => self.put(h, None),
+            Some(Slot::KnownPending(since)) => self.put(h, Some(Slot::Pending(since))),
+            _ => {}
+        }
     }
 
     /// Permanent confirm failure: never re-offer this hash to the confirm engine
     /// and never re-getdata it.
     pub fn mark_rejected(&mut self, h: BlockHash) {
-        self.known.remove(&h);
-        self.pending_since.remove(&h);
-        self.missing.remove(&h);
-        self.rejected.insert(h);
+        self.put(h, Some(Slot::Rejected));
     }
 
     /// Pending hashes older than `max_age` matching `pred` → mark missing (re-get).
@@ -113,10 +199,15 @@ impl BodyPresence {
     ) -> Vec<BlockHash> {
         let now = Instant::now();
         let stale: Vec<BlockHash> = self
-            .pending_since
+            .pending_keys
             .iter()
-            .filter(|(h, t)| pred(h) && now.duration_since(**t) >= max_age)
-            .map(|(h, _)| *h)
+            .filter(|hash| {
+                self.slots
+                    .get(*hash)
+                    .and_then(|slot| slot.pending_at())
+                    .is_some_and(|since| pred(hash) && now.duration_since(since) >= max_age)
+            })
+            .copied()
             .collect();
         for h in &stale {
             self.mark_missing(*h);
@@ -125,24 +216,24 @@ impl BodyPresence {
     }
 
     pub fn is_rejected(&self, h: &BlockHash) -> bool {
-        self.rejected.contains(h)
+        matches!(self.slots.get(h), Some(Slot::Rejected))
     }
 
     /// True if we already know Class A is present (no store probe).
     pub fn is_known_archived(&self, h: &BlockHash) -> bool {
-        self.known.contains(h)
+        self.slots.get(h).is_some_and(|slot| slot.is_known())
     }
 
     pub fn known_len(&self) -> usize {
-        self.known.len()
+        self.known
     }
 
     pub fn size_snapshot(&self) -> BodyPresenceSizes {
         BodyPresenceSizes {
-            known: self.known.len(),
-            pending: self.pending_since.len(),
-            missing: self.missing.len(),
-            rejected: self.rejected.len(),
+            known: self.known,
+            pending: self.pending,
+            missing: self.missing,
+            rejected: self.rejected,
         }
     }
 
@@ -151,7 +242,7 @@ impl BodyPresence {
     }
 
     pub fn is_missing(&self, h: &BlockHash) -> bool {
-        self.missing.contains(h)
+        matches!(self.slots.get(h), Some(Slot::Missing))
     }
 
     /// Hot path: local sets first. Do **not** call `has_block` before checking
@@ -160,14 +251,14 @@ impl BodyPresence {
     /// Does **not** treat `known` (Class A cache) as skip — that set is densify
     /// bookkeeping; tip-hole re-get after resume still needs peer wire into BQ.
     pub fn skip_download(&mut self, hub: &ChainHub, h: &BlockHash) -> bool {
-        if self.rejected.contains(h) || self.is_pending_hash(h) {
+        if self.is_rejected(h) || self.is_pending_hash(h) {
             return true;
         }
         if self.is_missing(h) {
             return false;
         }
         if hub.has_block(h) {
-            self.known.insert(*h);
+            self.put(*h, Some(Slot::Known));
             return true;
         }
         false
@@ -176,8 +267,35 @@ impl BodyPresence {
     /// Drop cache entries that are no longer on the live work path.
     /// Rejected entries are never pruned.
     pub fn hygiene_retain(&mut self, mut keep: impl FnMut(&BlockHash) -> bool) {
-        self.known.retain(|h| keep(h));
-        self.missing.retain(|h| keep(h));
-        self.pending_since.retain(|h, _| keep(h));
+        let mut drop_known = 0;
+        let mut drop_pending = 0;
+        let mut drop_missing = 0;
+        let mut drop_pending_keys = Vec::new();
+        self.slots.retain(|hash, slot| {
+            if matches!(slot, Slot::Rejected) || keep(hash) {
+                return true;
+            }
+            match slot {
+                Slot::Known => drop_known += 1,
+                Slot::Pending(_) => {
+                    drop_pending += 1;
+                    drop_pending_keys.push(*hash);
+                }
+                Slot::KnownPending(_) => {
+                    drop_known += 1;
+                    drop_pending += 1;
+                    drop_pending_keys.push(*hash);
+                }
+                Slot::Missing => drop_missing += 1,
+                Slot::Rejected => {}
+            }
+            false
+        });
+        for hash in drop_pending_keys {
+            self.pending_keys.remove(&hash);
+        }
+        self.known -= drop_known;
+        self.pending -= drop_pending;
+        self.missing -= drop_missing;
     }
 }

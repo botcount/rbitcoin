@@ -14,7 +14,7 @@ use crate::scripthash_layout::ShHeadValue;
 use crate::scripthash_pages::{
     sh_page_entries_into, sh_page_extent_creates, sh_page_set_extent_creates,
 };
-use rbitcoin_primitives::Fk;
+use rbitcoin_primitives::{le_u16, le_u64, Fk};
 #[cfg(debug_assertions)]
 use std::cell::Cell;
 use std::collections::BTreeSet;
@@ -1311,10 +1311,10 @@ pub fn read_undo(body: &TableFile) -> Result<Option<UndoRec>, StoreError> {
         return Ok(None);
     }
     let tag = buf[4];
-    let index = u16::from_le_bytes(buf[6..8].try_into().unwrap());
-    let target = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let image = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-    let head_off = u64::from_le_bytes(buf[24..32].try_into().unwrap());
+    let index = le_u16!(buf, 6);
+    let target = le_u64!(buf, 8);
+    let image = le_u64!(buf, 16);
+    let head_off = le_u64!(buf, 24);
     let mut old = [0u8; 8];
     old.copy_from_slice(&buf[32..40]);
     if target == 0

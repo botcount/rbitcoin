@@ -13,10 +13,13 @@ test = false
 doctest = false
 
 [features]
-mutants = []
+# Nightly cargo-mutants only. Off for the node build.
+mutants = ["dep:mutants"]
 
 
 [dependencies]
+# Attribute only. cargo-mutants reads it; it does not change compiled code.
+mutants = { version = "0.0.4", optional = true }
 rbitcoin-primitives = { workspace = true }
 rbitcoin-log = { workspace = true }
 rbitcoin-query = { workspace = true }
@@ -31,9 +34,16 @@ tokio = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 [[test]]
 name = "suite"
 path = "tests/suite.rs"
+
+[[test]]
+name = "listener_limits"
+path = "tests/listener_limits.rs"
 
 [lints]
 workspace = true

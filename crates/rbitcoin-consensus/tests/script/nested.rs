@@ -711,6 +711,8 @@ fn try_nested_matching_hash_enters_witness_verify() {
     ss2.extend_from_slice(&redeem_wpkh);
     let mut tx2 = dummy_tx();
     tx2.input[0].script_sig = ScriptBuf::from_bytes(ss2);
+    tx2.input[0].witness =
+        Witness::from_slice(&[&[0x30, 0x06, 0x02, 0x01, 0x01, 0x01][..], &[0x02; 33][..]]);
     let job2 = {
         let txid = [0u8; 32];
         let prevouts = vec![TxOut {
@@ -739,14 +741,16 @@ fn try_nested_matching_hash_enters_witness_verify() {
         ScriptCheckJob::with_txid(txid, prevouts, tx, flags)
     };
     let mut cache = SighashCache::new(&*job2.tx);
-    assert!(matches!(
-        try_nested(
-            &job2,
-            &mut cache,
-            &rbitcoin_consensus::TxScriptPrecompute::from_tx(&job2.tx)
-        ),
-        Some(Err(_))
-    ));
+    // Policy flags are off and the witness has two items, so this is the
+    // typed P2WPKH path.
+    let err = try_nested(
+        &job2,
+        &mut cache,
+        &rbitcoin_consensus::TxScriptPrecompute::from_tx(&job2.tx),
+    )
+    .expect("nested")
+    .expect_err("pubkey hash");
+    assert!(format!("{err}").contains("p2wpkh pubkey hash"), "{err}");
 
     // Legacy OP_TRUE redeem succeeds (require_true_top path).
     let redeem = vec![0x51]; // OP_TRUE

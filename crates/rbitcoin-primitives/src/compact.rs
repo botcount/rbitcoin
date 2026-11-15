@@ -48,24 +48,24 @@ pub fn read_compact_size(buf: &[u8]) -> Result<(u64, usize), PackError> {
     match buf[0] {
         n @ 0..=252 => Ok((u64::from(n), 1)),
         253 => {
-            if buf.len() < 3 {
+            let Some(raw) = buf.first_chunk::<3>() else {
                 return Err(PackError("compact size u16 truncated"));
-            }
-            let v = u16::from_le_bytes([buf[1], buf[2]]);
+            };
+            let v = crate::le_u16!(raw, 1);
             Ok((u64::from(v), 3))
         }
         254 => {
-            if buf.len() < 5 {
+            let Some(raw) = buf.first_chunk::<5>() else {
                 return Err(PackError("compact size u32 truncated"));
-            }
-            let v = u32::from_le_bytes(buf[1..5].try_into().unwrap());
+            };
+            let v = crate::le_u32!(raw, 1);
             Ok((u64::from(v), 5))
         }
         255 => {
-            if buf.len() < 9 {
+            let Some(raw) = buf.first_chunk::<9>() else {
                 return Err(PackError("compact size u64 truncated"));
-            }
-            let v = u64::from_le_bytes(buf[1..9].try_into().unwrap());
+            };
+            let v = crate::le_u64!(raw, 1);
             Ok((v, 9))
         }
     }
@@ -81,29 +81,39 @@ pub fn uleb128_len(mut n: u64) -> usize {
     len
 }
 
-pub fn write_uleb128_into(dst: &mut [u8], mut n: u64) -> Result<usize, PackError> {
+fn emit_uleb128(mut n: u64, mut emit: impl FnMut(u8)) -> usize {
     let mut i = 0usize;
     loop {
-        if i >= dst.len() {
-            return Err(PackError("uleb128 dest short"));
-        }
         let mut b = (n & 0x7f) as u8;
         n >>= 7;
         if n != 0 {
             b |= 0x80;
         }
-        dst[i] = b;
+        emit(b);
         i += 1;
         if n == 0 {
-            return Ok(i);
+            return i;
         }
     }
 }
 
+pub fn write_uleb128_into(dst: &mut [u8], n: u64) -> Result<usize, PackError> {
+    let mut i = 0usize;
+    let used = emit_uleb128(n, |b| {
+        if let Some(slot) = dst.get_mut(i) {
+            *slot = b;
+        }
+        i += 1;
+    });
+    if used > dst.len() {
+        Err(PackError("uleb128 dest short"))
+    } else {
+        Ok(used)
+    }
+}
+
 pub fn write_uleb128(out: &mut Vec<u8>, n: u64) {
-    let mut tmp = [0u8; 10];
-    let used = write_uleb128_into(&mut tmp, n).expect("10-byte stack holds any u64 uleb128");
-    out.extend_from_slice(&tmp[..used]);
+    emit_uleb128(n, |b| out.push(b));
 }
 
 pub fn read_uleb128(buf: &[u8]) -> Result<(u64, usize), PackError> {

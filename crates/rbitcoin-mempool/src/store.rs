@@ -30,6 +30,7 @@ use crate::packed::{
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Transaction, Txid, Wtxid};
+use rbitcoin_primitives::{bytes, le_u16, le_u32, le_u64};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -58,6 +59,14 @@ pub const MAX_SLOT_CAP: u32 = 1_048_576;
 /// session. Schema 4 already had these bytes. Older files leave them 0.
 #[doc(hidden)]
 pub const SLOT_REC: usize = 48;
+
+/// One slot record. `off` names a record inside a table of
+/// `SLOTS_HEADER + cap * SLOT_REC` bytes.
+pub(crate) fn slot_rec(slots: &[u8], off: usize) -> [u8; SLOT_REC] {
+    let mut rec = [0u8; SLOT_REC];
+    rec.copy_from_slice(&slots[off..off + SLOT_REC]);
+    rec
+}
 #[doc(hidden)]
 pub const SLOTS_HEADER: usize = 16;
 #[doc(hidden)]
@@ -178,12 +187,15 @@ impl Mempool {
             #[cfg(debug_assertions)]
             slots_syncs: 0,
         };
-        let body_schema = u16::from_le_bytes(mp.body[4..6].try_into().unwrap());
+        let mut body_hdr = [0u8; BODY_HEADER];
+        body_hdr.copy_from_slice(&mp.body[..BODY_HEADER]);
+        let body_schema = le_u16!(body_hdr, 4);
+        let mut slots_hdr = [0u8; SLOTS_HEADER];
+        slots_hdr.copy_from_slice(&mp.slots[..SLOTS_HEADER]);
+        let slots_schema = le_u16!(slots_hdr, 4);
         if body_schema != MEM_SCHEMA {
             mp.migrate_to_current(body_schema)?;
-        } else if meta_schema != MEM_SCHEMA
-            || u16::from_le_bytes(mp.slots[4..6].try_into().unwrap()) != MEM_SCHEMA
-        {
+        } else if meta_schema != MEM_SCHEMA || slots_schema != MEM_SCHEMA {
             // Crash after the migrate renamed body+slots, before meta.
             mp.slots[4..6].copy_from_slice(&MEM_SCHEMA.to_le_bytes());
             mp.body[4..6].copy_from_slice(&MEM_SCHEMA.to_le_bytes());
@@ -312,7 +324,8 @@ impl Mempool {
             if self.slots[off] != SLOT_LIVE {
                 continue;
             }
-            let body_off = u64::from_le_bytes(self.slots[off + 4..off + 12].try_into().unwrap());
+            let rec = slot_rec(&self.slots, off);
+            let body_off = le_u64!(rec, 4);
             if body_off < old_persisted {
                 continue;
             }
@@ -415,9 +428,9 @@ impl Mempool {
         if self.slots[off] != SLOT_LIVE {
             return Ok(());
         }
-        let body_off = u64::from_le_bytes(self.slots[off + 4..off + 12].try_into().unwrap());
-        let body_len =
-            u32::from_le_bytes(self.slots[off + 12..off + 16].try_into().unwrap()) as u64;
+        let rec = slot_rec(&self.slots, off);
+        let body_off = le_u64!(rec, 4);
+        let body_len = le_u32!(rec, 12) as u64;
         self.slots[off] = SLOT_DEAD;
         self.live_count = self.live_count.saturating_sub(1);
         if body_off.saturating_add(body_len) <= self.body_persisted_len {
@@ -482,9 +495,9 @@ impl Mempool {
             if self.slots[off] != SLOT_LIVE {
                 continue;
             }
-            let body_off = u64::from_le_bytes(self.slots[off + 4..off + 12].try_into().unwrap());
-            let body_len =
-                u32::from_le_bytes(self.slots[off + 12..off + 16].try_into().unwrap()) as usize;
+            let rec = slot_rec(&self.slots, off);
+            let body_off = le_u64!(rec, 4);
+            let body_len = le_u32!(rec, 12) as usize;
             if body_off as usize + body_len > logical || body_len < BODY_TX_PREFIX {
                 return Err(MempoolError::Corrupt("live slot body range"));
             }
@@ -540,9 +553,9 @@ impl Mempool {
             if self.slots[off] != SLOT_LIVE {
                 continue;
             }
-            let body_off = u64::from_le_bytes(self.slots[off + 4..off + 12].try_into().unwrap());
-            let body_len =
-                u32::from_le_bytes(self.slots[off + 12..off + 16].try_into().unwrap()) as usize;
+            let rec = slot_rec(&self.slots, off);
+            let body_off = le_u64!(rec, 4);
+            let body_len = le_u32!(rec, 12) as usize;
             if body_off as usize + body_len > logical || body_len < V1_BODY_PREFIX {
                 return Err(MempoolError::Corrupt("legacy live slot body range"));
             }
@@ -550,9 +563,11 @@ impl Mempool {
             let old = if from == 1 {
                 let tx: Transaction = deserialize(&rec[V1_BODY_PREFIX..])
                     .map_err(|_| MempoolError::Corrupt("v1 tx deserialize"))?;
+                let mut head = [0u8; V1_BODY_PREFIX];
+                head.copy_from_slice(&rec[..V1_BODY_PREFIX]);
                 PackedLive {
-                    fee_sat: u64::from_le_bytes(rec[0..8].try_into().unwrap()),
-                    weight: u64::from_le_bytes(rec[8..16].try_into().unwrap()),
+                    fee_sat: le_u64!(head, 0),
+                    weight: le_u64!(head, 8),
                     sigop_cost: None,
                     accept_secs: 0,
                     txid: tx.compute_txid(),
@@ -613,7 +628,8 @@ impl Mempool {
         if self.slots[off] != SLOT_LIVE {
             return Err(MempoolError::Corrupt("sigops on non-live slot"));
         }
-        let body_off = u64::from_le_bytes(self.slots[off + 4..off + 12].try_into().unwrap());
+        let rec = slot_rec(&self.slots, off);
+        let body_off = le_u64!(rec, 4);
         let at = body_off as usize + SIGOP_COST_OFF;
         self.body[at..at + 8].copy_from_slice(&cost.to_le_bytes());
         let path = self.dir.join("tx.body");
@@ -635,10 +651,13 @@ impl Mempool {
         if self.slots[off] != SLOT_LIVE {
             return None;
         }
-        let body_off = u64::from_le_bytes(self.slots[off + 4..off + 12].try_into().unwrap());
+        let rec = slot_rec(&self.slots, off);
+        let body_off = le_u64!(rec, 4);
         let at = body_off as usize + ACCEPT_SECS_OFF;
         let bytes = self.body.get(at..at + 8)?;
-        Some(u64::from_le_bytes(bytes.try_into().unwrap()))
+        let mut word = [0u8; 8];
+        word.copy_from_slice(bytes);
+        Some(le_u64!(word, 0))
     }
 
     /// Load LIVE txs whose packed bytes sit inside the logical body.
@@ -654,9 +673,9 @@ impl Mempool {
             if self.slots[off] != SLOT_LIVE {
                 continue;
             }
-            let body_off = u64::from_le_bytes(self.slots[off + 4..off + 12].try_into().unwrap());
-            let body_len =
-                u32::from_le_bytes(self.slots[off + 12..off + 16].try_into().unwrap()) as u64;
+            let rec = slot_rec(&self.slots, off);
+            let body_off = le_u64!(rec, 4);
+            let body_len = le_u32!(rec, 12) as u64;
             if live_slot_past_body(body_off, body_len, logical) {
                 continue;
             }
@@ -665,8 +684,7 @@ impl Mempool {
             }
             let start = body_off as usize;
             let packed = decode_packed_live(&self.body[start..start + body_len as usize])?;
-            let slot_txid =
-                Txid::from_byte_array(self.slots[off + 16..off + 48].try_into().unwrap());
+            let slot_txid = Txid::from_byte_array(bytes!(rec, 16, 32));
             if packed.txid != slot_txid {
                 return Err(MempoolError::Corrupt("live slot txid"));
             }
@@ -692,9 +710,9 @@ impl Mempool {
             if self.slots[off] != SLOT_LIVE {
                 continue;
             }
-            let body_off = u64::from_le_bytes(self.slots[off + 4..off + 12].try_into().unwrap());
-            let body_len =
-                u32::from_le_bytes(self.slots[off + 12..off + 16].try_into().unwrap()) as u64;
+            let rec = slot_rec(&self.slots, off);
+            let body_off = le_u64!(rec, 4);
+            let body_len = le_u32!(rec, 12) as u64;
             if !live_slot_past_body(body_off, body_len, logical) {
                 continue;
             }
@@ -899,9 +917,9 @@ impl Mempool {
             if self.slots[off] != SLOT_LIVE {
                 continue;
             }
-            let body_off = u64::from_le_bytes(self.slots[off + 4..off + 12].try_into().unwrap());
-            let body_len =
-                u32::from_le_bytes(self.slots[off + 12..off + 16].try_into().unwrap()) as u64;
+            let rec = slot_rec(&self.slots, off);
+            let body_off = le_u64!(rec, 4);
+            let body_len = le_u32!(rec, 12) as u64;
             if body_off.saturating_add(body_len) > self.body_persisted_len {
                 let img = disk.get_or_insert_with(|| self.slots.clone());
                 img[off] = SLOT_FREE;
@@ -1019,7 +1037,9 @@ pub fn body_logical_len(body: &[u8]) -> Result<usize, MempoolError> {
     if body.len() < BODY_HEADER {
         return Err(MempoolError::Corrupt("body too short"));
     }
-    let n = u64::from_le_bytes(body[8..16].try_into().unwrap()) as usize;
+    let mut hdr = [0u8; BODY_HEADER];
+    hdr.copy_from_slice(&body[..BODY_HEADER]);
+    let n = le_u64!(hdr, 8) as usize;
     if n < BODY_HEADER || n > body.len() {
         return Err(MempoolError::Corrupt("body logical len"));
     }
@@ -1112,9 +1132,9 @@ pub fn open_or_init_meta(path: &Path) -> Result<(File, u64, u32, u32, u16), Memp
             return Err(MempoolError::BadMagic);
         }
         let schema = accepted_schema(u16::from_le_bytes([buf[4], buf[5]]))?;
-        let generation = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-        let slot_cap = u32::from_le_bytes(buf[16..20].try_into().unwrap());
-        let live_count = u32::from_le_bytes(buf[20..24].try_into().unwrap());
+        let generation = le_u64!(buf, 8);
+        let slot_cap = le_u32!(buf, 16);
+        let live_count = le_u32!(buf, 20);
         if slot_cap == 0 {
             return Err(MempoolError::Corrupt("slot_cap zero"));
         }

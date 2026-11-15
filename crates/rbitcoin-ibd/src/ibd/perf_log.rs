@@ -1212,9 +1212,6 @@ pub fn ser_process_owned<S: serde::Serializer>(
     serde_json::json!({
         "conf_plans": o.conf_plans,
         "sh_runs": o.sh_runs,
-        "inflight_layers": o.inflight_layers,
-        "inflight_pins": o.inflight_pins,
-        "inflight_bytes": o.inflight_bytes,
         "h2h_keys": o.h2h_keys,
         "fence_runs": o.fence_runs,
         "bq_promoted": o.bq_promoted,

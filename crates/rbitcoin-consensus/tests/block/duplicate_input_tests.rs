@@ -5,7 +5,7 @@ use bitcoin::{
     Amount, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
     TxMerkleNode, TxOut, Txid, Witness,
 };
-use rbitcoin_consensus::block::validate_block_structure;
+use rbitcoin_consensus::block::{validate_block_structure, JobPrevouts};
 use rbitcoin_consensus::{ChainParams, ConsensusError, ValidationContext, REGTEST_POW_BITS};
 
 fn ctx() -> ValidationContext<'static> {
@@ -88,6 +88,9 @@ fn duplicate_input_is_one_set_for_the_block() {
     let dup = tx_with(vec![spend(2, 0), spend(2, 0)]);
     assert_dup(validate_block_structure(&block_with(vec![coinbase(), dup]), &ctx()).unwrap_err());
 
+    let dup3 = tx_with(vec![spend(3, 0), spend(4, 0), spend(3, 0)]);
+    assert_dup(validate_block_structure(&block_with(vec![coinbase(), dup3]), &ctx()).unwrap_err());
+
     let mut cb = coinbase();
     cb.input.push(cb.input[0].clone());
     assert_dup(validate_block_structure(&block_with(vec![cb]), &ctx()).unwrap_err());
@@ -108,4 +111,36 @@ fn duplicate_input_is_one_set_for_the_block() {
     }
     validate_block_structure(&block_with(vec![coinbase(), tx_with(input)]), &ctx())
         .expect("64 unique inputs");
+}
+
+#[test]
+fn job_prevouts_empty_follows_len() {
+    let empty = JobPrevouts::owned(Vec::new());
+    assert!(empty.is_empty());
+    assert_eq!(empty.len(), 0);
+    let one = JobPrevouts::owned(vec![TxOut {
+        value: Amount::from_sat(1),
+        script_pubkey: ScriptBuf::new(),
+    }]);
+    assert!(!one.is_empty());
+    assert_eq!(one.len(), 1);
+}
+
+/// CheckTransaction's output walk. `i64::MAX` still fits the wire `u64` and is
+/// too-large money, not a negative amount. One sat past it is negative.
+#[test]
+fn output_at_i64_max_is_too_large_not_negative() {
+    let mut tx = coinbase();
+    tx.output[0].value = Amount::from_sat(i64::MAX as u64);
+    let err = rbitcoin_consensus::block::tx_value_out(&tx).unwrap_err();
+    assert!(
+        matches!(err, ConsensusError::BadTx(s) if s.contains("vout-toolarge")),
+        "{err:?}"
+    );
+    tx.output[0].value = Amount::from_sat((i64::MAX as u64).saturating_add(1));
+    let err = rbitcoin_consensus::block::tx_value_out(&tx).unwrap_err();
+    assert!(
+        matches!(err, ConsensusError::BadTx(s) if s.contains("vout-negative")),
+        "{err:?}"
+    );
 }

@@ -25,8 +25,8 @@ mod eviction;
 mod fee_history;
 mod fee_history_file;
 mod i2p_sam;
-#[cfg(windows)]
 mod listen;
+mod log_burst;
 mod most_work;
 mod msg_decode;
 mod net_permissions;
@@ -43,6 +43,7 @@ mod service;
 mod socks;
 mod tip_accept;
 mod tx_relay;
+mod unconfirmed_script;
 mod v1;
 mod v2;
 mod versionbits_warn;

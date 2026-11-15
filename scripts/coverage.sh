@@ -18,7 +18,7 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-# Core JSON corpora are staged from the v32.1 submodule (not in-tree copies).
+# Core JSON corpora are staged from the pinned submodule (not in-tree copies).
 ./scripts/core-functional/init-submodule.sh
 
 # `cargo llvm-cov test` builds `journey-node` when a journey execs it.

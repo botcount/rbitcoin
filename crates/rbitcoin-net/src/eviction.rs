@@ -75,29 +75,64 @@ pub fn select_inbound_eviction(mut cands: Vec<InboundEvictCandidate>) -> Option<
             .then_with(|| a.id.cmp(&b.id))
     });
     remove_first_k(&mut cands, PROTECT_LONGEST);
-    if cands.is_empty() {
-        return None;
-    }
-
     // Newest peer in the largest netgroup. Group ids are the integers stored
     // at accept; this compares those integers and does not read asmap.
-    let mut counts = std::collections::HashMap::<u64, usize>::new();
-    for c in &cands {
-        *counts.entry(c.netgroup).or_insert(0) += 1;
+    let left = NonEmptyCands::new(&cands)?;
+    Some(newest_in_largest_group(left))
+}
+
+/// A candidate slice that has at least one peer.
+struct NonEmptyCands<'a>(&'a [InboundEvictCandidate]);
+
+impl<'a> NonEmptyCands<'a> {
+    fn new(cands: &'a [InboundEvictCandidate]) -> Option<Self> {
+        if cands.is_empty() {
+            None
+        } else {
+            Some(Self(cands))
+        }
     }
-    let (group, _) = counts
-        .into_iter()
-        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
-        .expect("at least one candidate");
-    cands
-        .iter()
-        .filter(|c| c.netgroup == group)
-        .max_by(|a, b| {
-            a.connected_at
-                .cmp(&b.connected_at)
-                .then_with(|| a.id.cmp(&b.id))
-        })
-        .map(|c| c.id)
+}
+
+/// Largest netgroup, ties to the smaller group id. Newest `connected_at`,
+/// then the higher id, inside that group.
+fn newest_in_largest_group(cands: NonEmptyCands<'_>) -> u64 {
+    use std::collections::HashMap;
+    struct GroupScore {
+        count: usize,
+        connected_at: u64,
+        id: u64,
+    }
+    let mut groups: HashMap<u64, GroupScore> = HashMap::new();
+    for c in cands.0 {
+        groups
+            .entry(c.netgroup)
+            .and_modify(|g| {
+                g.count += 1;
+                if c.connected_at > g.connected_at
+                    || (c.connected_at == g.connected_at && c.id > g.id)
+                {
+                    g.connected_at = c.connected_at;
+                    g.id = c.id;
+                }
+            })
+            .or_insert(GroupScore {
+                count: 1,
+                connected_at: c.connected_at,
+                id: c.id,
+            });
+    }
+    let mut best_group = cands.0[0].netgroup;
+    let mut best_count = groups[&best_group].count;
+    let mut best_id = groups[&best_group].id;
+    for (group, score) in &groups {
+        if score.count > best_count || (score.count == best_count && *group < best_group) {
+            best_group = *group;
+            best_count = score.count;
+            best_id = score.id;
+        }
+    }
+    best_id
 }
 
 #[doc(hidden)]

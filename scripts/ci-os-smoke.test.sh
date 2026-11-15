@@ -32,8 +32,8 @@ assert_ok "dry-run lists query SH-cap confirm" \
   grep -q "sh_history_caps" <<<"$out"
 assert_ok "dry-run has no skips off Windows" \
   grep -qx "skip=" <<<"$out"
-assert_ok "dry-run lists SH RAM / host_mem probes" \
-  grep -q "sorted_run::host_mem" <<<"$out"
+assert_ok "dry-run lists SH RAM / mem_available probes" \
+  grep -q "sorted_run::mem_available" <<<"$out"
 assert_ok "dry-run lists Darwin vm page math" \
   grep -q "sorted_run::darwin_vm" <<<"$out"
 assert_ok "dry-run lists the default IO session per OS" \

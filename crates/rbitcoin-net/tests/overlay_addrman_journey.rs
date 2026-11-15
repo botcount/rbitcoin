@@ -151,7 +151,7 @@ fn only_net_dials_and_peers_file(am: &Mutex<rbitcoin_net::seeds::AddrMan>, overl
     let mut only = book.clone();
     only.set_only_net(vec![OnlyNet::Onion]);
     assert_eq!(
-        only.take_dial_candidates_net(8, &HashSet::new(), &[]),
+        only.take_dial_candidates_net(8, &HashSet::new(), &[], false),
         vec![onion]
     );
     assert!(only
@@ -160,7 +160,7 @@ fn only_net_dials_and_peers_file(am: &Mutex<rbitcoin_net::seeds::AddrMan>, overl
 
     let mut only = book.clone();
     only.set_only_net(vec![OnlyNet::I2p]);
-    let got = only.take_dial_candidates_net(8, &HashSet::new(), &[]);
+    let got = only.take_dial_candidates_net(8, &HashSet::new(), &[], false);
     assert!(got.contains(&i2p), "{got:?}");
     assert!(
         got.iter().all(|a| matches!(a, rbitcoin_net::NetAddr::I2p { .. })),
@@ -184,7 +184,7 @@ fn only_net_dials_and_peers_file(am: &Mutex<rbitcoin_net::seeds::AddrMan>, overl
         mixed.add(SocketAddr::from((Ipv4Addr::new(10, 0, 0, i), 8333)));
     }
     mixed.add_addr(onion);
-    let got = mixed.take_dial_candidates_net(8, &HashSet::new(), &[]);
+    let got = mixed.take_dial_candidates_net(8, &HashSet::new(), &[], false);
     assert_eq!(got.len(), 8, "{got:?}");
     assert!(
         got.contains(&onion),
@@ -197,7 +197,7 @@ fn only_net_dials_and_peers_file(am: &Mutex<rbitcoin_net::seeds::AddrMan>, overl
         port: 8333,
     };
     failed.add_addr(fresh);
-    let got = failed.take_dial_candidates_net(8, &HashSet::new(), &[]);
+    let got = failed.take_dial_candidates_net(8, &HashSet::new(), &[], false);
     assert!(
         got.contains(&fresh) && !got.contains(&onion),
         "a failed onion loses to a fresh one: {got:?}"
@@ -228,7 +228,7 @@ fn only_net_dials_and_peers_file(am: &Mutex<rbitcoin_net::seeds::AddrMan>, overl
     fresh_ip.note_connect_failed_addr(tired_onion, false);
     fresh_ip.add_addr(bad_onion);
     fresh_ip.note_connect_failed_addr(bad_onion, true);
-    let got = fresh_ip.take_dial_candidates_net(8, &HashSet::new(), &[]);
+    let got = fresh_ip.take_dial_candidates_net(8, &HashSet::new(), &[], false);
     assert!(
         !got.contains(&tired_onion) && !got.contains(&bad_onion),
         "a fresh clearnet drops last-resort and incompatible overlays: {got:?}"
@@ -241,7 +241,7 @@ fn only_net_dials_and_peers_file(am: &Mutex<rbitcoin_net::seeds::AddrMan>, overl
     tired_ip.note_connect_failed_addr(rbitcoin_net::NetAddr::from_socket(tired_clear), false);
     tired_ip.add_addr(tired_onion);
     tired_ip.note_connect_failed_addr(tired_onion, false);
-    let got = tired_ip.take_dial_candidates_net(4, &HashSet::new(), &[]);
+    let got = tired_ip.take_dial_candidates_net(4, &HashSet::new(), &[], false);
     assert!(
         got.contains(&tired_onion),
         "a last-resort clearnet is not a fresh batch: {got:?}"
@@ -251,7 +251,7 @@ fn only_net_dials_and_peers_file(am: &Mutex<rbitcoin_net::seeds::AddrMan>, overl
     only_bad.set_onion_reachable(true);
     only_bad.add_addr(bad_onion);
     only_bad.note_connect_failed_addr(bad_onion, true);
-    let got = only_bad.take_dial_candidates_net(4, &HashSet::new(), &[]);
+    let got = only_bad.take_dial_candidates_net(4, &HashSet::new(), &[], false);
     assert!(
         got.contains(&bad_onion),
         "an incompatible overlay is still dialed when nothing else is: {got:?}"
@@ -266,7 +266,7 @@ fn only_net_dials_and_peers_file(am: &Mutex<rbitcoin_net::seeds::AddrMan>, overl
     mix.add_addr(good_onion);
     mix.add_addr(bad_onion);
     mix.note_connect_failed_addr(bad_onion, true);
-    let got = mix.take_dial_candidates_net(4, &HashSet::new(), &[]);
+    let got = mix.take_dial_candidates_net(4, &HashSet::new(), &[], false);
     assert!(
         got.contains(&good_onion) && !got.contains(&bad_onion),
         "without a fresh clearnet, incompatible overlays lose to a compatible one: {got:?}"
@@ -275,7 +275,7 @@ fn only_net_dials_and_peers_file(am: &Mutex<rbitcoin_net::seeds::AddrMan>, overl
     sole_recent.set_onion_reachable(true);
     sole_recent.add_addr(good_onion);
     sole_recent.note_attempt_addr(good_onion);
-    let got = sole_recent.take_dial_candidates_net(4, &HashSet::new(), &[]);
+    let got = sole_recent.take_dial_candidates_net(4, &HashSet::new(), &[], false);
     assert!(
         got.contains(&good_onion),
         "a sole recent overlay is still dialed: {got:?}"
@@ -365,7 +365,7 @@ fn overlay_config() {
             rbitcoin_net::NetAddr::Onion { .. } => one.set_onion_reachable(true),
             rbitcoin_net::NetAddr::I2p { .. } => one.set_i2p_reachable(true),
             rbitcoin_net::NetAddr::Cjdns { .. } => one.set_cjdns_reachable(true),
-            rbitcoin_net::NetAddr::Ip(_) => {}
+            rbitcoin_net::NetAddr::Ip(_) | rbitcoin_net::NetAddr::Name { .. } => {}
         }
         one.add_addr(addr);
         hub.set_addrman(Arc::new(Mutex::new(one)));

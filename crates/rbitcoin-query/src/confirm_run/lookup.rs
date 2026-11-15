@@ -1025,6 +1025,13 @@ pub fn lookup_bind_archive_plan(
 ) -> Result<(Option<crate::ArchiveWritePlan>, u64, u64), ConfirmError> {
     let t_filter = Instant::now();
     let header_fks: Vec<rbitcoin_primitives::Fk> = metas.iter().map(|m| m.header_fk).collect();
+    if query.prune_seqsigwit() {
+        for (meta, block) in metas.iter().zip(wire_blocks.iter()) {
+            query
+                .note_pruned_archived_seqsigwit(meta.header_fk, block)
+                .map_err(ConfirmError::from)?;
+        }
+    }
     let need_fks = query
         .archive_filter_need_header_fks(&header_fks)
         .map_err(ConfirmError::from)?;

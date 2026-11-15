@@ -12,8 +12,16 @@ use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut};
 use bitcoin::{Transaction, Witness};
 use rbitcoin_consensus::block::ScriptCheckJob;
 use rbitcoin_consensus::script;
+use rbitcoin_consensus::script::classify::{program_len, ProgramLen};
 use rbitcoin_consensus::script::crypto;
 use rbitcoin_consensus::script::p2tr::*;
+
+fn fixture_output_key(spk: &[u8]) -> &[u8; 32] {
+    let ProgramLen::N32(output_key) = program_len(&spk[2..]) else {
+        panic!("fixture is a 32-byte program");
+    };
+    output_key
+}
 
 fn owned_prevout_mut(job: &mut ScriptCheckJob) -> &mut TxOut {
     let rbitcoin_consensus::block::JobPrevouts::Owned(v) = &mut job.prevouts else {
@@ -546,6 +554,7 @@ fn empty_witness_and_bad_sig_len() {
             &job.tx,
             &Default::default(),
             Amount::from_sat(value),
+            fixture_output_key(script),
             script,
         )
     }
@@ -562,6 +571,7 @@ fn empty_witness_and_bad_sig_len() {
             &job2.tx,
             &Default::default(),
             Amount::from_sat(value),
+            fixture_output_key(script),
             script,
         )
     }

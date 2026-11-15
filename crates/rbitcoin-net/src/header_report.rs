@@ -9,6 +9,15 @@ use std::sync::Arc;
 
 type HeaderPoint = (BlockHash, u32);
 
+/// A stored prefix covers `hash` at `height` when it is that header, or an
+/// ancestor: a different hash strictly below `height`.
+fn prefix_point_covers(point: HeaderPoint, hash: BlockHash, height: u32) -> bool {
+    matches!(
+        (point.0.cmp(&hash).is_eq(), point.1.cmp(&height)),
+        (true, std::cmp::Ordering::Equal) | (false, std::cmp::Ordering::Less)
+    )
+}
+
 /// Reporting generation captured before loading or validating an IBD walk.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IbdHeaderEpoch(u64);
@@ -112,9 +121,12 @@ impl ChainHub {
         });
         let fast = (epoch == report.epoch && report.invalid.is_empty())
             || reusable.is_some_and(|p| {
-                target.is_none_or(|h| {
-                    report.ibd_height.is_some_and(|old| h <= old)
-                        || (report.ibd_height == p.anchors.last().map(|a| a.1) && h <= p.safe_until)
+                target.is_none_or(|h| match report.ibd_height {
+                    Some(old) if Some(old) == p.anchors.last().map(|a| a.1) => {
+                        h <= old || h <= p.safe_until
+                    }
+                    Some(old) => h <= old,
+                    None => false,
                 })
             });
         let safe_until = if report.invalid.is_empty() {
@@ -135,6 +147,7 @@ impl ChainHub {
                 .and(report.ibd_height)
                 .zip(target)
                 .map(|(old, new)| old.min(new));
+            report.revision = report.revision.wrapping_add(1);
         }
         let current = report.epoch;
         report.ibd = (!anchors.is_empty()).then_some(IbdProof {
@@ -144,9 +157,6 @@ impl ChainHub {
             safe_until,
         });
         report.dirty |= !fast;
-        if !fast {
-            report.revision = report.revision.wrapping_add(1);
-        }
         report.refresh_height();
         fast.then_some(current)
     }
@@ -181,13 +191,7 @@ impl ChainHub {
             .into_iter()
             .filter_map(|(hash, height)| {
                 self.stored_header_prefix(hash, &context.invalid, &context.proved)
-                    .filter(|point| {
-                        if point.0 == hash {
-                            point.1 == height
-                        } else {
-                            point.1 < height
-                        }
-                    })
+                    .filter(|point| prefix_point_covers(*point, hash, height))
                     .map(|point| (hash, point))
             })
             .collect();
@@ -197,7 +201,10 @@ impl ChainHub {
             .map(|p| self.check_ibd_header_proof(&p.anchors, &context));
         let tips = self.header_tips.read().unwrap();
         let mut report = self.header_report.write().unwrap();
-        if report.epoch != context.epoch || report.revision != context.revision {
+        if report.epoch != context.epoch {
+            return;
+        }
+        if report.revision != context.revision {
             return;
         }
         for (hash, height) in valid {
@@ -206,16 +213,16 @@ impl ChainHub {
             }
         }
         let proof_matches = match (&proof, &report.ibd) {
-            (Some(a), Some(b)) => a.anchors == b.anchors && a.epoch == b.epoch,
-            (None, None) => true,
+            (Some(a), Some(b)) => {
+                (a.anchors.as_slice(), a.epoch) == (b.anchors.as_slice(), b.epoch)
+            }
+            (None, other) => other.is_none(),
             _ => false,
         };
         if let (Some(proof), Some(checked)) = (proof, checked) {
-            if report
-                .ibd
-                .as_ref()
-                .is_some_and(|p| p.anchors == proof.anchors && p.epoch == proof.epoch)
-            {
+            if report.ibd.as_ref().is_some_and(|p| {
+                (p.anchors.as_slice(), p.epoch) == (proof.anchors.as_slice(), proof.epoch)
+            }) {
                 report.ibd_height = checked.height;
                 report.ibd = Some(IbdProof {
                     epoch: context.epoch,
@@ -271,7 +278,11 @@ impl ChainHub {
         };
         let directly_invalid = {
             let invalid = self.invalidated.set.read().unwrap();
-            invalid.contains(&hash) || invalid.contains(&prev)
+            if invalid.contains(&hash) {
+                true
+            } else {
+                invalid.contains(&prev)
+            }
         };
         let proof = if !directly_invalid && (connected || parent_proof.is_some_and(|p| p.0 == prev))
         {
@@ -289,8 +300,8 @@ impl ChainHub {
         }
         tips.insert(hash, prev, height);
         let mut report = self.header_report.write().unwrap();
-        let stale = epoch != report.epoch;
-        if !stale {
+        let current = epoch == report.epoch;
+        if current {
             if let Some(proof) = proof {
                 report.stored.insert(hash, proof);
             }
@@ -299,7 +310,7 @@ impl ChainHub {
         report.refresh_height();
         drop(report);
         drop(tips);
-        if stale {
+        if !current {
             self.refresh_stored_header_tip(hash, height);
         }
     }
@@ -315,19 +326,16 @@ impl ChainHub {
         let context = self.header_report.read().unwrap().context();
         let Some(prefix) = self
             .stored_header_prefix(hash, &context.invalid, &context.proved)
-            .filter(|p| {
-                if p.0 == hash {
-                    p.1 == height
-                } else {
-                    p.1 < height
-                }
-            })
+            .filter(|p| prefix_point_covers(*p, hash, height))
         else {
             return;
         };
         let tips = self.header_tips.read().unwrap();
         let mut report = self.header_report.write().unwrap();
-        if report.epoch == context.epoch && tips.contains(&hash) {
+        if report.epoch != context.epoch {
+            return;
+        }
+        if tips.contains(&hash) {
             report.stored.insert(hash, prefix);
             report.refresh_height();
         }
@@ -356,7 +364,10 @@ impl ChainHub {
         loop {
             let hash = BlockHash::from_byte_array(rec.hash);
             if invalid.contains(&hash) {
-                if rec.prev_fk.is_null() || rec.prev_fk.0 >= fk.0 {
+                if rec.prev_fk.is_null() {
+                    return None;
+                }
+                if rec.prev_fk.0 >= fk.0 {
                     return None;
                 }
                 fk = rec.prev_fk;
@@ -373,7 +384,10 @@ impl ChainHub {
                 return Some((prefix, height.checked_add(depth)?));
             }
             if rec.prev_fk.is_null() {
-                return (hash == self.params.genesis_hash).then_some((prefix, depth));
+                if hash != self.params.genesis_hash {
+                    return None;
+                }
+                return Some((prefix, depth));
             }
             if rec.prev_fk.0 >= fk.0 {
                 return None;
@@ -387,7 +401,10 @@ impl ChainHub {
     fn stored_hash_at(&self, tip: BlockHash, height: u32, target: u32) -> Option<BlockHash> {
         let (mut fk, mut rec) = self.query.get_header_by_hash(tip.as_byte_array()).ok()??;
         for _ in target..height {
-            if rec.prev_fk.is_null() || rec.prev_fk.0 >= fk.0 {
+            if rec.prev_fk.is_null() {
+                return None;
+            }
+            if fk.0 <= rec.prev_fk.0 {
                 return None;
             }
             fk = rec.prev_fk;
@@ -417,9 +434,13 @@ impl ChainHub {
             .stored_header_prefix(stored, &context.invalid, &context.proved)
             .or_else(|| {
                 anchors.iter().rev().find_map(|&(hash, height)| {
-                    (self.proved_stored_header_height(hash, &context.invalid, &context.proved)
-                        == Some(height))
-                    .then_some((hash, height))
+                    let proved =
+                        self.proved_stored_header_height(hash, &context.invalid, &context.proved);
+                    if proved != Some(height) {
+                        None
+                    } else {
+                        Some((hash, height))
+                    }
                 })
             });
         let Some(valid_prefix) = valid_prefix else {
@@ -464,5 +485,22 @@ impl ChainHub {
             safe_until,
             ..prefix
         }
+    }
+}
+
+#[cfg(test)]
+mod prefix_cover {
+    use super::prefix_point_covers;
+    use bitcoin::hashes::Hash;
+    use bitcoin::BlockHash;
+
+    #[test]
+    fn a_different_hash_at_the_same_height_does_not_cover() {
+        let here = BlockHash::from_byte_array([1; 32]);
+        let other = BlockHash::from_byte_array([2; 32]);
+        assert!(prefix_point_covers((here, 5), here, 5));
+        assert!(!prefix_point_covers((other, 5), here, 5));
+        assert!(prefix_point_covers((other, 4), here, 5));
+        assert!(!prefix_point_covers((other, 6), here, 5));
     }
 }

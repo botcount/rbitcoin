@@ -3,12 +3,14 @@
 
 Maps Core TestNode argv + bitcoin.conf onto kebab rbitcoin-node flags
 (no Core aliases on the node). `-datadir=DIR` becomes `--datadir DIR/regtest`
+(or Core's `signet` / `signet_<message start>`, see `signet_datadir.py`)
 so the harness cookie lands at `DIR/regtest/.cookie` (mirrored from the
 node's `{datadir}/rpc.token` as `__cookie__:<token>`).
 
 Tests speak to a JSON-RPC proxy on `-rpcport`. The node listens on
-`rpcport+10000` and Esplora on `rpcport+20000` (not node-RPC+1: Core
-gives consecutive rpcports, so that collided across nodes).
+`rpcport+10000`. Esplora listens above the ephemeral range (61000-65535),
+not on `rpcport+20000` (that band is inside the ephemeral range) and not
+on node-RPC+1 (Core gives consecutive rpcports, so those collided).
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from map_debuglog import apply_line, load_rules, map_error_stderr
 from rpc_proxy import RpcProxy, esplora_port, node_rpc_port
 from rpc_util import register_utility
 from rpc_wallet import register_wallet
+from signet_datadir import chain_dir, parse_hex
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -109,11 +112,6 @@ def parse_kv(arg: str) -> tuple[str, str | None]:
         k, v = a.split("=", 1)
         return k, v
     return a, None
-
-
-def is_hex_script(raw: str) -> bool:
-    """Even-length hex. Odd length and empty are not a script push."""
-    return bool(raw) and len(raw) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", raw) is not None
 
 
 def parse_port(raw: str | None, flag: str) -> str:
@@ -699,15 +697,16 @@ def translate(
             file=sys.stderr,
         )
         raise SystemExit(1)
-    if len(signet_challenges) == 1:
-        raw = signet_challenges[0]
-        if not is_hex_script(raw):
+    challenge = signet_challenges[0] if signet_challenges else None
+    if challenge is not None:
+        script = parse_hex(challenge)
+        if script is None:
             print(
-                f"Error: -signetchallenge must be hex, not '{raw}'.",
+                f"Error: -signetchallenge must be hex, not '{challenge}'.",
                 file=sys.stderr,
             )
             raise SystemExit(1)
-        extra_node_args.append(f"--signet-challenge={raw}")
+        extra_node_args.append(f"--signet-challenge={script.hex()}")
 
     conf = read_conf(datadir / "bitcoin.conf")
     if conf.get("regtest") in ("1", "true"):
@@ -739,8 +738,13 @@ def translate(
 
     for v in whitebind_vals:
         apply_whitebind(v, binds, extra_node_args)
+    # Core's framework writes noban_tx_relay as a conf whitelist= line.
+    for v in read_conf_keys(datadir / "bitcoin.conf", "whitelist"):
+        if v:
+            extra_node_args.extend(node_args("whitelist", v))
 
-    node_dir = datadir / network
+    net_dir = chain_dir(network, challenge)
+    node_dir = datadir / net_dir
     node_dir.mkdir(parents=True, exist_ok=True)
     maybe_seed_store(node_dir)
 
@@ -767,7 +771,7 @@ def translate(
     if not blk0.is_file():
         blk0.write_bytes(b"\x00" * 16)
     if blocksdir_arg is not None:
-        bd_blocks = blocksdir_arg / network / "blocks"
+        bd_blocks = blocksdir_arg / net_dir / "blocks"
         bd_blocks.mkdir(parents=True, exist_ok=True)
         bd_blk = bd_blocks / "blk00000.dat"
         if not bd_blk.is_file():
@@ -853,7 +857,14 @@ def emit_child_init_errors(log_path: Path, prior: int, rules: list) -> None:
             text = f.read().decode("utf-8", errors="replace")
     except OSError:
         text = ""
-    errs = [ln for ln in text.splitlines() if ln.startswith("Error:")]
+    lines = text.splitlines()
+    errs = [ln for ln in lines if ln.startswith("Error:")]
+    # `error!` is a timestamped `ERROR` line, not an `Error:` InitError.
+    # Without this, the test only sees "exited with status 1".
+    if not errs:
+        errs = [ln for ln in lines if " ERROR " in ln or ln.startswith("error:")]
+    if not errs:
+        errs = [ln for ln in lines if ln.strip()][-15:]
     # Core InitError FULL_TEXT for a tip more than 2h ahead of -mocktime.
     if "appears to be from the future" in text:
         print(
@@ -907,6 +918,30 @@ def main(argv: list[str] | None = None) -> int:
     child_env = os.environ.copy()
     child_env["RBITCOIN_RPC_WAIT_TIP_IDLE"] = "1"
     child_env["RBITCOIN_RPC_PACKAGE_DIALECT"] = "1"
+    # A stand-in RBITCOIN_NODE (shell script) does not honor this. The pump
+    # still copies its stdout. The real node writes the file itself.
+    node_writes_debug_log = os.path.basename(cmd[0]) in {
+        "rbitcoin-node",
+        "rbitcoin-node.exe",
+    }
+    if node_writes_debug_log:
+        child_env["RBITCOIN_DEBUG_LOG"] = str(log_path)
+
+    def _append_log(data: bytes) -> None:
+        try:
+            fcntl.flock(log_f.fileno(), fcntl.LOCK_EX)
+            log_f.write(data)
+            log_f.flush()
+        finally:
+            fcntl.flock(log_f.fileno(), fcntl.LOCK_UN)
+
+    def _node_plain_log_line(text: str) -> bool:
+        # `2026-11-11T16:46:02.469Z INFO …` — already flushed to debug.log.
+        if len(text) < 22 or text[4] != "-" or text[7] != "-" or text[10] != "T":
+            return False
+        z = text.find("Z ")
+        return 20 <= z <= 30
+
     try:
         child = subprocess.Popen(
             cmd,
@@ -923,11 +958,13 @@ def main(argv: list[str] | None = None) -> int:
     def _pump() -> None:
         assert child.stdout is not None
         for raw in iter(child.stdout.readline, b""):
-            log_f.write(raw)
             text = raw.decode("utf-8", errors="replace")
+            # Plain log lines are already in debug.log. Still copy panics
+            # and `Error:` init text, which the node prints with eprintln.
+            if not node_writes_debug_log or not _node_plain_log_line(text):
+                _append_log(raw)
             for mapped in apply_line(text, rules):
-                log_f.write((mapped + "\n").encode())
-            log_f.flush()
+                _append_log((mapped + "\n").encode())
             if log_stdout and raw:
                 try:
                     sys.stdout.buffer.write(raw)

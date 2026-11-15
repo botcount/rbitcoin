@@ -97,6 +97,18 @@ deadline=$((start + BUDGET_SEC))
 
 # One green workspace run per job. It does not warm the mutants scratch
 # tree. Phase 2's timeout is five times the test half of this run.
+# The full log stays in the artifact. The job log gets the failure names
+# and a short tail.
+show_baseline_failure() {
+  local why=$1
+  local ec=$2
+  echo "mutants-nightly: workspace baseline ${why} (exit ${ec})"
+  if [[ -f "$OUT/workspace-baseline.log" ]]; then
+    grep -m 40 -E 'FAILED$|^error:|^error\[|panicked at' "$OUT/workspace-baseline.log" || true
+    echo "mutants-nightly: workspace-baseline.log tail"
+    tail -n 80 "$OUT/workspace-baseline.log" || true
+  fi
+}
 echo "mutants-nightly: workspace baseline"
 set +e
 cargo test --no-run --features mutants --workspace --exclude rbitcoin-bench \
@@ -104,7 +116,7 @@ cargo test --no-run --features mutants --workspace --exclude rbitcoin-bench \
 build_ec=$?
 set -e
 if ((build_ec != 0)); then
-  echo "mutants-nightly: workspace baseline did not build (exit $build_ec)"
+  show_baseline_failure "did not build" "$build_ec"
   exit "$build_ec"
 fi
 test_start=$SECONDS
@@ -115,7 +127,7 @@ test_ec=$?
 set -e
 measured=$((SECONDS - test_start))
 if ((test_ec != 0)); then
-  echo "mutants-nightly: workspace baseline failed (exit $test_ec)"
+  show_baseline_failure "failed" "$test_ec"
   exit "$test_ec"
 fi
 if ((measured < 1)); then

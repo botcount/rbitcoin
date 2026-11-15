@@ -4,7 +4,9 @@
 //! built from live mempool (and optional extra txs). On incomplete fill,
 //! returns missing absolute indexes for `getblocktxn`.
 
-use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds, ShortId};
+use bitcoin::bip152::{
+    BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds, PrefilledTransaction, ShortId,
+};
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message::NetworkMessage;
@@ -36,6 +38,71 @@ pub fn short_id_for_tx(tx: &Transaction, version: u32, keys: (u64, u64)) -> Shor
         1 => ShortId::with_siphash_keys(&tx.compute_txid().to_raw_hash(), keys),
         _ => ShortId::with_siphash_keys(&tx.compute_wtxid().to_raw_hash(), keys),
     }
+}
+
+/// The hash each transaction's short id is taken from, in block order:
+/// txid for version 1, wtxid otherwise.
+pub fn short_id_hashes(block: &Block, version: u32) -> Vec<[u8; 32]> {
+    block
+        .txdata
+        .iter()
+        .map(|tx| match version {
+            1 => tx.compute_txid().to_byte_array(),
+            _ => tx.compute_wtxid().to_byte_array(),
+        })
+        .collect()
+}
+
+/// `HeaderAndShortIds::from_block` from hashes already in hand: `ids` is
+/// [`short_id_hashes`] for `version`. The coinbase is always prefilled.
+/// `None` for a version other than 1 or 2, an `ids` length that is not the
+/// block's transaction count, a `prefill` that is not ascending indexes
+/// into the block, or a gap between prefilled transactions that does not
+/// fit the `u16` differential index. On `None` an announce retries with
+/// the coinbase alone and a compact `getdata` is served the full block.
+pub fn header_and_short_ids(
+    block: &Block,
+    ids: &[[u8; 32]],
+    nonce: u64,
+    version: u32,
+    prefill: &[usize],
+) -> Option<HeaderAndShortIds> {
+    if !(1..=2).contains(&version) || ids.len() != block.txdata.len() {
+        return None;
+    }
+    let keys = ShortId::calculate_siphash_keys(&block.header, nonce);
+    let mut rest = prefill;
+    let mut next_idx = 0usize;
+    let mut prefilled_txs = Vec::with_capacity(prefill.len() + 1);
+    let mut short_ids = Vec::with_capacity(block.txdata.len().saturating_sub(prefill.len()));
+    for (idx, (tx, id)) in block.txdata.iter().zip(ids).enumerate() {
+        let listed = rest.first() == Some(&idx);
+        if listed {
+            rest = &rest[1..];
+        }
+        if !listed && idx != 0 {
+            short_ids.push(ShortId::with_siphash_keys(id, keys));
+            continue;
+        }
+        let mut tx = tx.clone();
+        if version == 1 {
+            tx.input.iter_mut().for_each(|i| i.witness.clear());
+        }
+        prefilled_txs.push(PrefilledTransaction {
+            idx: u16::try_from(idx - next_idx).ok()?,
+            tx,
+        });
+        next_idx = idx + 1;
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    Some(HeaderAndShortIds {
+        header: block.header,
+        nonce,
+        short_ids,
+        prefilled_txs,
+    })
 }
 
 /// Consensus-decode BIP152 `HeaderAndShortIds`.
@@ -125,9 +192,12 @@ pub fn prefilled_absolute_indexes(hsi: &HeaderAndShortIds) -> Vec<(usize, &Trans
 /// Matched mempool / extra / orphan bodies are owned here. Apply overlays
 /// the peer response onto those holes and must not re-walk a live short-id
 /// map (a later `try_read` miss or eviction would drop first-pass hits).
+/// `txids[i]` is the digest already hashed for a filled `slots[i]`, or
+/// `None` on a hole. It is the same length as `slots`.
 #[derive(Clone, Debug)]
 pub struct CmpctPartial {
     pub slots: Vec<Option<Transaction>>,
+    pub txids: Vec<Option<[u8; 32]>>,
     pub missing: Vec<u64>,
 }
 
@@ -170,10 +240,13 @@ pub fn reconstruct<T: Borrow<Transaction>>(
     let total = hsi.short_ids.len() + hsi.prefilled_txs.len();
 
     let mut slots: Vec<Option<Transaction>> = vec![None; total];
+    let mut txid_at: Vec<Option<[u8; 32]>> = vec![None; total];
     let mut prefilled_set = std::collections::HashSet::new();
     let mut placed: std::collections::HashSet<bitcoin::Txid> = std::collections::HashSet::new();
     for (abs, tx) in prefilled_absolute_indexes(hsi) {
-        placed.insert(tx.compute_txid());
+        let txid = tx.compute_txid();
+        placed.insert(txid);
+        txid_at[abs] = Some(txid.to_byte_array());
         slots[abs] = Some(tx.clone());
         prefilled_set.insert(abs);
     }
@@ -199,6 +272,7 @@ pub fn reconstruct<T: Borrow<Transaction>>(
                     missing.push(abs as u64);
                     continue;
                 }
+                txid_at[abs] = Some(txid.to_byte_array());
                 *slot = Some(cands[0].borrow().clone());
             }
             // One candidate fills the slot. Every other count, including a
@@ -208,18 +282,26 @@ pub fn reconstruct<T: Borrow<Transaction>>(
     }
 
     if !missing.is_empty() {
-        return Reconstruct::Partial(CmpctPartial { slots, missing });
+        return Reconstruct::Partial(CmpctPartial {
+            slots,
+            txids: txid_at,
+            missing,
+        });
     }
 
     let mut txdata = Vec::with_capacity(total);
-    for slot in slots {
-        match slot {
-            Some(tx) => txdata.push(tx),
-            None => return Reconstruct::Fail,
+    let mut leaves = Vec::with_capacity(total);
+    for (slot, leaf) in slots.into_iter().zip(txid_at) {
+        match (slot, leaf) {
+            (Some(tx), Some(id)) => {
+                txdata.push(tx);
+                leaves.push(id);
+            }
+            _ => return Reconstruct::Fail,
         }
     }
 
-    match finish_reconstructed(hsi.header, txdata) {
+    match finish_with_txids(hsi.header, txdata, &leaves) {
         Ok(block) => Reconstruct::Block(block),
         Err(_) => Reconstruct::Fail,
     }
@@ -235,12 +317,15 @@ pub fn missing_request(block_hash: BlockHash, missing: &[u64]) -> BlockTransacti
 
 /// Overlay `blocktxn` onto a first-pass [`CmpctPartial`].
 ///
+/// Takes `slots` and `txids` after the three early returns. `missing` stays.
+/// Those returns leave the partial unchanged.
+///
 /// `txn.transactions` is 1:1 with `partial.missing` (absolute indexes, request
 /// order). Already-filled slots are kept; the live short-id map is not consulted.
 /// Completes only when the filled txs merkle to `hsi.header`.
 pub fn apply_block_transactions(
     hsi: &HeaderAndShortIds,
-    partial: &CmpctPartial,
+    partial: &mut CmpctPartial,
     txn: &BlockTransactions,
 ) -> Result<Block, Vec<u64>> {
     if txn.transactions.len() != partial.missing.len() {
@@ -249,32 +334,49 @@ pub fn apply_block_transactions(
     if partial.slots.is_empty() {
         return Err(Vec::new());
     }
+    if partial.txids.len() != partial.slots.len() {
+        return Err(Vec::new());
+    }
 
-    let mut slots = partial.slots.clone();
-    let mut placed: std::collections::HashSet<bitcoin::Txid> = slots
-        .iter()
-        .flatten()
-        .map(Transaction::compute_txid)
-        .collect();
+    let mut slots = std::mem::take(&mut partial.slots);
+    let mut leaves = std::mem::take(&mut partial.txids);
+    let mut placed = HashSet::new();
+    for (slot, leaf) in slots.iter().zip(leaves.iter()) {
+        match (slot.is_some(), leaf) {
+            (true, Some(id)) => {
+                if !placed.insert(bitcoin::Txid::from_byte_array(*id)) {
+                    return Err(partial.missing.clone());
+                }
+            }
+            (false, None) => {}
+            _ => return Err(Vec::new()),
+        }
+    }
     for (i, abs) in partial.missing.iter().enumerate() {
         let abs = *abs as usize;
         if abs >= slots.len() || slots[abs].is_some() {
             return Err(Vec::new());
         }
         let tx = &txn.transactions[i];
-        if !placed.insert(tx.compute_txid()) {
+        let txid = tx.compute_txid();
+        if !placed.insert(txid) {
             return Err(partial.missing.clone());
         }
+        leaves[abs] = Some(txid.to_byte_array());
         slots[abs] = Some(tx.clone());
     }
     let mut txdata = Vec::with_capacity(slots.len());
-    for slot in slots {
-        let Some(tx) = slot else {
-            return Err(partial.missing.clone());
-        };
-        txdata.push(tx);
+    let mut ids = Vec::with_capacity(leaves.len());
+    for (slot, leaf) in slots.into_iter().zip(leaves) {
+        match (slot, leaf) {
+            (Some(tx), Some(id)) => {
+                txdata.push(tx);
+                ids.push(id);
+            }
+            _ => return Err(partial.missing.clone()),
+        }
     }
-    finish_reconstructed(hsi.header, txdata)
+    finish_with_txids(hsi.header, txdata, &ids)
 }
 
 /// Header merkle root and the CVE-2012-2459 mutation bit from one txid list.
@@ -293,13 +395,19 @@ pub fn block_txid_merkle(txdata: &[Transaction]) -> Option<([u8; 32], bool)> {
     Some(rbitcoin_store::merkle_root_mutated(&leaves))
 }
 
-/// BIP152: filled slots must merkle to the compact header and not be a
-/// Core `IsBlockMutated` body (empty → getdata).
+/// Merkle check from txids already hashed while the slots were filled.
+///
+/// `leaves[i]` is the txid of `txdata[i]`.
 #[doc(hidden)]
-pub fn finish_reconstructed(header: Header, txdata: Vec<Transaction>) -> Result<Block, Vec<u64>> {
-    let Some((root, mutated)) = block_txid_merkle(&txdata) else {
+pub fn finish_with_txids(
+    header: Header,
+    txdata: Vec<Transaction>,
+    leaves: &[[u8; 32]],
+) -> Result<Block, Vec<u64>> {
+    if leaves.len() != txdata.len() || leaves.is_empty() {
         return Err(Vec::new());
-    };
+    }
+    let (root, mutated) = rbitcoin_store::merkle_root_mutated(leaves);
     let block = Block { header, txdata };
     if root != block.header.merkle_root.to_byte_array()
         || mutated
@@ -415,12 +523,29 @@ pub fn reconstruct_getdata_stats(hash: BlockHash, missing_n: usize) -> CmpctReco
     }
 }
 
+/// One wtxid per transaction, in block order.
+pub fn block_wtxids(block: &Block) -> Vec<Wtxid> {
+    block.txdata.iter().map(|tx| tx.compute_wtxid()).collect()
+}
+
 /// Classify a completed reconstruct: fill sources plus `blocktxn` fetch size.
 pub fn reconstruct_stats(
     hsi: &HeaderAndShortIds,
     block: &Block,
     fill: &CmpctFillSets,
     fetched_indexes: &[u64],
+) -> CmpctReconstructStats {
+    let wtxids = block_wtxids(block);
+    reconstruct_stats_from_wtxids(hsi, block, fill, fetched_indexes, &wtxids)
+}
+
+/// Same classification as [`reconstruct_stats`], using wtxids already hashed.
+pub fn reconstruct_stats_from_wtxids(
+    hsi: &HeaderAndShortIds,
+    block: &Block,
+    fill: &CmpctFillSets,
+    fetched_indexes: &[u64],
+    wtxids: &[Wtxid],
 ) -> CmpctReconstructStats {
     let prefilled: HashSet<usize> = prefilled_absolute_indexes(hsi)
         .into_iter()
@@ -434,11 +559,11 @@ pub fn reconstruct_stats(
     };
     for (abs, tx) in block.txdata.iter().enumerate() {
         let bytes = tx_wire_len(tx);
-        let wtxid = tx.compute_wtxid();
+        let wtxid = wtxids.get(abs);
         if prefilled.contains(&abs) {
             stats.prefill_n += 1;
             stats.prefill_bytes += bytes;
-            if fill.mempool.contains(&wtxid) {
+            if wtxid.is_some_and(|id| fill.mempool.contains(id)) {
                 stats.redundant_prefill_n += 1;
                 stats.redundant_prefill_bytes += bytes;
             }
@@ -449,13 +574,16 @@ pub fn reconstruct_stats(
             stats.fetched_bytes += bytes;
             continue;
         }
-        if fill.mempool.contains(&wtxid) {
+        let Some(wtxid) = wtxid else {
+            continue;
+        };
+        if fill.mempool.contains(wtxid) {
             stats.mempool_n += 1;
             stats.mempool_bytes += bytes;
-        } else if fill.extra.contains(&wtxid) {
+        } else if fill.extra.contains(wtxid) {
             stats.extra_n += 1;
             stats.extra_bytes += bytes;
-        } else if fill.orphan.contains(&wtxid) {
+        } else if fill.orphan.contains(wtxid) {
             stats.orphan_n += 1;
             stats.orphan_bytes += bytes;
         }
@@ -470,14 +598,27 @@ pub const EXTRA_PREFILL_BUDGET: usize = 10 * 1024;
 ///
 /// Packs greedily up to [`EXTRA_PREFILL_BUDGET`] additional witness bytes.
 pub fn prefill_indexes(block: &Block, fill: &CmpctFillSets) -> Vec<usize> {
+    let wtxids = block_wtxids(block);
+    prefill_indexes_from_wtxids(block, fill, &wtxids)
+}
+
+/// Same indexes as [`prefill_indexes`], using wtxids already hashed.
+pub fn prefill_indexes_from_wtxids(
+    block: &Block,
+    fill: &CmpctFillSets,
+    wtxids: &[Wtxid],
+) -> Vec<usize> {
     let mut primary = Vec::new();
     let mut extra = Vec::new();
-    for (i, tx) in block.txdata.iter().enumerate().skip(1) {
-        let w = tx.compute_wtxid();
-        if fill.mempool.contains(&w) {
+    for (i, _tx) in block.txdata.iter().enumerate().skip(1) {
+        let Some(w) = wtxids.get(i) else {
+            primary.push(i);
+            continue;
+        };
+        if fill.mempool.contains(w) {
             continue;
         }
-        if fill.extra.contains(&w) {
+        if fill.extra.contains(w) {
             extra.push(i);
         } else {
             primary.push(i);

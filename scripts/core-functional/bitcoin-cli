@@ -2,7 +2,9 @@
 """Test-only bitcoin-cli → cookie JSON-RPC. Not the operator CLI.
 
 `mining_template_verification.py` calls `node.cli.getblocktemplate(...)` in
-parallel. Core's TestNodeCLI shells out to this binary.
+parallel. Core's TestNodeCLI shells out to this binary. The cookie is read
+from the same `regtest` / `signet` / `signet_<magic>` directory the bitcoind
+shim hands the node.
 """
 
 from __future__ import annotations
@@ -13,6 +15,10 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+from signet_datadir import chain_dir
+
+SIGNET_HINT = "Is your -signetchallenge correct for custom signets?"
 
 
 def parse_kv(arg: str) -> tuple[str, str | None]:
@@ -39,16 +45,42 @@ def conf_value(datadir: Path, key: str) -> str | None:
     return None
 
 
-def cookie_auth(datadir: Path) -> str | None:
-    for p in (datadir / "regtest" / ".cookie", datadir / ".cookie"):
+def is_on(val: str | None) -> bool:
+    return val is None or val.lower() in ("1", "true", "yes", "on")
+
+
+def cookie_auth(datadir: Path, net_dir: str, cookiefile: str | None) -> str | None:
+    """Core `-rpccookiefile`: a relative path is under the network directory."""
+    if cookiefile is not None:
+        paths = [datadir / net_dir / cookiefile]
+    else:
+        paths = [datadir / net_dir / ".cookie", datadir / ".cookie"]
+    for p in paths:
         if p.is_file():
             return p.read_text(encoding="utf-8").strip()
     return None
 
 
+def auth_failed(datadir: Path, cookie_read: bool, password: bool, signet: bool) -> str:
+    """Core's bitcoin-cli HTTP 401 text, with its signet hint."""
+    if password:
+        why = "Incorrect rpcuser or rpcpassword were specified."
+    elif cookie_read:
+        why = "Cookie file credentials were invalid and no rpcpassword was specified."
+    else:
+        why = "Failed to read cookie file and no rpcpassword was specified."
+    text = f"Authorization failed: {why} Configuration file: ({datadir / 'bitcoin.conf'})"
+    if signet:
+        text += f"\n{SIGNET_HINT}"
+    return text
+
+
 def main(argv: list[str]) -> int:
     datadir: Path | None = None
     rpcport: int | None = None
+    network: str | None = None
+    challenge: str | None = None
+    cookiefile: str | None = None
     named = False
     use_stdin = False
     positional: list[str] = []
@@ -73,6 +105,14 @@ def main(argv: list[str]) -> int:
                 datadir = Path(v or "")
             elif k == "rpcport" and v:
                 rpcport = int(v)
+            elif k in ("signet", "regtest") and is_on(v):
+                network = k
+            elif k == "chain" and v:
+                network = v
+            elif k == "signetchallenge":
+                challenge = v or ""
+            elif k == "rpccookiefile" and v:
+                cookiefile = v
             i += 1
             continue
         positional.append(a)
@@ -121,12 +161,17 @@ def main(argv: list[str]) -> int:
             except json.JSONDecodeError:
                 params.append(a)
 
-    cookie = cookie_auth(datadir)
+    if network is None:
+        network = "signet" if is_on(conf_value(datadir, "signet") or "0") else "regtest"
+    cookie = cookie_auth(datadir, chain_dir(network, challenge), cookiefile)
+    cookie_read = cookie is not None
+    password = False
     if cookie is None:
         user = conf_value(datadir, "rpcuser") or ""
-        password = conf_value(datadir, "rpcpassword")
-        if password:
-            cookie = f"{user}:{password}"
+        rpcpassword = conf_value(datadir, "rpcpassword")
+        if rpcpassword:
+            cookie = f"{user}:{rpcpassword}"
+            password = True
     body = json.dumps({"jsonrpc": "1.0", "id": "cli", "method": method, "params": params}).encode()
     req = urllib.request.Request(
         f"http://127.0.0.1:{rpcport}/",
@@ -143,6 +188,10 @@ def main(argv: list[str]) -> int:
         with urllib.request.urlopen(req, timeout=120) as resp:
             raw = resp.read().decode()
     except urllib.error.HTTPError as e:
+        if e.code == 401:
+            text = auth_failed(datadir, cookie_read, password, network == "signet")
+            print(f"error: {text}", file=sys.stderr)
+            return 1
         raw = e.read().decode() if e.fp else ""
         if not raw:
             print(f"error: {e}", file=sys.stderr)

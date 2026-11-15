@@ -5,17 +5,29 @@ use rbitcoin_store::integrity::*;
 use rbitcoin_store::store::Store;
 use rbitcoin_store::tx_table::{InputRecord, OutputRecord, TxRecord};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn tmp() -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("rbitcoin-integrity-{n}"));
-    let _ = std::fs::remove_dir_all(&p);
+    let p = rbitcoin_store::testutil::fresh_path("integrity");
     std::fs::create_dir_all(&p).unwrap();
     p
+}
+
+#[test]
+fn one_clock_tick_does_not_share_an_integrity_dir() {
+    let a = rbitcoin_store::testutil::TempDir::labeled_at("integrity", 1).unwrap();
+    let b = rbitcoin_store::testutil::TempDir::labeled_at("integrity", 1).unwrap();
+    assert_ne!(
+        a.path(),
+        b.path(),
+        "two integrity stores from one clock sample"
+    );
+    for dir in [&a, &b] {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join("meta"))
+            .unwrap_or_else(|e| panic!("meta in {}: {e}", dir.display()));
+    }
 }
 
 fn hdr(prev: Fk, parent_hash: [u8; 32], salt: u8) -> HeaderRecord {
@@ -147,6 +159,24 @@ fn poison_prev_edge_shrinks_tip() {
 }
 
 #[test]
+fn tip_seal_roundtrip_keeps_each_field() {
+    let dir = tmp();
+    let seal = TipSeal {
+        tip_height: 0x0403_0201,
+        tip_hash: std::array::from_fn(|i| i as u8),
+        confirmed_len: 0x0807_0605_0403_0201,
+        generation: 0x100f_0e0d_0c0b_0a09,
+    };
+    seal.store(&dir).unwrap();
+    let back = TipSeal::load(&dir).unwrap().expect("seal");
+    assert_eq!(back.tip_height, seal.tip_height);
+    assert_eq!(back.tip_hash, seal.tip_hash);
+    assert_eq!(back.confirmed_len, seal.confirmed_len);
+    assert_eq!(back.generation, seal.generation);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn tip_seal_clamps_unsealed_extension() {
     let dir = tmp();
     let s = Store::create_tiny(&dir).unwrap();
@@ -161,6 +191,8 @@ fn tip_seal_clamps_unsealed_extension() {
         .expect("seal after tip barrier");
     assert_eq!(seal.tip_height, 0);
     assert_eq!(seal.tip_hash, g.hash);
+    assert_eq!(seal.confirmed_len, 1);
+    assert_eq!(seal.generation, 1);
 
     // Extend tip in RAM + flush confirmed only *without* updating seal:
     // simulate by writing a higher tip then restoring old seal file.
@@ -834,6 +866,41 @@ fn connect_wide_coinbase(
         .set(write, Height(u32::from(h)), header_fk)
         .unwrap();
     (header_fk, hash)
+}
+
+/// Prune mode already knows the short input is the crash tail. Repair must
+/// not also read the witness locator: that read can fail, and open would
+/// refuse a store it can already truncate.
+#[test]
+fn pruned_short_input_skips_the_witness_locator() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (prev, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    let (prev, parent) = connect_coinbase(&s, &write, 1, prev, parent);
+    connect_coinbase(&s, &write, 2, prev, parent);
+    s.txs.flush().unwrap();
+    assert_eq!(s.txs.count(), 3);
+    s.txs.input.truncate_to_count(1).unwrap();
+    s.txs.seqsigwit_loc.truncate_to_count(2).unwrap();
+    let fd = s.txs.seqsigwit_loc.loc.read_fd();
+    rbitcoin_store::io_handle::arm_fail_preads(fd, 8);
+    let disarm = Disarm(fd);
+    let stems = rbitcoin_store::tx_table::ClassASkewStems {
+        create_loc: &s.txs.create_loc,
+        seqsigwit_loc: &s.txs.seqsigwit_loc,
+        body: &s.txs.body,
+        spent: &s.txs.spent,
+        seqsigwit: &s.txs.seqsigwit,
+        txids: &s.txs.txids,
+        txstat: &s.txs.txstat,
+        input: &s.txs.input,
+    };
+    rbitcoin_store::tx_table::repair_class_a_count_skew(stems, true, true).unwrap();
+    drop(disarm);
+    assert_eq!(s.txs.count(), 1, "repair stops at the short input");
+    assert_eq!(s.txs.input.count(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn write_hwm(path: &std::path::Path, logical: u64) {

@@ -25,6 +25,19 @@ fn last_push_data_direct_and_pushdata() {
                                                                   // Non-push after push clears last.
     assert!(last_push_data(&[0x01, 0xaa, 0x51]).is_none());
     assert_eq!(last_push_data(&[0x00, 0x01, 0xee]), Some(&[0xee][..]));
+    // `last_push_data`: direct `n == len`, PUSHDATA1 of one byte, the cursor after that push, PUSHDATA2 of length 0.
+    assert!(last_push_data(&[0x02, 0xaa]).is_none());
+    assert_eq!(last_push_data(&[0x4c, 0x01]), None);
+    assert_eq!(last_push_data(&[0x4c, 0x01, 0x11]), Some(&[0x11][..]));
+    assert_eq!(
+        last_push_data(&[0x4c, 0x03, 0xaa, 0xbb, 0xcc, 0x01, 0xdd]),
+        Some(&[0xdd][..])
+    );
+    assert_eq!(last_push_data(&[0x4d, 0x00, 0x00]), Some(&[][..]));
+    assert_eq!(
+        last_push_data(&[0x4d, 0x03, 0x00, 0xaa, 0xbb, 0xcc, 0x01, 0xdd]),
+        Some(&[0xdd][..])
+    );
 }
 
 #[test]
@@ -195,7 +208,10 @@ fn vin_inner_scripts_follow_prevout_type() {
     let wsh = vin[3]["inner_witnessscript_asm"].as_str().unwrap();
     assert!(wsh.contains("OP_1") || wsh.contains('1'), "p2wsh {wsh}");
     let tr = vin[4]["inner_witnessscript_asm"].as_str().unwrap();
-    assert!(tr.contains("OP_1") || tr.contains('1'), "tapscript {tr}");
+    assert!(
+        tr.contains("OP_PUSHNUM_1") || tr == "OP_1",
+        "tapscript {tr}"
+    );
     assert!(
         !tr.contains("OP_UNKNOWN"),
         "control block must not be the leaf: {tr}"
@@ -208,6 +224,98 @@ fn vin_inner_scripts_follow_prevout_type() {
         "key path {}",
         keypath["vin"][4]
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn script_asm_drops_empty_and_past_10k() {
+    // `script_asm`: empty, length 10_000, length 10_001. Inner scripts call this.
+    assert!(script_asm(&[]).is_none());
+    assert!(script_asm(&vec![0x51; 10_000]).is_some());
+    assert!(script_asm(&vec![0x51; 10_001]).is_none());
+}
+
+#[test]
+fn tapscript_leaf_is_the_script_before_the_control() {
+    // `tapscript_leaf`: annex, a two-item witness, and a five-item witness. Vin JSON calls this.
+    let leaf = vec![0x51];
+    let control = {
+        let mut c = vec![0xc0];
+        c.extend_from_slice(&[0x44; 32]);
+        c
+    };
+    assert!(tapscript_leaf(&[]).is_none());
+    assert_eq!(
+        tapscript_leaf(&[leaf.clone(), control.clone()]),
+        Some(leaf.as_slice())
+    );
+    assert_eq!(
+        tapscript_leaf(&[leaf.clone(), control.clone(), vec![0x50, 0x01]]),
+        Some(leaf.as_slice())
+    );
+    let wide = [
+        vec![0x01],
+        vec![0x02],
+        vec![0x03],
+        leaf.clone(),
+        control.clone(),
+    ];
+    assert_eq!(tapscript_leaf(&wide), Some(leaf.as_slice()));
+    let plain = [vec![0x01], leaf.clone(), control];
+    assert_eq!(tapscript_leaf(&plain), Some(leaf.as_slice()));
+}
+
+#[test]
+fn prevout_json_uses_the_stored_create() {
+    use bitcoin::hashes::Hash;
+    use bitcoin::{OutPoint, ScriptBuf, Sequence, TxIn, Txid, Witness};
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("esplora-prevout-fk");
+    let mut txid = [0u8; 32];
+    txid[31] = 0xcb;
+    let header = HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x207fffff,
+        nonce: 0,
+        merkle_root: [1u8; 32],
+        hash: [1u8; 32],
+        size: 0,
+        weight: 0,
+    };
+    let parent = TxApply {
+        tx: TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord::coinbase(u32::MAX, vec![0], vec![])],
+        outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+    };
+    q.connect_block(Height(0), &header, &[parent]).unwrap();
+    let fk = q.tx_fk_by_txid(&txid).unwrap().unwrap();
+    let tin = TxIn {
+        previous_output: OutPoint {
+            txid: Txid::from_byte_array([0x99; 32]),
+            vout: 0,
+        },
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::MAX,
+        witness: Witness::new(),
+    };
+    let stored = rbitcoin_store::InputParent::Prevout {
+        create_fk: fk,
+        vout: 0,
+    };
+    let (prev, _value, _spk) = prevout_json(&q, &[stored], 0, &tin, Network::Regtest, None)
+        .unwrap()
+        .expect("stored create");
+    assert_eq!(prev["value"], serde_json::json!(50_0000_0000u64));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -611,5 +719,53 @@ fn pruned_tx_json_has_fee_from_txstat() {
     assert!(raw.get("size").is_none(), "{raw}");
     assert!(raw.get("weight").is_none(), "{raw}");
     assert!(raw.get("sigops").is_none(), "{raw}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Prune mode is on and this height is still served. The JSON is the full
+/// transaction, not a pruned stub and not a missing witness.
+#[test]
+fn kept_pruned_tx_json_serves_the_witness() {
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("esplora-kept-prune");
+    q.set_prune_seqsigwit(true).unwrap();
+    let mut merkle = [0u8; 32];
+    merkle[0] = 0xab;
+    let h0 = HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x207fffff,
+        nonce: 0,
+        merkle_root: merkle,
+        hash: merkle,
+        size: 0,
+        weight: 0,
+    };
+    let mut txid = [0u8; 32];
+    txid[31] = 0xcb;
+    let ta0 = TxApply {
+        tx: TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord::coinbase(
+            u32::MAX,
+            vec![0x11, 0x22],
+            vec![vec![0x33]],
+        )],
+        outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+    };
+    q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+    let fk = q.block_tx_fks(Height(0)).unwrap()[0];
+    let v = build_tx_json(&q, fk, Network::Regtest, None).unwrap();
+    assert!(v.get("pruned").is_none(), "{v}");
+    assert_eq!(v["vin"][0]["is_coinbase"], true);
+    assert_eq!(v["vin"][0]["scriptsig"], "1122");
     let _ = std::fs::remove_dir_all(&dir);
 }

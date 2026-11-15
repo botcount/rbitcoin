@@ -23,6 +23,7 @@ let
     mainnet = 8333;
     testnet = 18333;
     testnet4 = 48333;
+    testnet5 = 18353;
     signet = 38333;
     regtest = 18444;
   };
@@ -31,6 +32,7 @@ let
     mainnet = 8332;
     testnet = 18332;
     testnet4 = 48332;
+    testnet5 = 18352;
     signet = 38332;
     regtest = 18443;
   };
@@ -245,6 +247,7 @@ let
   ++ optional (cfg.asmap != null) cfg.asmap
   ++ lib.concatMap (c: [ "--ua-comment" c ]) cfg.uaComment
   ++ optional (!cfg.p2p.discover) "--no-discover"
+  ++ optional cfg.p2p.discoverFromPeers "--discover-from-peers"
   ++ optional cfg.p2p.listenOnion "--listen-onion"
   ++ optional (cfg.coldDataDir != null) "--datadir-cold"
   ++ optional (cfg.coldDataDir != null) cfg.coldDataDir
@@ -269,6 +272,10 @@ let
   ++ optional (cfg.electrum.enable && cfg.electrum.maxSubs != null) "--electrum-max-subs"
   ++ optional (cfg.electrum.enable && cfg.electrum.maxSubs != null) (
     toString cfg.electrum.maxSubs
+  )
+  ++ optional (cfg.electrum.enable && cfg.electrum.maxSpSubs != null) "--electrum-max-sp-subs"
+  ++ optional (cfg.electrum.enable && cfg.electrum.maxSpSubs != null) (
+    toString cfg.electrum.maxSpSubs
   )
   ++ optional cfg.esplora.enable "--esplora-listen"
   ++ optional cfg.esplora.enable (
@@ -301,10 +308,10 @@ let
   ++ optional needI2pSam cfg.i2p.sam
   ++ optional cfg.i2p.acceptIncoming "--i2p-accept-incoming"
   ++ optional cfg.cjdns.reachable "--cjdns-reachable"
+  ++ optional (cfg.electrum.enable && cfg.electrum.hiddenService) "--electrum-onion"
   ++ optional (cfg.esplora.enable && cfg.esplora.hiddenService) "--esplora-onion"
-  ++ optional (
-    cfg.esplora.enable && !cfg.esplora.hiddenService && torControlAddr != null
-  ) "--esplora-onion=0"
+  ++ optional (cfg.electrum.enable && cfg.electrum.i2p) "--electrum-i2p"
+  ++ optional (cfg.esplora.enable && cfg.esplora.i2p) "--esplora-i2p"
   ++ optional cfg.pruneSeqSigWit "--prune-seqsigwit"
   ++ optional (cfg.pruneSeqSigwitRamThresholdBytes != null) "--prune-seqsigwit-ram-threshold-bytes"
   ++ optional (cfg.pruneSeqSigwitRamThresholdBytes != null) (
@@ -435,8 +442,8 @@ in
       example = 840000;
       description = ''
         Pass `--milestone HEIGHT`. Null omits the flag: mainnet and testnet
-        keep the anchored script-skip default, and signet and testnet4 check
-        every script.
+        keep the anchored script-skip default, and signet, testnet4, and
+        testnet5 check every script.
         An explicit height is height-only.
       '';
     };
@@ -468,6 +475,7 @@ in
         "mainnet"
         "testnet"
         "testnet4"
+        "testnet5"
         "signet"
         "regtest"
       ];
@@ -585,10 +593,10 @@ in
     spTweaksDust = mkOption {
       type = types.nullOr types.ints.unsigned;
       default = null;
-      example = 546;
+      example = 545;
       description = ''
         Pass `--sp-tweaks-dust SATS`. Null keeps the node default (1000).
-        0 serves every P2TR output. 546 matches Cake electrs.
+        0 serves every P2TR output. 545 matches Cake electrs at its 546 floor.
       '';
     };
 
@@ -768,7 +776,7 @@ in
       example = "0x0000000000000000000000000000000000000000000000000000000100000000";
       description = ''
         Pass `--min-chain-work HEX` (optional `0x`, at most 64 hex digits).
-        Null keeps Core's minimum on mainnet, testnet3, and testnet4, and leaves signet and regtest unset.
+        Null keeps Core's minimum on mainnet, testnet3, and testnet4, and leaves signet, testnet5, and regtest unset.
       '';
     };
 
@@ -988,6 +996,12 @@ in
         description = "Advertise local addresses to peers. Off with --no-discover.";
       };
 
+      discoverFromPeers = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Announce the IP outbound clearnet peers report reaching us at (--discover-from-peers). Needs discover and a non-loopback p2p.address; ignored with a warning on a loopback bind.";
+      };
+
       listenOnion = mkOption {
         type = types.bool;
         default = false;
@@ -1172,11 +1186,17 @@ in
         type = types.bool;
         default = false;
         description = ''
-          ADD_ONION for Electrum when the listener is on. Requires `enable`.
+          ADD_ONION for Electrum (`--electrum-onion`). Requires `enable` on 127.0.0.1 or 0.0.0.0.
           Implies tor.control 127.0.0.1:9051 if unset. That implied port enables
           services.tor, opens 127.0.0.1:9051, and writes a group-readable cookie
           at the control cookie path. The unit joins group tor so it can read it.
         '';
+      };
+
+      i2p = mkOption {
+        type = types.bool;
+        default = false;
+        description = "I2P destination ({dataDir}/i2p/electrum.priv) and STREAM FORWARD for Electrum (--electrum-i2p). Needs electrum.enable on 127.0.0.1 or 0.0.0.0 and i2p.sam. Independent of i2p.acceptIncoming.";
       };
 
       maxSubs = mkOption {
@@ -1187,6 +1207,17 @@ in
           blockchain.scripthash.subscribe cap per Electrum connection (--electrum-max-subs).
           Null keeps the node default (10000). Wallets subscribe every address up to their
           gap limit.
+        '';
+      };
+
+      maxSpSubs = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        example = 100;
+        description = ''
+          blockchain.silentpayments.subscribe address cap per Electrum connection
+          (--electrum-max-sp-subs). Null keeps the node default (16). Each address
+          scans every new block.
         '';
       };
     };
@@ -1236,14 +1267,18 @@ in
         type = types.bool;
         default = false;
         description = ''
-          ADD_ONION for Esplora when the listener is on. Requires `enable`.
-          True implies tor.control 127.0.0.1:9051 if unset and passes `--esplora-onion`.
-          That implied port enables services.tor, opens 127.0.0.1:9051, and writes
-          a group-readable cookie at the control cookie path.
-          The unit joins group tor so it can read it.
-          False passes `--esplora-onion=0` when the listener is on and Tor control is on
-          for another reason. REST and /ws share the TCP port.
+          ADD_ONION for Esplora (`--esplora-onion`). Requires `enable` on 127.0.0.1 or 0.0.0.0.
+          Implies tor.control 127.0.0.1:9051 if unset. That implied port enables
+          services.tor, opens 127.0.0.1:9051, and writes a group-readable cookie
+          at the control cookie path. The unit joins group tor so it can read it.
+          REST and /ws share the TCP port.
         '';
+      };
+
+      i2p = mkOption {
+        type = types.bool;
+        default = false;
+        description = "I2P destination ({dataDir}/i2p/esplora.priv) and STREAM FORWARD for Esplora (--esplora-i2p). Needs esplora.enable on 127.0.0.1 or 0.0.0.0 and i2p.sam. Independent of i2p.acceptIncoming.";
       };
 
       maxInflight = mkOption {
@@ -1326,6 +1361,30 @@ in
     services.rbitcoin.p2p.listen = mkIf (cfg.trustPeer != null) (mkDefault false);
     services.rbitcoin.p2p.maxInbound = mkIf (cfg.trustPeer != null) (mkDefault 0);
     assertions = [
+      {
+        assertion = !cfg.electrum.i2p || cfg.electrum.enable;
+        message = "services.rbitcoin.electrum.i2p requires electrum.enable";
+      }
+      {
+        assertion = !cfg.esplora.i2p || cfg.esplora.enable;
+        message = "services.rbitcoin.esplora.i2p requires esplora.enable";
+      }
+      {
+        assertion = !(cfg.electrum.hiddenService || cfg.electrum.i2p) || builtins.elem cfg.electrum.address [ "127.0.0.1" "0.0.0.0" ];
+        message = "services.rbitcoin.electrum.hiddenService and electrum.i2p forward to 127.0.0.1; electrum.address must be 127.0.0.1 or 0.0.0.0";
+      }
+      {
+        assertion = !(cfg.esplora.hiddenService || cfg.esplora.i2p) || builtins.elem cfg.esplora.address [ "127.0.0.1" "0.0.0.0" ];
+        message = "services.rbitcoin.esplora.hiddenService and esplora.i2p forward to 127.0.0.1; esplora.address must be 127.0.0.1 or 0.0.0.0";
+      }
+      {
+        assertion = !(cfg.esplora.hiddenService || cfg.esplora.i2p) || cfg.esplora.socketPath == null;
+        message = "services.rbitcoin.esplora.hiddenService and esplora.i2p need a TCP listener; unset esplora.socketPath";
+      }
+      {
+        assertion = !(cfg.electrum.i2p || cfg.esplora.i2p) || cfg.i2p.sam != null;
+        message = "services.rbitcoin.electrum.i2p and esplora.i2p require i2p.sam";
+      }
       {
         assertion = cfg.trustPeer == null || !cfg.p2p.listen;
         message = "services.rbitcoin.trustPeer cannot be combined with p2p.listen";

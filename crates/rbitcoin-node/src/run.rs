@@ -9,7 +9,7 @@ use rbitcoin_ibd::{
 };
 use rbitcoin_log::{debug, enabled, info, warn, Level};
 use rbitcoin_net::{
-    default_port, netgroup, sample_reset_serve_perf, socks_dns_seed_dests, AddrMan, AsMap,
+    default_port, netgroup_net, sample_reset_serve_perf, socks_dns_seed_dests, AddrMan, AsMap,
     BlockingRegion, ChainHub, Dialer, MempoolHub, NetAddr, OutboundPass, P2PNode, PeerConnType,
     TipEvent,
 };
@@ -348,14 +348,27 @@ pub async fn mempool_blocking<T: Send + 'static>(
     .map_err(|e| NodeError::Config(format!("mempool task: {e}")))
 }
 
-/// Start the node: ensure datadir, exclusive-lock, open store.
+/// Datadir file that records the network the datadir was created for.
+#[doc(hidden)]
+pub const NETWORK_MARKER: &str = "network";
+
+/// Longest [`NETWORK_MARKER`] read. The line is a network name and eight hex
+/// digits; a longer file is not one this node wrote.
+const NETWORK_MARKER_MAX: u64 = 64;
+
+/// Start the node: ensure datadir, exclusive-lock, refuse another network's
+/// datadir, open store.
 pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
     config.ensure_datadir()?;
     let dir_locks = crate::lock::lock_node_dirs(&config)?;
+    let params = config.chain_params()?;
+    let marker = DatadirNetwork::check(config.datadir.path(), config.network, &params)?;
     let query = Query::open_or_create_layout_checkblocks(
         config.store_layout(),
         config.check_blocks_window(),
     )?;
+    refuse_foreign_genesis(&query, &params)?;
+    marker.record()?;
     rbitcoin_query::replay_spend_annotations(&query)
         .map_err(|e| NodeError::Init(format!("spend annotation replay: {e}")))?;
     Ok(NodeHandle {
@@ -364,6 +377,119 @@ pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
         mempool: None,
         _dir_locks: dir_locks,
     })
+}
+
+/// The network a datadir was created for: its name and P2P message start,
+/// one line in [`NETWORK_MARKER`]. Every signet shares one genesis block, so
+/// [`refuse_foreign_genesis`] cannot tell two signets apart. The message
+/// start can.
+#[doc(hidden)]
+#[must_use = "record the marker once the store has opened"]
+pub struct DatadirNetwork {
+    datadir: PathBuf,
+    started: String,
+    missing: bool,
+}
+
+impl DatadirNetwork {
+    /// Refuse a datadir whose marker names another network. Runs before the
+    /// store opens, before any peer, and before RPC serves.
+    pub fn check(
+        datadir: &Path,
+        network: rbitcoin_primitives::Network,
+        params: &rbitcoin_consensus::ChainParams,
+    ) -> Result<Self, NodeError> {
+        let path = datadir.join(NETWORK_MARKER);
+        let started = format!(
+            "{} {}",
+            network.as_str(),
+            rbitcoin_net::service::magic_for_params(params)
+        );
+        let stored = read_network_marker(&path)?;
+        let stored = stored.trim();
+        let missing = stored.is_empty();
+        if !missing && stored != started {
+            return Err(NodeError::Init(format!(
+                "Wrong datadir for network? stored network {stored} does not match started network {started}. Use a separate --datadir for each network."
+            )));
+        }
+        Ok(Self {
+            datadir: datadir.to_path_buf(),
+            started,
+            missing,
+        })
+    }
+
+    /// Write a missing or empty marker. A datadir from before the marker
+    /// adopts the started network here, after the genesis check passed.
+    /// Every signet shares one genesis, so a legacy signet datadir adopts
+    /// whichever challenge this start passed.
+    pub fn record(self) -> Result<(), NodeError> {
+        if !self.missing {
+            return Ok(());
+        }
+        let path = self.datadir.join(NETWORK_MARKER);
+        self.write_synced(&path)
+            .map_err(|source| NodeError::Datadir {
+                path: path.clone(),
+                source,
+            })?;
+        info!(
+            "datadir: no network marker in {}; adopting {}",
+            path.display(),
+            self.started
+        );
+        Ok(())
+    }
+
+    /// Temp file, `sync_all`, rename, then sync the datadir, so a crash
+    /// leaves no marker or the whole line. A symlinked temp is unlinked, not
+    /// followed.
+    fn write_synced(&self, path: &Path) -> std::io::Result<()> {
+        let tmp = path.with_extension("tmp");
+        match std::fs::remove_file(&tmp) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let mut file =
+            crate::lock::no_follow(std::fs::OpenOptions::new().write(true).create_new(true))
+                .open(&tmp)?;
+        std::io::Write::write_all(&mut file, format!("{}\n", self.started).as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        rbitcoin_store::file::fsync_parent_dir(&self.datadir)
+    }
+}
+
+/// The marker's text, empty when there is none. A symlink or a file longer
+/// than [`NETWORK_MARKER_MAX`] is refused without reading it.
+fn read_network_marker(path: &Path) -> Result<String, NodeError> {
+    let file = match crate::lock::no_follow(std::fs::OpenOptions::new().read(true)).open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(source) => {
+            return Err(NodeError::Datadir {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(file, NETWORK_MARKER_MAX + 1),
+        &mut bytes,
+    )
+    .map_err(|source| NodeError::Datadir {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if bytes.len() as u64 > NETWORK_MARKER_MAX {
+        return Err(NodeError::Init(format!(
+            "Wrong datadir for network? {} is longer than {NETWORK_MARKER_MAX} bytes and is not a network marker",
+            path.display()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Height 0 is the chain this datadir already stored. No height 0 is an
@@ -389,6 +515,37 @@ pub fn refuse_foreign_genesis(
     )))
 }
 
+/// A P2P bind failure is Core's `BindListenPort` InitError (`feature_port.py`).
+fn p2p_start_err(what: &str, e: rbitcoin_net::NetError) -> NodeError {
+    let rbitcoin_net::NetError::Bind { addr, source } = e else {
+        return NodeError::Config(format!("{what}: {e}"));
+    };
+    if source.kind() == std::io::ErrorKind::AddrInUse {
+        return NodeError::Init(format!(
+            "Unable to bind to {addr} on this computer. rbitcoin is probably already running."
+        ));
+    }
+    NodeError::Init(format!(
+        "Unable to bind to {addr} on this computer (bind returned error {})",
+        os_error_text(&source)
+    ))
+}
+
+/// Core's `NetworkErrorString`: `<OS text> (<code>)`, not Rust's
+/// `(os error N)`.
+fn os_error_text(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match e.raw_os_error() {
+        Some(n) => {
+            let os = text
+                .strip_suffix(&format!(" (os error {n})"))
+                .unwrap_or(&text);
+            format!("{os} ({n})")
+        }
+        None => text,
+    }
+}
+
 /// Long-running P2P (+ optional Electrum): seed resolve, catch-up, persistent follow, progress logs.
 ///
 /// Cleanly exits on **SIGTERM** / **SIGINT** (`kill <pid>` or Ctrl+C): flushes the store
@@ -410,7 +567,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let handle = run_node(config.clone())?;
     status.enter(Phase::Starting);
     let params = config.chain_params()?;
-    refuse_foreign_genesis(&handle.query, &params)?;
     let milestone = config.milestone();
     if let Some(anchor) = milestone.anchor {
         info!(
@@ -441,7 +597,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             .as_ref()
             .map(|p| format!(" datadir_cold={}", p.display()))
             .unwrap_or_default(),
-        std::env::var("RBITCOIN_IO").unwrap_or_else(|_| "default".into()),
+        rbitcoin_store::bulk_io::backend_name(),
     );
 
     handle.query.set_trust_peer(config.trust_peer_set());
@@ -476,7 +632,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             .await
         }
     }
-    .map_err(|e| NodeError::Config(format!("p2p start: {e}")))?;
+    .map_err(|e| p2p_start_err("p2p start", e))?;
     node.peers
         .set_trust_peer(config.trust_peer, config.trust_peer_host.clone());
     if config.trust_peer_set() {
@@ -494,7 +650,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         let bound = node
             .add_listen(*extra)
             .await
-            .map_err(|e| NodeError::Config(format!("p2p extra listen {extra}: {e}")))?;
+            .map_err(|e| p2p_start_err(&format!("p2p extra listen {extra}"), e))?;
         info!(
             "rbitcoin-node listening on {} ({})",
             bound,
@@ -552,6 +708,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let table = config.finalized_net_perms();
     let immediate_relay = config.trusted;
     let hub = Arc::clone(&node.hub);
+    let enforce_bip54 = hub.params.enforce_bip54;
     let (mempool, mp_gen, mp_live) = tokio::task::spawn_blocking(move || {
         let _g = BlockingRegion::enter();
         let mp = MempoolHub::open_with_weight_persist_and_sigop_reserve(
@@ -562,6 +719,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             block_reserved_sigops,
         )?;
         mp.set_cluster_limits(cluster_count, cluster_kvb);
+        mp.set_enforce_bip54(enforce_bip54);
         if let Some(b) = bytes_per_sigop {
             mp.set_bytes_per_sigop(b);
         }
@@ -591,10 +749,20 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         mempool.set_isolated_broadcast(true);
     }
     node.peers.set_net_perms(table.clone());
+    node.peers
+        .set_overlay_loopback_forward(config.listen.overlay_loopback_forward());
     if let Some(secs) = config.listen.peer_timeout_secs {
         node.peers.set_peer_timeout_secs(secs);
     }
     node.peers.set_discover(config.listen.discover);
+    let from_peers = discover_from_peers_on(config.listen.discover_from_peers, node.local_addr);
+    if config.listen.discover_from_peers && !from_peers {
+        warn!(
+            "--discover-from-peers ignored: the P2P bind {} is loopback, so peers could not reach the address it would announce (set --listen)",
+            node.local_addr
+        );
+    }
+    node.peers.set_discover_from_peers(from_peers);
     node.peers
         .set_clearnet_listen(!matches!(config.listen.p2p, crate::config::P2pListen::Off));
     if node.local_addr.port() != 0 {
@@ -643,7 +811,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 
     let shutdown = Shutdown::new();
     spawn_signal_handler(shutdown.clone());
-    let mut tor_ctl = shutdown
+    let tor_ctl = shutdown
         .run_until_cancelled(crate::tor_control::TorControl::connect_if_configured(
             config.tor.control,
             config.tor.cookie.as_deref(),
@@ -654,7 +822,14 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 .unwrap_or(crate::tor_control::CONTROL_TIMEOUT),
         ))
         .await?
-        .flatten();
+        .flatten()
+        .map(|ctl| {
+            crate::tor_control::TorKeeper::spawn(
+                ctl,
+                Arc::clone(&node.peers),
+                crate::tor_control::RECONNECT_START,
+            )
+        });
     if tor_ctl.is_some() {
         info!(
             "tor control authenticated on {}",
@@ -666,17 +841,12 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
     if config.listen.listen_onion && !shutdown.requested() {
         let ctl = tor_ctl
-            .as_mut()
+            .as_ref()
             .expect("validate requires --tor-control with --listen-onion");
         let virt = config.network.default_p2p_port();
-        if let Some(hs) = shutdown
+        shutdown
             .run_until_cancelled(ctl.add_p2p_onion(config.datadir.path(), node.local_addr, virt))
-            .await?
-        {
-            info!("p2p onion {}.onion:{}", hs.service_id, virt);
-            node.peers
-                .set_p2p_onion(format!("{}.onion", hs.service_id), virt);
-        }
+            .await?;
     }
     if config.listen.i2p_sam.is_some() {
         node.peers.set_i2p_reachable(true);
@@ -773,6 +943,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     );
     let dns_resolved = if shutdown.requested() {
         Vec::new()
+    } else if config.listen.proxy.is_some() {
+        proxied_connect_names(&config.listen.connect_dns, config.network)
     } else {
         resolve_connect_dns(&config.listen.connect_dns, config.network).await
     };
@@ -790,27 +962,36 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         addrman.add_addr(*c);
     }
     let mut proxy_seeds_queued = false;
+    // A known book tries its own peers first. The DNS seeds wait on
+    // `dns_seeds_when_needed` in the background once the book is shared.
+    let known_book = addrman.len();
+    let dns_seeds_deferred = should_resolve_dns_seeds(&config) && known_book > 0;
     if should_resolve_default_seeds(&config) && !shutdown.requested() {
         info!(
             "ibd: resolving DNS/fixed seeds for {}…",
             config.network.as_str()
         );
         let n_before = addrman.len();
-        addrman.inject(rbitcoin_net::resolve_dns_seeds(config.network));
+        if should_resolve_dns_seeds(&config) && !dns_seeds_deferred {
+            let network = config.network;
+            let resolve = move || rbitcoin_net::resolve_dns_seeds(network);
+            if let Some(addrs) = dns_seeds_when_needed(0, || 0, &shutdown, resolve).await {
+                addrman.inject(addrs);
+            }
+        }
         let fixed = addrman.add_fixed_seeds(config.network);
         info!(
             "ibd: seeds resolved (+{} new, {fixed} fixed, book={})",
             addrman.len().saturating_sub(n_before),
             addrman.len()
         );
-    } else if !config.trust_peer_set()
-        && config.listen.proxy.is_some()
-        && config.listen.use_seeds
-        && !shutdown.requested()
-    {
+    } else if should_queue_proxy_seeds(&config) && !shutdown.requested() {
         proxy_seeds_queued = true;
         let n = queue_proxy_seed_addrfetch(&node.peers, config.network);
         info!("ibd: SOCKS proxy set — queued {n} seed hostnames via SOCKS addrfetch");
+    } else if should_add_fixed_seeds_behind_proxy(&config) && !shutdown.requested() {
+        let fixed = addrman.add_fixed_seeds(config.network);
+        info!("ibd: no clearnet reachable behind the proxy; +{fixed} fixed seeds");
     } else if config.signet_challenge.is_some()
         && !config.listen.has_pinned_connect()
         && addrman.is_empty()
@@ -819,6 +1000,25 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
     let shared_peers = std::sync::Arc::new(std::sync::Mutex::new(addrman.clone()));
     node.peers.set_addrman(std::sync::Arc::clone(&shared_peers));
+    if dns_seeds_deferred && !shutdown.requested() {
+        let peers = Arc::clone(&node.peers);
+        let book = Arc::clone(&shared_peers);
+        let sd = Arc::clone(&shutdown);
+        let network = config.network;
+        tokio::spawn(async move {
+            let outbound = || peers.full_outbound_count();
+            let resolve = move || rbitcoin_net::resolve_dns_seeds(network);
+            if let Some(addrs) = dns_seeds_when_needed(known_book, outbound, &sd, resolve).await {
+                let found = addrs.len();
+                let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
+                book.inject(addrs);
+                info!(
+                    "ibd: {found} address(es) found from DNS seeds (book={})",
+                    book.len()
+                );
+            }
+        });
+    }
     if proxy_or_onion_without_trust(&config) {
         let _iso = rbitcoin_net::spawn_isolated_broadcast_loop(
             Arc::clone(&mempool),
@@ -1149,32 +1349,27 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             config.listen.electrum,
             config.sptweaks_dust,
             config.electrum_max_subs,
+            config.electrum_max_sp_subs,
             &shutdown,
             &node.hub,
             &params,
             &mempool,
+            &status.electrum_listen,
         )
         .await,
     );
-    if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), electrum_handles.first()) {
-        if let Some(hs) = shutdown.or_fail(
-            shutdown
-                .run_until_cancelled(ctl.add_named_onion(
-                    config.datadir.path(),
-                    "electrum",
-                    h.local_addr,
-                ))
-                .await,
-        ) {
-            info!(
-                "electrum onion {}.onion:{}",
-                hs.service_id,
-                h.local_addr.port()
-            );
-            let _ = electrum_onion.set((format!("{}.onion", hs.service_id), h.local_addr.port()));
-            node.peers
-                .set_wallet_onion(format!("{}.onion", hs.service_id), h.local_addr.port());
-        }
+    if let (Some(ctl), Some(h)) = (tor_ctl.as_ref(), electrum_handles.first()) {
+        shutdown.or_fail(
+            add_wallet_onion(
+                &shutdown,
+                &config,
+                ctl,
+                WalletListener::Electrum,
+                h.local_addr,
+                Some(Arc::clone(&electrum_onion)),
+            )
+            .await,
+        );
     }
     if let Some(h) = electrum_handles.first() {
         publish_listener_addr(config.datadir.path(), "electrum", h.local_addr);
@@ -1194,26 +1389,18 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         )
         .await,
     );
-    if config.esplora_onion {
-        if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), esplora_handles.first()) {
-            if let Some(hs) = shutdown.or_fail(
-                shutdown
-                    .run_until_cancelled(ctl.add_named_onion(
-                        config.datadir.path(),
-                        "esplora",
-                        h.local_addr,
-                    ))
-                    .await,
-            ) {
-                info!(
-                    "esplora onion http://{}.onion:{} (/ws same port)",
-                    hs.service_id,
-                    h.local_addr.port()
-                );
-                node.peers
-                    .set_wallet_onion(format!("{}.onion", hs.service_id), h.local_addr.port());
-            }
-        }
+    if let (Some(ctl), Some(h)) = (tor_ctl.as_ref(), esplora_handles.first()) {
+        shutdown.or_fail(
+            add_wallet_onion(
+                &shutdown,
+                &config,
+                ctl,
+                WalletListener::Esplora,
+                h.local_addr,
+                None,
+            )
+            .await,
+        );
     }
     if let Some(h) = esplora_handles.first() {
         publish_listener_addr(config.datadir.path(), "esplora", h.local_addr);
@@ -1228,33 +1415,31 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         status.attach_sv2(Arc::clone(s));
     }
     let mut i2p_wallet = Vec::new();
-    if config.listen.i2p_accept_incoming && !shutdown.requested() {
+    if !shutdown.requested() {
         if let Some(addr) = config.listen.i2p_sam {
             if let Some(h) = electrum_handles.first() {
                 i2p_wallet.extend(
                     shutdown.or_fail(
-                        start_i2p_named_forward(
+                        wallet_i2p_forward(
                             addr,
-                            config.datadir.path(),
-                            "electrum",
+                            &config,
+                            WalletListener::Electrum,
                             h.local_addr.port(),
                         )
-                        .await
-                        .map(Some),
+                        .await,
                     ),
                 );
             }
             if let Some(h) = esplora_handles.first() {
                 i2p_wallet.extend(
                     shutdown.or_fail(
-                        start_i2p_named_forward(
+                        wallet_i2p_forward(
                             addr,
-                            config.datadir.path(),
-                            "esplora",
+                            &config,
+                            WalletListener::Esplora,
                             h.local_addr.port(),
                         )
-                        .await
-                        .map(Some),
+                        .await,
                     ),
                 );
             }
@@ -1326,52 +1511,41 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                             config.listen.electrum,
                             config.sptweaks_dust,
                             config.electrum_max_subs,
+                            config.electrum_max_sp_subs,
                             &shutdown,
                             &node.hub,
                             &params,
                             &mempool,
+                            &status.electrum_listen,
                         )
                         .await,
                     );
-                    if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), handles.first()) {
-                        if let Some(hs) = shutdown.or_fail(
-                            shutdown
-                                .run_until_cancelled(ctl.add_named_onion(
-                                    config.datadir.path(),
-                                    "electrum",
-                                    h.local_addr,
-                                ))
-                                .await,
-                        ) {
-                            info!(
-                                "electrum onion {}.onion:{}",
-                                hs.service_id,
-                                h.local_addr.port()
-                            );
-                            let _ = onion
-                                .set((format!("{}.onion", hs.service_id), h.local_addr.port()));
-                            node.peers.set_wallet_onion(
-                                format!("{}.onion", hs.service_id),
-                                h.local_addr.port(),
-                            );
-                        }
+                    if let (Some(ctl), Some(h)) = (tor_ctl.as_ref(), handles.first()) {
+                        shutdown.or_fail(
+                            add_wallet_onion(
+                                &shutdown,
+                                &config,
+                                ctl,
+                                WalletListener::Electrum,
+                                h.local_addr,
+                                Some(Arc::clone(&onion)),
+                            )
+                            .await,
+                        );
                     }
-                    if config.listen.i2p_accept_incoming {
-                        if let Some(addr) = config.listen.i2p_sam {
-                            if let Some(h) = handles.first() {
-                                i2p_wallet.extend(
-                                    shutdown.or_fail(
-                                        start_i2p_named_forward(
-                                            addr,
-                                            config.datadir.path(),
-                                            "electrum",
-                                            h.local_addr.port(),
-                                        )
-                                        .await
-                                        .map(Some),
-                                    ),
-                                );
-                            }
+                    if let Some(addr) = config.listen.i2p_sam {
+                        if let Some(h) = handles.first() {
+                            i2p_wallet.extend(
+                                shutdown.or_fail(
+                                    wallet_i2p_forward(
+                                        addr,
+                                        &config,
+                                        WalletListener::Electrum,
+                                        h.local_addr.port(),
+                                    )
+                                    .await,
+                                ),
+                            );
                         }
                     }
                     if let Some(h) = handles.first() {
@@ -1397,45 +1571,32 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                         )
                         .await,
                     );
-                    if config.esplora_onion {
-                        if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), handles.first()) {
-                            if let Some(hs) = shutdown.or_fail(
-                                shutdown
-                                    .run_until_cancelled(ctl.add_named_onion(
-                                        config.datadir.path(),
-                                        "esplora",
-                                        h.local_addr,
-                                    ))
-                                    .await,
-                            ) {
-                                info!(
-                                    "esplora onion http://{}.onion:{} (/ws same port)",
-                                    hs.service_id,
-                                    h.local_addr.port()
-                                );
-                                node.peers.set_wallet_onion(
-                                    format!("{}.onion", hs.service_id),
-                                    h.local_addr.port(),
-                                );
-                            }
-                        }
+                    if let (Some(ctl), Some(h)) = (tor_ctl.as_ref(), handles.first()) {
+                        shutdown.or_fail(
+                            add_wallet_onion(
+                                &shutdown,
+                                &config,
+                                ctl,
+                                WalletListener::Esplora,
+                                h.local_addr,
+                                None,
+                            )
+                            .await,
+                        );
                     }
-                    if config.listen.i2p_accept_incoming {
-                        if let Some(addr) = config.listen.i2p_sam {
-                            if let Some(h) = handles.first() {
-                                i2p_wallet.extend(
-                                    shutdown.or_fail(
-                                        start_i2p_named_forward(
-                                            addr,
-                                            config.datadir.path(),
-                                            "esplora",
-                                            h.local_addr.port(),
-                                        )
-                                        .await
-                                        .map(Some),
-                                    ),
-                                );
-                            }
+                    if let Some(addr) = config.listen.i2p_sam {
+                        if let Some(h) = handles.first() {
+                            i2p_wallet.extend(
+                                shutdown.or_fail(
+                                    wallet_i2p_forward(
+                                        addr,
+                                        &config,
+                                        WalletListener::Esplora,
+                                        h.local_addr.port(),
+                                    )
+                                    .await,
+                                ),
+                            );
                         }
                     }
                     if let Some(h) = handles.first() {
@@ -1604,18 +1765,16 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 continue;
             }
             let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
-            let addrs: Vec<SocketAddr> = rows.iter().map(|(_, addr)| *addr).collect();
-            let groups: Vec<u64> = addrs
+            let groups: Vec<u64> = rows
                 .iter()
-                .map(|a| netgroup(*a, addrman.asmap()))
+                .map(|(_, net)| netgroup_net(*net, addrman.asmap()))
                 .collect();
             let salt = node.hub.clock.now_secs();
             let Some(evict_id) = rbitcoin_net::pick_stale_follow_evict(&ids, salt, &groups) else {
                 node.peers.note_outbound_pass(OutboundPass::NoSpare);
                 continue;
             };
-            let (occupied, _, _) = outbound_slots(&node.peers);
-            let replacement = outbound_full_relay_candidates(&shared_peers, 1, &occupied);
+            let replacement = stale_follow_replacement(&node.peers, &shared_peers, evict_id);
             if replacement.is_empty() {
                 node.peers.note_outbound_pass(OutboundPass::NoSpare);
                 continue;
@@ -1720,10 +1879,35 @@ pub fn tip_meets_min_work(config: &NodeConfig, hub: &rbitcoin_net::ChainHub) -> 
 
 #[doc(hidden)]
 pub fn should_resolve_default_seeds(config: &NodeConfig) -> bool {
+    seeds_allowed(config) && config.listen.proxy.is_none()
+}
+
+#[doc(hidden)]
+pub fn should_queue_proxy_seeds(config: &NodeConfig) -> bool {
+    seeds_allowed(config)
+        && config.listen.proxy.is_some()
+        && config.listen.clearnet_reachable()
+        && !socks_dns_seed_dests(config.network).is_empty()
+}
+
+/// Behind `--proxy` with no clearnet reachable, no seed hostname is asked,
+/// so the fixed onion, I2P, and CJDNS seeds are the only first peers.
+fn should_add_fixed_seeds_behind_proxy(config: &NodeConfig) -> bool {
+    seeds_allowed(config) && config.listen.proxy.is_some() && !config.listen.clearnet_reachable()
+}
+
+fn seeds_allowed(config: &NodeConfig) -> bool {
     config.listen.use_seeds
+        && !config.trust_peer_set()
         && !config.listen.has_pinned_connect()
         && config.signet_challenge.is_none()
-        && config.listen.proxy.is_none()
+}
+
+/// DNS seed hostnames are looked up only when this node can dial IPv4 or
+/// IPv6. Under `--only-net onion` the fixed onion seeds still apply.
+#[doc(hidden)]
+pub fn should_resolve_dns_seeds(config: &NodeConfig) -> bool {
+    should_resolve_default_seeds(config) && config.listen.clearnet_reachable()
 }
 
 /// Isolated broadcast dials peers other than the pinned session.
@@ -1753,6 +1937,28 @@ pub fn catch_up_with_connect(
 /// Tip-follow may run below `--min-chain-work`. Relay stays off until the floor.
 pub fn relay_while_following(meets_min_work: bool, blocks_only: bool, in_ibd: bool) -> bool {
     meets_min_work && !blocks_only && !in_ibd
+}
+
+/// `--connect` names under `--proxy`: pinned by name, so the proxy resolves them.
+pub fn proxied_connect_names(hosts: &[String], network: Network) -> Vec<rbitcoin_net::NetAddr> {
+    let port = network.default_p2p_port();
+    hosts
+        .iter()
+        .filter_map(|h| {
+            let with_port = rbitcoin_net::ensure_host_port(h, Some(port)).ok()?;
+            if let Ok(net) = rbitcoin_net::parse_peer_net(&with_port) {
+                return Some(net);
+            }
+            let (host, port) = with_port.rsplit_once(':')?;
+            let name = rbitcoin_net::NetAddr::name(host, port.parse().ok()?);
+            if name.is_none() {
+                rbitcoin_log::warn!(
+                    "not pinning {with_port}: too many distinct proxied host names"
+                );
+            }
+            name
+        })
+        .collect()
 }
 
 pub async fn resolve_connect_dns(hosts: &[String], network: Network) -> Vec<rbitcoin_net::NetAddr> {
@@ -1785,6 +1991,59 @@ pub fn queue_proxy_seed_addrfetch(peers: &Arc<rbitcoin_net::PeerHub>, network: N
         }
     }
     n
+}
+
+/// Core `DNSSEEDS_DELAY_FEW_PEERS`: a known book tries its own peers this
+/// long before the DNS seeds are asked.
+pub const DNSSEEDS_DELAY_FEW_PEERS: Duration = Duration::from_secs(11);
+/// Core `DNSSEEDS_DELAY_MANY_PEERS`: the wait for a book of at least
+/// [`DNSSEEDS_DELAY_PEER_THRESHOLD`] rows, checked every
+/// [`DNSSEEDS_DELAY_FEW_PEERS`].
+pub const DNSSEEDS_DELAY_MANY_PEERS: Duration = Duration::from_secs(5 * 60);
+/// Core `DNSSEEDS_DELAY_PEER_THRESHOLD`.
+pub const DNSSEEDS_DELAY_PEER_THRESHOLD: usize = 1000;
+/// Core `SEED_OUTBOUND_CONNECTION_THRESHOLD`: this many outbound full-relay
+/// peers make the DNS seeds unnecessary.
+pub const SEED_OUTBOUND_CONNECTION_THRESHOLD: usize = 2;
+
+/// Core `ThreadDNSAddressSeed`. An empty book (`book_len == 0`) asks the
+/// DNS seeds at once. A known book waits [`DNSSEEDS_DELAY_FEW_PEERS`], or
+/// [`DNSSEEDS_DELAY_MANY_PEERS`] past the threshold, and returns `None` at
+/// the first check with [`SEED_OUTBOUND_CONNECTION_THRESHOLD`] outbound
+/// peers up. Shutdown returns `None`. Otherwise `resolve` runs on the
+/// blocking pool and its addresses are returned.
+#[doc(hidden)]
+pub async fn dns_seeds_when_needed(
+    book_len: usize,
+    full_outbound: impl Fn() -> usize,
+    shutdown: &Shutdown,
+    resolve: impl FnOnce() -> Vec<SocketAddr> + Send + 'static,
+) -> Option<Vec<SocketAddr>> {
+    if book_len > 0 {
+        let mut left = if book_len >= DNSSEEDS_DELAY_PEER_THRESHOLD {
+            DNSSEEDS_DELAY_MANY_PEERS
+        } else {
+            DNSSEEDS_DELAY_FEW_PEERS
+        };
+        info!("ibd: waiting {}s before querying DNS seeds", left.as_secs());
+        while !left.is_zero() {
+            let step = left.min(DNSSEEDS_DELAY_FEW_PEERS);
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return None,
+                () = tokio::time::sleep(step) => {}
+            }
+            left -= step;
+            if full_outbound() >= SEED_OUTBOUND_CONNECTION_THRESHOLD {
+                info!("ibd: P2P peers available. Skipped DNS seeding.");
+                return None;
+            }
+        }
+    }
+    if shutdown.requested() {
+        return None;
+    }
+    tokio::task::spawn_blocking(resolve).await.ok()
 }
 
 /// A SOCKS seed answer that lost its circuit is not retried by the dial
@@ -1943,7 +2202,13 @@ pub async fn wait_for_dialable_targets(
                     *addrman = g.clone();
                 }
             }
-            follow_dial_targets(pinned, addrman, candidate_n, occupied)
+            follow_dial_targets(
+                pinned,
+                addrman,
+                candidate_n,
+                occupied,
+                overlay_outbound_live(occupied),
+            )
         };
         let targets = sample();
         if !targets.is_empty() {
@@ -2103,16 +2368,53 @@ pub fn apply_startup_index_mode(
             "datadir is pruned-seqsigwit; restart with --prune-seqsigwit enabled".into(),
         ));
     }
+    if config.prune_seqsigwit && config.sptweaks && !query.prune_seqsigwit() {
+        // The enabled bit is false until the call below, and the stem cut
+        // cannot be undone. Refuse before either write.
+        query
+            .refuse_adding_prune_with_tweaks(rbitcoin_primitives::Height(taproot_height))
+            .map_err(|e| NodeError::Config(e.to_string()))?;
+    }
     if config.prune_seqsigwit {
         query.set_prune_seqsigwit(true)?;
+    }
+    let origin = rbitcoin_primitives::Height(taproot_height);
+    let tweaks_on = if config.sptweaks {
+        match query.set_sptweaks_enabled(true, origin) {
+            Ok(()) => true,
+            // Prune refusals stay fatal. Any other enable error on an
+            // unpruned node is the old warning: the node still starts.
+            Err(e) if config.prune_seqsigwit => {
+                return Err(NodeError::Config(e.to_string()));
+            }
+            Err(e) => {
+                warn!("sp_tweaks: enable failed: {e}");
+                false
+            }
+        }
+    } else {
+        query
+            .set_sptweaks_enabled(false, origin)
+            .map_err(|e| NodeError::Config(e.to_string()))?;
+        false
+    };
+    // The tip can be durable before the tweak rows. Seal that gap while
+    // the spills are still on disk, then advance the prune height.
+    if config.prune_seqsigwit && tweaks_on {
+        rbitcoin_query::prepare_live_indexes(query).map_err(|e| {
+            crate::error::NodeError::Init(format!("index startup repair failed: {e}"))
+        })?;
+        query
+            .refuse_prune_advance_past_tweaks()
+            .map_err(|e| NodeError::Config(e.to_string()))?;
+    }
+    if config.prune_seqsigwit {
         query.apply_prune_seqsigwit_tip()?;
     }
-    if let Err(e) =
-        query.set_sptweaks_enabled(config.sptweaks, rbitcoin_primitives::Height(taproot_height))
-    {
-        warn!("sp_tweaks: enable failed: {e}");
-    } else if config.sptweaks {
+    if tweaks_on {
         info!("sp_tweaks: enabled origin={taproot_height}");
+    } else if let Some(warning) = query.sp_tweaks_prune_omit_warning() {
+        warn!("{}", warning.log_line());
     }
     // Before write-behind starts. An unproven head must not catch up by
     // appending from height 0; delete it and stay Direct until materialize.
@@ -2426,6 +2728,93 @@ pub fn electrum_tip_notify(ev: TipEvent) -> Option<TipNotify> {
     })
 }
 
+/// A wallet listener that can be published as a Tor onion and over I2P.
+#[derive(Clone, Copy)]
+enum WalletListener {
+    Electrum,
+    Esplora,
+}
+
+impl WalletListener {
+    /// Key file stem under `{datadir}/onion/` and `{datadir}/i2p/`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Electrum => "electrum",
+            Self::Esplora => "esplora",
+        }
+    }
+
+    /// `--electrum-onion` / `--esplora-onion`.
+    fn onion(self, config: &NodeConfig) -> bool {
+        match self {
+            Self::Electrum => config.electrum_onion,
+            Self::Esplora => config.esplora_onion,
+        }
+    }
+
+    /// `--electrum-i2p` / `--esplora-i2p`.
+    fn i2p(self, config: &NodeConfig) -> bool {
+        match self {
+            Self::Electrum => config.electrum_i2p,
+            Self::Esplora => config.esplora_i2p,
+        }
+    }
+}
+
+/// `ADD_ONION` for a wallet listener when its onion switch is on. While tor
+/// is away the keeper holds it and adds it on reconnect.
+async fn add_wallet_onion(
+    shutdown: &Shutdown,
+    config: &NodeConfig,
+    ctl: &crate::tor_control::TorKeeper,
+    listener: WalletListener,
+    bound: SocketAddr,
+    electrum_hosts: Option<Arc<OnceLock<(String, u16)>>>,
+) -> Result<(), NodeError> {
+    if !listener.onion(config) {
+        return Ok(());
+    }
+    let port = bound.port();
+    let added: crate::tor_control::OnionAdded = match listener {
+        WalletListener::Electrum => Box::new(move |hs| {
+            info!("electrum onion {}.onion:{port}", hs.service_id);
+            if let Some(hosts) = electrum_hosts {
+                let _ = hosts.set((format!("{}.onion", hs.service_id), port));
+            }
+        }),
+        WalletListener::Esplora => Box::new(move |hs| {
+            info!(
+                "esplora onion http://{}.onion:{port} (/ws same port)",
+                hs.service_id
+            )
+        }),
+    };
+    shutdown
+        .run_until_cancelled(ctl.add_named_onion(
+            config.datadir.path(),
+            listener.name(),
+            bound,
+            added,
+        ))
+        .await
+        .map(|_| ())
+}
+
+/// SAM `STREAM FORWARD` to a wallet listener. `None` when its I2P switch is off.
+async fn wallet_i2p_forward(
+    sam_addr: SocketAddr,
+    config: &NodeConfig,
+    listener: WalletListener,
+    port: u16,
+) -> Result<Option<rbitcoin_net::I2pSam>, NodeError> {
+    if !listener.i2p(config) {
+        return Ok(None);
+    }
+    start_i2p_named_forward(sam_addr, config.datadir.path(), listener.name(), port)
+        .await
+        .map(Some)
+}
+
 pub async fn start_i2p_named_forward(
     sam_addr: SocketAddr,
     datadir: &Path,
@@ -2530,10 +2919,12 @@ pub async fn start_electrum_if_ready(
     addr: Option<SocketAddr>,
     tweaks_min_dust: u64,
     electrum_max_subs: usize,
+    electrum_max_sp_subs: usize,
     shutdown: &Shutdown,
     hub: &ChainHub,
     params: &rbitcoin_consensus::ChainParams,
     mempool: &std::sync::Arc<MempoolHub>,
+    electrum_listen: &std::sync::Arc<std::sync::atomic::AtomicU8>,
 ) -> Result<
     (
         Vec<ElectrumHandle>,
@@ -2560,8 +2951,10 @@ pub async fn start_electrum_if_ready(
     );
     let mut ecfg = ElectrumConfig::for_params(addr, params);
     ecfg.max_scripthash_subs = electrum_max_subs;
+    ecfg.max_sp_subs = electrum_max_sp_subs;
     ecfg.tweaks_min_dust = tweaks_min_dust;
     ecfg.onion_tcp = Arc::clone(&onion_tcp);
+    ecfg.listen_state = Some(Arc::clone(electrum_listen));
     ecfg.batch_window = rbitcoin_electrum::batch_window(crate::cli::blocking_pool_size());
     let max_conn = ecfg.limits.max_connections;
     let max_line = ecfg.limits.max_request_bytes;
@@ -3007,16 +3400,25 @@ pub fn outbound_dial_targets(
     if trust_peer {
         pinned.to_vec()
     } else {
-        follow_dial_targets(pinned, book, max, occupied)
+        follow_dial_targets(pinned, book, max, occupied, overlay_outbound_live(occupied))
     }
 }
 
+/// An onion or I2P net in `occupied` is a live or in-flight outbound: inbound
+/// sessions key by socket and never carry an overlay net.
+fn overlay_outbound_live(occupied: &[rbitcoin_net::NetAddr]) -> bool {
+    occupied.iter().any(|a| a.is_overlay())
+}
+
 /// `--connect` is operator-pinned: no netgroup filter. Otherwise rank + diversity.
+/// `overlay_live` keeps a one-peer batch on clearnet while an onion or I2P
+/// outbound is up.
 pub fn follow_dial_targets(
     connect: &[rbitcoin_net::NetAddr],
     book: &AddrMan,
     max: usize,
     occupied: &[rbitcoin_net::NetAddr],
+    overlay_live: bool,
 ) -> Vec<rbitcoin_net::NetAddr> {
     if !connect.is_empty() {
         connect.to_vec()
@@ -3027,7 +3429,7 @@ pub fn follow_dial_targets(
             .copied()
             .filter_map(rbitcoin_net::NetAddr::socket_addr)
             .collect();
-        book.take_dial_candidates_net(max, &exclude, &socks)
+        book.take_dial_candidates_net(max, &exclude, &socks, overlay_live)
     }
 }
 
@@ -3171,12 +3573,31 @@ pub fn refill_outbound_full_relay(
         return;
     }
     let room = max_out.saturating_sub(live).saturating_sub(pending);
-    let picked = outbound_full_relay_candidates(shared_peers, room, &occupied);
+    let overlay_live = overlay_outbound_live(&occupied);
+    let picked = outbound_full_relay_candidates(shared_peers, room, &occupied, overlay_live);
     if picked.is_empty() {
         peers.note_outbound_pass(OutboundPass::NoSpare);
         return;
     }
     queue_outbound_full_relay(peers, shared_peers, &picked);
+}
+
+/// One full-relay replacement for the stale-tip rotation, picked before
+/// `evict_id` is disconnected. The evicted net stays excluded, but it does
+/// not count as a live overlay: when it is the only onion or I2P session,
+/// the replacement may take the overlay slot.
+#[doc(hidden)]
+pub fn stale_follow_replacement(
+    peers: &rbitcoin_net::PeerHub,
+    shared_peers: &Arc<std::sync::Mutex<AddrMan>>,
+    evict_id: u64,
+) -> Vec<NetAddr> {
+    let (occupied, _, _) = outbound_slots(peers);
+    let evicted = peers.get(evict_id).map(|p| p.net);
+    let overlay_live = occupied
+        .iter()
+        .any(|a| a.is_overlay() && Some(*a) != evicted);
+    outbound_full_relay_candidates(shared_peers, 1, &occupied, overlay_live)
 }
 
 /// Live outbound full-relay nets, every other live session (so a full-relay
@@ -3208,12 +3629,13 @@ fn outbound_full_relay_candidates(
     shared_peers: &Arc<std::sync::Mutex<AddrMan>>,
     room: usize,
     occupied: &[NetAddr],
+    overlay_live: bool,
 ) -> Vec<NetAddr> {
     if room == 0 {
         return Vec::new();
     }
     let book = shared_peers.lock().unwrap_or_else(|e| e.into_inner());
-    follow_dial_targets(&[], &book, room, occupied)
+    follow_dial_targets(&[], &book, room, occupied, overlay_live)
 }
 
 fn queue_outbound_full_relay(
@@ -3234,6 +3656,14 @@ fn queue_outbound_full_relay(
     for addr in queued {
         book.note_attempt_addr(addr);
     }
+}
+
+/// Whether `--discover-from-peers` takes effect on P2P bind `bind`. A
+/// loopback bind (the default, or the onion listener alone) accepts nothing
+/// from the address a peer reports, so announcing it would mislead.
+#[doc(hidden)]
+pub fn discover_from_peers_on(flag: bool, bind: SocketAddr) -> bool {
+    flag && !bind.ip().to_canonical().is_loopback()
 }
 
 /// A CJDNS listen bind is the address peers should learn. `--external-ip`

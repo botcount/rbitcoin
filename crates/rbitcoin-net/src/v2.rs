@@ -259,6 +259,7 @@ pub enum DecryptState {
         buf: CipherBuf,
         packet_len: usize,
         bytes_read: usize,
+        contents_len: usize,
     },
 }
 
@@ -314,7 +315,7 @@ impl<R: AsyncRead + Unpin + Send> V2SessionReader<R> {
         on_decoy: D,
     ) -> Result<Vec<u8>, NetError>
     where
-        F: FnMut(usize),
+        F: FnMut(usize, usize),
         D: FnMut(usize) -> Result<(), NetError>,
     {
         let mut plaintext = self.read_genuine_plaintext(on_progress, on_decoy).await?;
@@ -329,7 +330,7 @@ impl<R: AsyncRead + Unpin + Send> V2SessionReader<R> {
         mut on_decoy: D,
     ) -> Result<Vec<u8>, NetError>
     where
-        F: FnMut(usize),
+        F: FnMut(usize, usize),
         D: FnMut(usize) -> Result<(), NetError>,
     {
         loop {
@@ -350,7 +351,7 @@ impl<R: AsyncRead + Unpin + Send> V2SessionReader<R> {
         on_progress: &mut F,
     ) -> Result<(PacketType, Vec<u8>), NetError>
     where
-        F: FnMut(usize),
+        F: FnMut(usize, usize),
     {
         let Self {
             inbound_cipher,
@@ -390,19 +391,22 @@ impl<R: AsyncRead + Unpin + Send> V2SessionReader<R> {
                         buf,
                         packet_len: rest,
                         bytes_read: 0,
+                        contents_len: rest.saturating_sub(V2_PACKET_REST_OVERHEAD),
                     };
                 }
                 DecryptState::ReadingPayload {
                     buf,
                     packet_len,
                     bytes_read,
+                    contents_len,
                 } => {
                     let packet_len = *packet_len;
+                    let contents_len = *contents_len;
                     let packet = match buf {
                         CipherBuf::Owned(owned) => owned.as_mut_slice(),
                         CipherBuf::Ibd(scratch) => &mut scratch[..packet_len],
                     };
-                    fill_packet(reader, packet, bytes_read, on_progress).await?;
+                    fill_packet(reader, packet, bytes_read, contents_len, on_progress).await?;
                     let packet = match buf {
                         CipherBuf::Owned(owned) => owned.as_slice(),
                         CipherBuf::Ibd(scratch) => &scratch[..packet_len],
@@ -426,11 +430,12 @@ async fn fill_packet<R, F>(
     reader: &mut ProtocolSessionReader<R>,
     packet: &mut [u8],
     filled: &mut usize,
+    contents_len: usize,
     on_progress: &mut F,
 ) -> Result<(), NetError>
 where
     R: AsyncRead + Unpin + Send,
-    F: FnMut(usize),
+    F: FnMut(usize, usize),
 {
     while *filled < packet.len() {
         let n = reader.read(&mut packet[*filled..]).await?;
@@ -442,7 +447,7 @@ where
             .into());
         }
         *filled += n;
-        on_progress(*filled);
+        on_progress(*filled, contents_len);
     }
     Ok(())
 }
@@ -907,7 +912,7 @@ pub async fn read_v2_contents<R>(reader: &mut V2SessionReader<R>) -> Result<Vec<
 where
     R: AsyncRead + Unpin + Send,
 {
-    reader.read_genuine_contents(|_| {}, |_| Ok(())).await
+    reader.read_genuine_contents(|_, _| {}, |_| Ok(())).await
 }
 
 /// Read the next genuine application frame (skips decoy packets).
@@ -920,11 +925,11 @@ pub async fn read_v2_frame<R>(
 where
     R: AsyncRead + Unpin + Send,
 {
-    read_v2_frame_with_progress(reader, magic, |_| {}, |_| Ok(())).await
+    read_v2_frame_with_progress(reader, magic, |_, _| {}, |_| Ok(())).await
 }
 
-/// Read the next genuine frame; `on_progress` is invoked as ciphertext body
-/// bytes arrive, then again with decrypted content length.
+/// Read the next genuine frame. `on_progress` gets ciphertext bytes read and
+/// the contents length, then once more with the decrypted contents length.
 pub async fn read_v2_frame_with_progress<R, F, D>(
     reader: &mut V2SessionReader<R>,
     magic: Magic,
@@ -933,12 +938,13 @@ pub async fn read_v2_frame_with_progress<R, F, D>(
 ) -> Result<FramedMessage, NetError>
 where
     R: AsyncRead + Unpin + Send,
-    F: FnMut(usize),
+    F: FnMut(usize, usize),
     D: FnMut(usize) -> Result<(), NetError>,
 {
     let plaintext = reader
         .read_genuine_plaintext(&mut on_progress, on_decoy)
         .await?;
-    on_progress(plaintext.len() - 1);
+    let n = plaintext.len() - 1;
+    on_progress(n, n);
     parse_v2_packet(magic, plaintext)
 }

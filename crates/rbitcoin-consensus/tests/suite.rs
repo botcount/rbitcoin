@@ -13,3 +13,4 @@ mod script_pool;
 mod signet;
 mod silent_payments;
 mod tx_precompute;
+mod wire;

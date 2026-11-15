@@ -132,6 +132,15 @@ fn exit_and_catchup_complete_surface() {
     near.max_ready_height = 100;
     near.headers_done = true;
     assert!(ibd_caught_up(&near, 100));
+    // Lag 0 is caught up even when the empty-headers latch is still open
+    // and the walk has no proved origin. A larger gap stays open with it.
+    let mut level = IbdWorkState::new(Vec::new(), None, Some(100));
+    level.max_peer_height = 100;
+    level.max_ready_height = 100;
+    level.headers_done = false;
+    assert!(ibd_caught_up(&level, 100));
+    level.max_peer_height = 101;
+    assert!(!ibd_caught_up(&level, 100));
     near.max_ready_height = 105;
     assert!(!ibd_caught_up(&near, 100));
     assert_eq!(header_lag_behind_peers(&near, 100), 0); // archived ≥ peer
@@ -217,6 +226,11 @@ fn empty_headers_lag_rate_limits() {
     assert!(!should_advance_locator_after_known_batch(
         0, 0, false, false
     ));
+    // Two blocks of lag is still tip chatter. Three blocks advances.
+    assert!(!should_advance_locator_after_known_batch(
+        1, 2, false, false
+    ));
+    assert!(should_advance_locator_after_known_batch(1, 3, false, false));
     // Live path + full window still advances.
     assert!(should_advance_locator_after_known_batch(
         8_000, 0, true, false

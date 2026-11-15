@@ -411,6 +411,21 @@ async fn blindbit_v1_routes_before_and_below_the_index() {
     assert!(!bitcoin::bip158::BlockFilter::new(&data)
         .match_any(&hash, std::iter::once(&key[..]))
         .unwrap());
+    q.set_sptweaks_enabled(true, Height(1)).unwrap();
+    let (header_fk, rec) = q.header_at_height(Height(1)).unwrap().unwrap();
+    let els = rbitcoin_esplora::blindbit::block_sp_elements(
+        &q,
+        &rbitcoin_esplora::blindbit::ServedBlock {
+            height: 1,
+            header_fk,
+            hash: rec.hash,
+            time: rec.timestamp,
+        },
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(els.new_keys, vec![key]);
     handle.shutdown().await;
 }
 

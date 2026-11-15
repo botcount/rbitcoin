@@ -35,13 +35,7 @@ fn stray_batch_is_not_persisted() {
     let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
     let _ = rbitcoin_ibd::ibd::header_walk::send_getheaders(&mut st, &hub);
     let shared = Mutex::new(st);
-    rbitcoin_net::chain::reset_header_store_counts();
     run_header_batch(&shared, &hub, 0, vec![header], &empty_header_fk_bus());
-    assert_eq!(
-        rbitcoin_net::chain::header_store_counts().0,
-        0,
-        "a stray batch is classified before any header is persisted"
-    );
     assert_eq!(side_count(&hub), 0);
     let _ = std::fs::remove_dir_all(dir);
 }

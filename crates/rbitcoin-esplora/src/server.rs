@@ -11,6 +11,9 @@ use axum::routing::{get, post};
 use axum::Router;
 use bitcoin::consensus::Encodable;
 use bitcoin::Network;
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
 use rbitcoin_electrum::ServeLimits;
 use rbitcoin_net::MempoolHub;
 use rbitcoin_net::RequestMeter;
@@ -20,6 +23,7 @@ use rbitcoin_store::StoreError;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -161,13 +165,18 @@ pub fn json_reply_here(v: impl Serialize) -> Response {
     json_reply_shared(Arc::new(v))
 }
 
+/// A JSON body the handler already encoded.
+#[doc(hidden)]
+pub fn json_bytes_reply(body: Vec<u8>) -> Response {
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
 /// Light bodies encode here. A heavy body moves the `Arc` into the response
 /// so [`ensure_json`] can hand it to `rbtc-scripts-*` without cloning.
 #[doc(hidden)]
 pub fn json_reply_shared(v: Arc<Value>) -> Response {
     if !rbitcoin_electrum::json_is_cpu_heavy(&v) {
-        let bytes = serde_json::to_vec(v.as_ref()).unwrap_or_else(|_| b"{}".to_vec());
-        return ([(header::CONTENT_TYPE, "application/json")], bytes).into_response();
+        return json_bytes_reply(serde_json::to_vec(v.as_ref()).unwrap_or_else(|_| b"{}".to_vec()));
     }
     let mut resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
@@ -233,10 +242,13 @@ pub fn path_uses_sh_view(path: &str) -> bool {
         || path.starts_with("/scripthash/")
         || path.starts_with("/addresses/")
         || path.starts_with("/scripthashes/")
+        || path.starts_with("/internal/address/")
+        || path.starts_with("/internal/scripthash/")
 }
 
 /// COMPAT.md: `?asof=` on tx status/outspend(s), confirmed output and
-/// tx-by-position reads, and address/scripthash `/`, `/utxo`, `/txs`,
+/// tx-by-position reads, and address/scripthash `/` (and its `/internal`
+/// twin), `/utxo`, `/txs`,
 /// `/txs/chain`, `/txs/summary` (not `/txs/mempool`, not `GET /tx/{txid}`).
 #[doc(hidden)]
 pub fn path_accepts_asof(path: &str) -> bool {
@@ -252,6 +264,8 @@ pub fn path_accepts_asof(path: &str) -> bool {
             | ["block-heights", "txs", "outs"]
             | ["address", _]
             | ["scripthash", _]
+            | ["internal", "address", _]
+            | ["internal", "scripthash", _]
             | ["address", _, "utxo"]
             | ["scripthash", _, "utxo"]
             | ["address", _, "txs"]
@@ -316,19 +330,27 @@ pub async fn stamp_chain_view_mw(State(st): State<AppState>, req: Request, next:
         Err(()) => return not_found(),
     };
     let path = req.uri().path().to_string();
-    if path_uses_sh_view(&path) && !st.query.sh_history_available() {
+    // `/internal` is mounted on unix listen only. On TCP that path reaches the
+    // unknown-path fallback, which has no `MatchedPath`, and stays a plain 404.
+    let unmounted = path.starts_with("/internal/")
+        && req
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .is_none();
+    let sh_view = !unmounted && path_uses_sh_view(&path);
+    if sh_view && !st.query.sh_history_available() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             rbitcoin_query::SCRIPTHASH_INDEX_DISABLED,
         )
             .into_response();
     }
-    if asof.is_some() && !path_accepts_asof(&path) {
+    if asof.is_some() && (unmounted || !path_accepts_asof(&path)) {
         return not_found();
     }
     let pre_view = if path_never_pins(&path) || asof.is_some() {
         None
-    } else if path_uses_sh_view(&path) {
+    } else if sh_view {
         let q = std::sync::Arc::clone(&st.query);
         match crate::handlers::store_blocking(move || q.pin_sh_chain_view()).await {
             Ok(Ok(v)) => v,
@@ -447,12 +469,13 @@ impl EsploraConfig {
     }
 
     pub fn with_listen(listen: EsploraListen, network: Network) -> Self {
+        let blindbit_max_inflight = crate::blindbit::default_max_inflight();
         Self {
             listen,
             limits: ServeLimits::for_public_proxy(),
             network,
             block_template: None,
-            blindbit_max_inflight: crate::blindbit::default_max_inflight(),
+            blindbit_max_inflight,
         }
     }
 }
@@ -923,7 +946,7 @@ impl AppState {
     }
 
     pub fn seed_bulk(&self, client: Option<&str>, bag: &mut HashMap<[u8; 32], Arc<ShJoinSlot>>) {
-        let Some(id) = client.filter(|s| !s.is_empty()) else {
+        let Some(id) = named_join_client(client) else {
             return;
         };
         let g = self.sh_join.lock().unwrap_or_else(|p| p.into_inner());
@@ -935,7 +958,7 @@ impl AppState {
     }
 
     pub fn promote_bulk(&self, client: Option<&str>, bag: HashMap<[u8; 32], Arc<ShJoinSlot>>) {
-        let Some(id) = client.filter(|s| !s.is_empty()) else {
+        let Some(id) = named_join_client(client) else {
             return;
         };
         let mut g = self.sh_join.lock().unwrap_or_else(|p| p.into_inner());
@@ -978,6 +1001,14 @@ pub fn internal_routes() -> Router<AppState> {
             "/internal/txs/outspends/by-outpoint",
             post(crate::internal::post_outspends_by_outpoint),
         )
+        .route(
+            "/internal/address/{addr}",
+            get(crate::internal::get_internal_address),
+        )
+        .route(
+            "/internal/scripthash/{hash}",
+            get(crate::internal::get_internal_scripthash),
+        )
 }
 
 #[cfg(unix)]
@@ -990,6 +1021,119 @@ pub fn bind_unix_mode(
     let listener = tokio::net::UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     Ok(listener)
+}
+
+trait CappedAccept: Send + 'static {
+    type Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static;
+    type Addr: std::fmt::Debug + Send + 'static;
+    fn accept_one(
+        &mut self,
+    ) -> impl Future<Output = std::io::Result<(Self::Io, Self::Addr)>> + Send;
+}
+
+impl CappedAccept for tokio::net::TcpListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = SocketAddr;
+    fn accept_one(
+        &mut self,
+    ) -> impl Future<Output = std::io::Result<(Self::Io, Self::Addr)>> + Send {
+        tokio::net::TcpListener::accept(self)
+    }
+}
+
+#[cfg(unix)]
+impl CappedAccept for tokio::net::UnixListener {
+    type Io = tokio::net::UnixStream;
+    type Addr = tokio::net::unix::SocketAddr;
+    fn accept_one(
+        &mut self,
+    ) -> impl Future<Output = std::io::Result<(Self::Io, Self::Addr)>> + Send {
+        tokio::net::UnixListener::accept(self)
+    }
+}
+
+/// Accepted sockets include requests waiting on the in-flight gate, so this
+/// is above `--esplora-max-inflight`. A connection past it is closed.
+pub fn esplora_accept_cap(max_inflight: usize) -> usize {
+    max_inflight
+        .max(1)
+        .saturating_mul(8)
+        .min(Semaphore::MAX_PERMITS)
+}
+
+/// Accept loop for TCP and unix. Caps sockets, closes one that never sends
+/// headers, and leaves the accept task as soon as `shutdown` is stored.
+fn spawn_capped<L: CappedAccept>(
+    mut listener: L,
+    app: Router,
+    max_conn: usize,
+    header_timeout: Duration,
+    shutdown: Arc<EsploraStop>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(max_conn.max(1)));
+        struct StopConns(Vec<JoinHandle<()>>);
+        impl Drop for StopConns {
+            fn drop(&mut self) {
+                for task in self.0.drain(..) {
+                    task.abort();
+                }
+            }
+        }
+        let mut conns = StopConns(Vec::new());
+        loop {
+            let wake = shutdown.notified();
+            if shutdown.load() {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = wake => break,
+                accepted = CappedAccept::accept_one(&mut listener) => {
+                    match accepted {
+                        Ok((io, peer)) => {
+                            conns.0.retain(|t| !t.is_finished());
+                            if !rbitcoin_net::listen::listener_fd_room() {
+                                rbitcoin_log::warn!(
+                                    "esplora: reject {peer:?} (descriptor reserve)"
+                                );
+                                drop(io);
+                                continue;
+                            }
+                            let Ok(permit) = sem.clone().try_acquire_owned() else {
+                                rbitcoin_log::warn!(
+                                    "esplora: reject {peer:?} (at max connections={max_conn})"
+                                );
+                                drop(io);
+                                continue;
+                            };
+                            let service = TowerToHyperService::new(app.clone());
+                            conns.0.push(tokio::spawn(async move {
+                                let _permit = permit;
+                                let mut http = http1::Builder::new();
+                                http.timer(TokioTimer::new())
+                                    .header_read_timeout(header_timeout);
+                                let _ = http.serve_connection(TokioIo::new(io), service).await;
+                            }));
+                        }
+                        Err(e) => {
+                            if rbitcoin_net::service::accept_error_ends_listen(&e) {
+                                rbitcoin_log::warn!("esplora: accept ended: {e}");
+                                break;
+                            }
+                            rbitcoin_log::warn!("esplora: accept retry: {e}");
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+#[doc(hidden)]
+pub fn named_join_client(client: Option<&str>) -> Option<&str> {
+    client.filter(|s| !s.is_empty())
 }
 
 /// Start Esplora **plain HTTP** on `config.listen`.
@@ -1060,6 +1204,10 @@ pub async fn run_esplora(
         .route("/block/{hash}/txids", get(handlers::block_txids))
         .route("/block/{hash}/txid/{index}", get(handlers::block_txid_at))
         .route("/block/{hash}/txs", get(handlers::block_txs_0))
+        .route(
+            "/block/{hash}/txs/summary",
+            get(handlers::block_txs_summary),
+        )
         .route("/block/{hash}/txs/{start}", get(handlers::block_txs_start))
         .route("/tx/{txid}", get(tx_full))
         .route("/tx/{txid}/hex", get(tx_hex))
@@ -1198,21 +1346,13 @@ pub async fn run_esplora(
         EsploraListen::Tcp(addr) => {
             let listener = rbitcoin_net::listen::bind_tcp(addr)?;
             let local_addr = listener.local_addr()?;
-            let task = tokio::spawn(async move {
-                let make = app.into_make_service_with_connect_info::<SocketAddr>();
-                let serve = axum::serve(listener, make).with_graceful_shutdown(async move {
-                    loop {
-                        let wake = shutdown_c.notified();
-                        if shutdown_c.load() {
-                            break;
-                        }
-                        wake.await;
-                    }
-                });
-                if let Err(e) = serve.await {
-                    rbitcoin_log::warn!("esplora: serve ended: {e}");
-                }
-            });
+            let task = spawn_capped(
+                listener,
+                app,
+                esplora_accept_cap(max_conn),
+                idle,
+                shutdown_c,
+            );
             Ok(EsploraHandle {
                 local_addr,
                 socket_path: None,
@@ -1225,26 +1365,17 @@ pub async fn run_esplora(
         #[cfg(unix)]
         EsploraListen::Unix(path) => {
             if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent)?;
-                }
+                std::fs::create_dir_all(parent)?;
             }
             let _ = std::fs::remove_file(&path);
             let listener = bind_unix_mode(&path, 0o660)?;
-            let task = tokio::spawn(async move {
-                let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
-                    loop {
-                        let wake = shutdown_c.notified();
-                        if shutdown_c.load() {
-                            break;
-                        }
-                        wake.await;
-                    }
-                });
-                if let Err(e) = serve.await {
-                    rbitcoin_log::warn!("esplora: serve ended: {e}");
-                }
-            });
+            let task = spawn_capped(
+                listener,
+                app,
+                esplora_accept_cap(max_conn),
+                idle,
+                shutdown_c,
+            );
             Ok(EsploraHandle {
                 local_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
                 socket_path: Some(path),
@@ -1289,9 +1420,8 @@ pub async fn block_header(State(st): State<AppState>, Path(hash_hex): Path<Strin
     let Ok(hash) = parse_hash32(&hash_hex) else {
         return not_found();
     };
-    // Prefer best-chain height path (fills prev correctly for wire header).
-    match st.query.height_of_hash(&hash) {
-        Ok(Some(h)) => match st.query.wire_header_at_height(h) {
+    match st.query.connected_block_header(&hash) {
+        Ok(Some((_, rec))) => match st.query.wire_header_from_record(&rec) {
             Ok(hdr) => match encode_header_hex(&hdr) {
                 Ok(hex) => plain_ok(hex),
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -1309,8 +1439,8 @@ pub async fn tx_full(State(st): State<AppState>, Path(txid_hex): Path<String>) -
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
         };
-        match st.query.get_tx_by_txid(&txid) {
-            Ok(Some((fk, _))) => match build_tx_json(&st.query, fk, st.network, None) {
+        match st.query.tx_fk_by_txid(&txid) {
+            Ok(Some(fk)) => match build_tx_json(&st.query, fk, st.network, None) {
                 Ok(v) => json_reply_here(v),
                 Err(e) => store_err(e),
             },
@@ -1339,8 +1469,8 @@ pub async fn tx_hex(State(st): State<AppState>, Path(txid_hex): Path<String>) ->
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
         };
-        match st.query.get_tx_by_txid(&txid) {
-            Ok(Some((fk, _))) => match st.query.tx_wire_bytes(fk) {
+        match st.query.tx_fk_by_txid(&txid) {
+            Ok(Some(fk)) => match st.query.tx_wire_bytes(fk) {
                 Ok(raw) => plain_ok(rbitcoin_primitives::hex_encode(&(raw))),
                 Err(e) => store_err(e),
             },

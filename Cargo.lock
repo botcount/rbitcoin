@@ -163,9 +163,9 @@ dependencies = [
 
 [[package]]
 name = "bip324"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a03c45ad0d13f5df3aff10b7fdf6897dba1e9fc819cf932589d48ddba2536c94"
+checksum = "4ed414c4fcc415f4899990cdc04d5fa6c7cd5673042c43bde1943250df8a59c7"
 dependencies = [
  "bitcoin_hashes 0.16.0",
  "chacha20-poly1305",
@@ -792,9 +792,9 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "loom"
-version = "0.7.2"
+version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "419e0dc8046cb947daa77eb95ae174acfbddb7673b4151f56d1eed8e93fbfaca"
+checksum = "f1611ddbf89dc6ae42cfbd51fc207836140130257646eab8d6d2fb16577db2d2"
 dependencies = [
  "cfg-if",
  "generator",
@@ -858,9 +858,9 @@ checksum = "add0ac067452ff1aca8c5002111bd6b1c895baee6e45fcbc44e0193aea17be56"
 
 [[package]]
 name = "noise_sv2"
-version = "2.0.0"
+version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21d54d5ba485f6a44a4195336cdbedca81e9afa875e656d7b28661ca9974c475"
+checksum = "4203061a5fdb8edc19f2e8d0208c8784d89290f6ad2b2839b3af253394d13ebf"
 dependencies = [
  "chacha20poly1305",
  "rand",
@@ -1048,6 +1048,8 @@ name = "rbitcoin-electrum"
 version = "0.9.99"
 dependencies = [
  "bitcoin",
+ "libc",
+ "mutants",
  "rbitcoin-consensus",
  "rbitcoin-log",
  "rbitcoin-net",
@@ -1066,6 +1068,9 @@ dependencies = [
  "axum",
  "bitcoin",
  "http",
+ "hyper",
+ "hyper-util",
+ "mutants",
  "rbitcoin-consensus",
  "rbitcoin-electrum",
  "rbitcoin-log",
@@ -1086,6 +1091,7 @@ version = "0.9.99"
 dependencies = [
  "bitcoin",
  "libc",
+ "mutants",
  "rbitcoin-consensus",
  "rbitcoin-log",
  "rbitcoin-net",
@@ -1139,9 +1145,12 @@ name = "rbitcoin-node"
 version = "0.9.99"
 dependencies = [
  "axum",
+ "base64",
  "bitcoin",
  "bitcoin_hashes 0.14.101",
  "getrandom 0.4.3",
+ "hyper",
+ "hyper-util",
  "libc",
  "mimalloc",
  "rbitcoin-consensus",
@@ -1240,6 +1249,7 @@ dependencies = [
 name = "rbitcoin-test"
 version = "0.9.99"
 dependencies = [
+ "base64",
  "binary_sv2",
  "bitcoin",
  "rbitcoin-cli",
@@ -1444,9 +1454,9 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shuttle"
-version = "0.9.9"
+version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d84550ec050f1512e6b8067087db7d00547f0ba0c1e2273f4920a573cd5a128d"
+checksum = "1fce0202e2bfb3a4bbdba196709368f2f7b5eb6129898e7526a2e42fcd4f19b1"
 dependencies = [
  "bitvec",
  "cfg-if",
@@ -1466,9 +1476,9 @@ dependencies = [
 
 [[package]]
 name = "shuttle-engine"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cf6dad68d0b9d252e56ba6374e05b542b659ee076cf7f319f7c1312d5879d65"
+checksum = "c0419bad464f0ca6f72baa2b4f0ae60fdd6ed2a413711697192754437fd9b872"
 dependencies = [
  "assoc",
  "bitvec",

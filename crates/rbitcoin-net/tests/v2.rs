@@ -550,10 +550,11 @@ async fn decoy_packet_is_handed_to_the_rate_hook() {
         let (r, _w) = protocol.into_split();
         let mut reader = V2SessionReader::from_protocol_reader(r);
         let mut seen = Vec::new();
+        let mut last_progress = 0usize;
         let frame = read_v2_frame_with_progress(
             &mut reader,
             magic,
-            |_| {},
+            |n, _| last_progress = n,
             |n| {
                 seen.push(n);
                 Ok(())
@@ -561,7 +562,7 @@ async fn decoy_packet_is_handed_to_the_rate_hook() {
         )
         .await
         .expect("genuine frame after decoy");
-        (seen, frame.is_ping())
+        (seen, frame.is_ping(), last_progress)
     });
 
     let (rh, wh) = tokio::io::split(client);
@@ -585,12 +586,18 @@ async fn decoy_packet_is_handed_to_the_rate_hook() {
     raw_w.write_all(&packet).await.unwrap();
     raw_w.flush().await.unwrap();
 
-    let (seen, is_ping) = tokio::time::timeout(std::time::Duration::from_secs(5), server_task)
-        .await
-        .expect("decoy read timed out")
-        .expect("server task join");
+    let (seen, is_ping, last_progress) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), server_task)
+            .await
+            .expect("decoy read timed out")
+            .expect("server task join");
     assert!(!seen.is_empty(), "a decoy must reach the rate hook");
     assert!(is_ping, "the genuine packet after the decoy is the ping");
+    let ping_len = encode_v2_contents(NetworkMessage::Ping(7)).unwrap().len();
+    assert_eq!(
+        last_progress, ping_len,
+        "the last progress value is the contents length"
+    );
 }
 
 /// Tip-follow and the IBD reader both call [`rbitcoin_net::peer_dos::decoy_stays`].
@@ -619,7 +626,7 @@ async fn decoy_over_the_window_scores_like_other_frames() {
         let frame = read_v2_frame_with_progress(
             &mut reader,
             magic,
-            |_| {},
+            |_, _| {},
             |n| {
                 if decoy_stays(&mut rate, &mut score, n, BAN_SCORE_THRESHOLD) {
                     Ok(())
@@ -669,6 +676,13 @@ async fn decoy_over_the_window_scores_like_other_frames() {
 fn truncated_v2_long_command_is_protocol() {
     assert!(matches!(
         parse_v2_contents(signet_magic(), &[0u8, b'v', b'e']),
+        Err(NetError::Protocol("truncated v2 long command"))
+    ));
+    // Twelve bytes is one short of the long-command header. A threshold of
+    // `1 * 12` treats it as complete and reads past the buffer.
+    let twelve = [0u8; 12];
+    assert!(matches!(
+        parse_v2_contents(signet_magic(), &twelve),
         Err(NetError::Protocol("truncated v2 long command"))
     ));
 }

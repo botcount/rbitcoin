@@ -95,6 +95,23 @@ fn filter_at_height_reads_only_its_record_and_survives_reopen() {
     assert!(matches!(gap, Err(StoreError::Corrupt(m)) if m.contains("next height")));
 }
 
+/// Checkpoint headers are heights 1000, 2000, … and nothing in between.
+#[test]
+fn checkpoint_headers_are_every_thousandth_slot() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 2_500);
+    assert_eq!(
+        t.checkpoint_headers(Height(999)).unwrap(),
+        Some(Vec::<[u8; 32]>::new())
+    );
+    assert_eq!(
+        t.checkpoint_headers(Height(2_500)).unwrap(),
+        Some(vec![slot(1_000).filter_header, slot(2_000).filter_header])
+    );
+    assert!(t.checkpoint_headers(Height(2_501)).unwrap().is_none());
+}
+
 /// Crash states a live session cannot produce on demand: a commit that
 /// synced body bytes but not its slots, then an idx HWM covering a slot
 /// whose record is cut short. Open keeps the committed prefix each time.
@@ -160,4 +177,12 @@ fn rolls_a_segment_when_the_next_start_passes_u32() {
     t.truncate_through(Some(Height(0))).unwrap();
     assert!(!BlockFilterTable::seg_dirs(&dir).body_path(1).exists());
     assert_eq!(t.next_height(), Height(1));
+}
+
+#[test]
+fn block_filter_slot_roundtrip_keeps_the_row() {
+    let row = decode_slot(&encode_slot(9, 40, &slot(3)));
+    assert_eq!(row.off, 9);
+    assert_eq!(row.len, 40);
+    assert_eq!(row.slot, slot(3));
 }

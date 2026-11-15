@@ -575,6 +575,7 @@ pub struct RewindPrep {
 pub fn prepare_header_rewind(
     hub: &ChainHub,
     path: &[BlockHash],
+    max_depth: u32,
 ) -> Result<Option<RewindPrep>, NetError> {
     if path.is_empty() {
         return Ok(None);
@@ -592,9 +593,9 @@ pub fn prepare_header_rewind(
     };
     let tip_h = hub.tip_height().unwrap_or(0);
     let rewound = tip_h > lca_h;
-    if tip_h.saturating_sub(lca_h) > REWIND_MAX_DEPTH {
+    if tip_h.saturating_sub(lca_h) > max_depth {
         warn!(
-            "ibd: heavier fork rewind depth {} exceeds cap {REWIND_MAX_DEPTH} (lca={lca_h} tip={tip_h})",
+            "ibd: heavier fork rewind depth {} exceeds cap {max_depth} (lca={lca_h} tip={tip_h})",
             tip_h.saturating_sub(lca_h)
         );
         return Ok(None);
@@ -677,13 +678,9 @@ pub fn commit_header_rewind(
             slot.chain.note_rewind(&st.height_to_hash, prep.lca_h);
         }
     }
-    for h in hub.query.block_queue_queued_heights() {
-        if h > prep.lca_h {
-            let _ = hub.query.block_queue_dequeue_height(h);
-        }
-    }
+    let _ = hub.query.block_queue_dequeue_above(prep.lca_h);
     st.reorg.clear_explore();
-    st.confirm_quiesce = true;
+    st.quiesce_refund();
 }
 
 pub fn apply_header_rewind(
@@ -691,7 +688,8 @@ pub fn apply_header_rewind(
     hub: &ChainHub,
     path: &[BlockHash],
 ) -> Result<bool, NetError> {
-    let Some(prep) = prepare_header_rewind(hub, path)? else {
+    let cap = super::header_walk::rewind_depth_cap(st, hub);
+    let Some(prep) = prepare_header_rewind(hub, path, cap)? else {
         return Ok(false);
     };
     commit_header_rewind(st, hub, path, &prep);
@@ -778,7 +776,11 @@ pub(crate) fn apply_off_lock_rewind(
         return Ok(None);
     };
     let tip_before = tip_pair(hub);
-    let Some(prep) = prepare_header_rewind(hub, &path)? else {
+    let cap = {
+        let st = shared.lock().unwrap_or_else(|err| err.into_inner());
+        super::header_walk::rewind_depth_cap(&st, hub)
+    };
+    let Some(prep) = prepare_header_rewind(hub, &path, cap)? else {
         return Ok(None);
     };
     // Re-selecting here would see the LCA we just rewound to and return

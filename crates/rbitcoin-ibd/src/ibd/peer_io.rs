@@ -21,7 +21,7 @@ use rbitcoin_net::peer_dos::{PeerRateLimiter, RATE_LIMIT_BAN_SCORE};
 use rbitcoin_net::v2::{read_v2_frame_with_progress, write_v2_msg_offload, V2Reader, V2Writer};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
@@ -145,6 +145,8 @@ pub struct PeerSlot {
     pub requested: Arc<Mutex<HashSet<BlockHash>>>,
     /// Bytes of blocks this peer was asked for. Stall-clock input.
     pub solicited_bytes: Arc<AtomicU64>,
+    /// Bytes of the block frame still on the socket. Zero for pings and headers.
+    pub open_block_bytes: Arc<AtomicU64>,
     /// Mono ms of the last solicited block the reader accepted.
     pub solicited_ms: Arc<AtomicU64>,
     /// Mono ms of the last socket read, including pings. Quiet stall only.
@@ -364,6 +366,15 @@ impl PeerSlot {
     /// not answer `notfound` for it recently.
     pub fn may_take_block(&self, hash: &BlockHash, now_ms: u64) -> bool {
         self.takes_block_requests() && !self.chain.lacks(hash, now_ms)
+    }
+
+    /// Finished solicited bytes plus the open block frame, since the stamp.
+    /// Pings, headers, and other socket bytes stay on `bytes_rx_total`.
+    pub fn solicited_since_progress(&self) -> u64 {
+        self.solicited_bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(self.open_block_bytes.load(Ordering::Relaxed))
+            .saturating_sub(self.rate.bytes_at_progress)
     }
 
     /// Pause block download until `until` and withdraw what this peer owed.
@@ -605,7 +616,6 @@ pub fn sample_peer_rates(slots: &mut [PeerSlot], now_ms: u64) {
         if !s.alive {
             continue;
         }
-        let total = s.bytes_rx_total.load(Ordering::Relaxed);
         let any = s.any_rx_ms.load(Ordering::Relaxed);
         if any > s.rate.any_rx_ms {
             s.rate.any_rx_ms = any;
@@ -620,10 +630,10 @@ pub fn sample_peer_rates(slots: &mut [PeerSlot], now_ms: u64) {
         if asked > s.rate.work_started_ms {
             s.rate.work_started_ms = asked;
         }
-        let bytes = s.solicited_bytes.load(Ordering::Relaxed);
-        s.rate.sample(now_ms, bytes, !s.in_flight.is_empty());
+        let solicited = s.solicited_bytes.load(Ordering::Relaxed);
+        s.rate.sample(now_ms, solicited, !s.in_flight.is_empty());
         if s.rate.progress_ms > progress_before {
-            s.rate.note_bytes_at_progress(total);
+            s.rate.note_bytes_at_progress(solicited);
         }
     }
 }
@@ -632,7 +642,7 @@ pub fn note_block_progress(slots: &mut [PeerSlot], peer: usize) {
     if let Some(s) = slots.iter_mut().find(|s| s.id == peer) {
         s.rate.note_rx(ibd_mono_ms());
         s.rate
-            .note_bytes_at_progress(s.bytes_rx_total.load(Ordering::Relaxed));
+            .note_bytes_at_progress(s.solicited_bytes.load(Ordering::Relaxed));
     }
 }
 
@@ -641,7 +651,7 @@ pub fn note_block_rx(slots: &mut [PeerSlot], peer: usize, wire_bytes: usize) {
         let now = ibd_mono_ms();
         s.rate.note_rx(now);
         s.rate
-            .note_bytes_at_progress(s.bytes_rx_total.load(Ordering::Relaxed));
+            .note_bytes_at_progress(s.solicited_bytes.load(Ordering::Relaxed));
         if wire_bytes > 0 && s.first_data_ms == 0 {
             s.first_data_ms = now;
         }
@@ -668,6 +678,30 @@ impl LightDecodes {
         self.tasks.retain(|t| !t.is_finished());
         self.tasks.push(task);
     }
+}
+
+/// Count `buffered` toward the open block when this frame cannot be a
+/// `headers` message and this peer still owes a block. Otherwise clear it.
+#[doc(hidden)]
+pub fn note_open_block(
+    open: &AtomicU64,
+    requested: &Mutex<HashSet<BlockHash>>,
+    contents_len: usize,
+    buffered: usize,
+) {
+    if contents_len <= rbitcoin_net::codec::MAX_HEADERS_CONTENTS {
+        open.store(0, Ordering::Relaxed);
+        return;
+    }
+    let owed = !requested
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty();
+    if !owed {
+        open.store(0, Ordering::Relaxed);
+        return;
+    }
+    open.store(buffered as u64, Ordering::Relaxed);
 }
 
 #[doc(hidden)]
@@ -698,6 +732,63 @@ pub fn decoy_hook(
     }
 }
 
+/// One queued pong. The reader stores the latest nonce; the writer emits it.
+#[doc(hidden)]
+pub struct IbdPong {
+    nonce: AtomicU64,
+    pending: AtomicBool,
+}
+
+impl Default for IbdPong {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IbdPong {
+    pub fn new() -> Self {
+        Self {
+            nonce: AtomicU64::new(0),
+            pending: AtomicBool::new(false),
+        }
+    }
+
+    /// Store `n`. `true` when the caller should queue the single pong.
+    pub fn note(&self, n: u64) -> bool {
+        self.nonce.store(n, Ordering::Release);
+        self.pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Nonce to write for a queued pong. `queued` is the fallback when this
+    /// slot is not tracking a session pong.
+    pub fn wire_nonce(&self, queued: u64) -> u64 {
+        if self.pending.load(Ordering::Acquire) {
+            self.nonce.load(Ordering::Acquire)
+        } else {
+            queued
+        }
+    }
+
+    /// Clear the slot after the write. A ping that landed during the write
+    /// is claimed again.
+    pub fn finish(&self, written: u64) -> Option<u64> {
+        self.pending.store(false, Ordering::Release);
+        let now = self.nonce.load(Ordering::Acquire);
+        if now != written
+            && self
+                .pending
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            Some(now)
+        } else {
+            None
+        }
+    }
+}
+
 /// Reader state for one IBD peer. The socket loop only pulls frames.
 #[doc(hidden)]
 pub struct IbdReadCtx {
@@ -714,6 +805,7 @@ pub struct IbdReadCtx {
     pub rate: PeerRateLimiter,
     pub logged_invalid_v2: bool,
     pub ban_score: u32,
+    pub pong: Arc<IbdPong>,
 }
 
 #[doc(hidden)]
@@ -778,8 +870,7 @@ impl IbdReadCtx {
     #[doc(hidden)]
     pub fn dispatch_frame(&mut self, frame: FramedMessage) -> bool {
         if frame.is_ping() {
-            self.on_ping(&frame);
-            return false;
+            return self.on_ping(&frame);
         }
         if frame.is_block() {
             return self.on_block(frame);
@@ -794,10 +885,16 @@ impl IbdReadCtx {
     }
 
     #[doc(hidden)]
-    pub fn on_ping(&self, frame: &FramedMessage) {
-        if let Some(n) = frame.ping_nonce() {
-            let _ = self.out_tx.send(NetworkMessage::Pong(n));
+    pub fn on_ping(&mut self, frame: &FramedMessage) -> bool {
+        if self.score_overflow(frame.payload.len()) {
+            return true;
         }
+        if let Some(n) = frame.ping_nonce() {
+            if self.pong.note(n) {
+                let _ = self.out_tx.send(NetworkMessage::Pong(n));
+            }
+        }
+        false
     }
 
     #[doc(hidden)]
@@ -925,11 +1022,14 @@ pub async fn read_ibd_peer(
     bytes_io: Arc<AtomicU64>,
     requested: Arc<Mutex<HashSet<BlockHash>>>,
     solicited_bytes: Arc<AtomicU64>,
+    open_block_bytes: Arc<AtomicU64>,
     any_rx_ms: Arc<AtomicU64>,
     solicited_ms: Arc<AtomicU64>,
     light_decode: Arc<Semaphore>,
+    pong: Arc<IbdPong>,
 ) {
     let mut prog_mark = 0usize;
+    let requested_progress = Arc::clone(&requested);
     let mut ctx = IbdReadCtx {
         id,
         out_tx,
@@ -942,21 +1042,79 @@ pub async fn read_ibd_peer(
         rate: PeerRateLimiter::default_limits(),
         logged_invalid_v2: false,
         ban_score: 0,
+        pong: Arc::clone(&pong),
     };
     reader.enable_ibd_ciphertext_buf();
     loop {
         let frame = read_v2_frame_with_progress(
             &mut reader,
             magic,
-            |buffered| note_read_progress(&bytes_io, &any_rx_ms, &mut prog_mark, buffered),
-            |n| decoy_hook(&mut ctx.rate, &mut ctx.ban_score, n),
+            |buffered, contents_len| {
+                note_read_progress(&bytes_io, &any_rx_ms, &mut prog_mark, buffered);
+                note_open_block(
+                    &open_block_bytes,
+                    &requested_progress,
+                    contents_len,
+                    buffered,
+                );
+            },
+            |n| {
+                open_block_bytes.store(0, Ordering::Relaxed);
+                decoy_hook(&mut ctx.rate, &mut ctx.ban_score, n)
+            },
         )
         .await;
         // The progress mark is per read. The next frame starts at zero.
         prog_mark = 0;
-        if ctx.handle(frame) {
+        let stop = ctx.handle(frame);
+        open_block_bytes.store(0, Ordering::Relaxed);
+        if stop {
             break;
         }
+    }
+}
+
+/// Writes one IBD pong nonce. The future may borrow `self` until it is awaited.
+#[doc(hidden)]
+pub trait IbdPongEmit {
+    /// `Send` so the spawned IBD writer can await the write.
+    #[allow(clippy::manual_async_fn)]
+    fn emit(
+        &mut self,
+        nonce: u64,
+    ) -> impl std::future::Future<Output = Result<(), NetError>> + Send + '_;
+}
+
+/// Write the queued pong and every nonce that arrives during a write.
+///
+/// The pending slot is clear when this returns `Ok`.
+#[doc(hidden)]
+pub async fn write_ibd_pong<E: IbdPongEmit>(
+    pong: &IbdPong,
+    queued: u64,
+    emit: &mut E,
+) -> Result<(), NetError> {
+    let mut nonce = pong.wire_nonce(queued);
+    loop {
+        emit.emit(nonce).await?;
+        match pong.finish(nonce) {
+            Some(extra) => nonce = extra,
+            None => return Ok(()),
+        }
+    }
+}
+
+struct IbdPongWriter<'a> {
+    writer: &'a mut V2Writer,
+}
+
+impl IbdPongEmit for IbdPongWriter<'_> {
+    #[allow(clippy::manual_async_fn)]
+    fn emit(
+        &mut self,
+        nonce: u64,
+    ) -> impl std::future::Future<Output = Result<(), NetError>> + Send + '_ {
+        async move { write_v2_msg_offload(self.writer, NetworkMessage::Pong(nonce)).await }
     }
 }
 
@@ -967,6 +1125,7 @@ pub async fn write_ibd_peer(
     mut writer: V2Writer,
     sinks_w: PeerEventSinks,
     wire: Arc<GetdataWire>,
+    pong: Arc<IbdPong>,
 ) {
     loop {
         tokio::select! {
@@ -1028,7 +1187,16 @@ pub async fn write_ibd_peer(
             msg = out_rx.recv() => {
                 match msg {
                     Some(payload) => {
-                        if write_v2_msg_offload(&mut writer, payload).await.is_err() {
+                        let failed = match payload {
+                            NetworkMessage::Pong(queued) => {
+                                let mut emit = IbdPongWriter {
+                                    writer: &mut writer,
+                                };
+                                write_ibd_pong(&pong, queued, &mut emit).await.is_err()
+                            }
+                            other => write_v2_msg_offload(&mut writer, other).await.is_err(),
+                        };
+                        if failed {
                             sinks_w.send_body(PeerEvent::Dead {
                                 peer: id,
                                 reason: "write outbound failed".into(),
@@ -1088,14 +1256,18 @@ pub async fn spawn_peer(
     // Reader → writer for pongs (must not write on the read task — that would
     // stall the receive half and look like a peer stall).
     let (out_tx, out_rx) = mpsc::unbounded_channel::<NetworkMessage>();
+    let pong = Arc::new(IbdPong::new());
+    let pong_r = Arc::clone(&pong);
     let bytes_rx_total = Arc::new(AtomicU64::new(0));
     let bytes_io = Arc::clone(&bytes_rx_total);
     let (requested, solicited_bytes, solicited_ms) = solicit_track();
+    let open_block_bytes = Arc::new(AtomicU64::new(0));
     let any_rx_ms = Arc::new(AtomicU64::new(0));
     let getdata_wire = GetdataWire::new();
     let wire_w = Arc::clone(&getdata_wire);
     let req_r = Arc::clone(&requested);
     let sol_bytes_r = Arc::clone(&solicited_bytes);
+    let open_block_r = Arc::clone(&open_block_bytes);
     let any_rx_r = Arc::clone(&any_rx_ms);
     let sol_ms_r = Arc::clone(&solicited_ms);
     let light_decode = Arc::new(Semaphore::new(LIGHT_DECODE_PERMITS));
@@ -1130,16 +1302,20 @@ pub async fn spawn_peer(
             bytes_io,
             req_r,
             sol_bytes_r,
+            open_block_r,
             any_rx_r,
             sol_ms_r,
             light_decode,
+            pong_r,
         ));
 
         // Let the reader poll once before we accept write work (getheaders).
         tokio::task::yield_now().await;
 
         let sinks_w = sinks;
-        let writer_task = tokio::spawn(write_ibd_peer(id, cmd_rx, out_rx, writer, sinks_w, wire_w));
+        let writer_task = tokio::spawn(write_ibd_peer(
+            id, cmd_rx, out_rx, writer, sinks_w, wire_w, pong,
+        ));
 
         let mut guard = PeerIoTasks {
             reader: reader_task,
@@ -1159,6 +1335,7 @@ pub async fn spawn_peer(
         in_flight: HashSet::new(),
         requested,
         solicited_bytes,
+        open_block_bytes,
         solicited_ms,
         any_rx_ms,
         getdata_wire,

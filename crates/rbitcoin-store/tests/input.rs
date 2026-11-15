@@ -1,5 +1,6 @@
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::error::StoreError;
+use rbitcoin_store::file::FILE_HEADER_LEN;
 use rbitcoin_store::input::*;
 use rbitcoin_store::testutil::TempDir;
 
@@ -129,6 +130,25 @@ fn input_append_reopen_reads_last_edges() {
         vec![edge(9, 3), edge(9, 4)]
     );
     assert_eq!(t.edges(Fk(1)).unwrap().unwrap(), vec![edge(1, 0)]);
+}
+
+/// Create 1025's body starts at the checkpoint open read from `input.off`.
+#[test]
+fn input_open_reads_the_checkpoint() {
+    let dir = TempDir::labeled("input-checkpoint").unwrap();
+    let t = Input::create(dir.path()).unwrap();
+    let mut batch = vec![vec![edge(7, 1)]; 1024];
+    batch.push(vec![edge(9, 3), edge(9, 4)]);
+    t.append(&batch).unwrap();
+    drop(t);
+    let t = Input::open(dir.path()).unwrap();
+    let cps = t.checkpoints.read().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(cps.as_slice(), &[FILE_HEADER_LEN as u64 + 1024 * REC_LEN]);
+    drop(cps);
+    assert_eq!(
+        t.edges(Fk(1025)).unwrap().unwrap(),
+        vec![edge(9, 3), edge(9, 4)]
+    );
 }
 
 #[test]

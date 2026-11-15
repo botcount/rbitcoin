@@ -7,7 +7,7 @@ Listener behavior, DoS limits, and the mempool.space nginx recipe stay in
 [`COMPAT.md`](../COMPAT.md) and [`rpc.md`](./rpc.md).
 
 Chains the node actually runs: `mainnet`, `testnet` (testnet3), `testnet4`,
-`signet`, `regtest`.
+`testnet5`, `signet`, `regtest`.
 
 0.x. The Electrum and Esplora listeners are the wallet product. Core
 wallet RPC (`importdescriptors`, `walletcreatefundedpsbt`,
@@ -24,9 +24,11 @@ watches use those, so they are documented in [`lightning.md`](./lightning.md).
 
 Electrum is plain TCP (`--electrum-listen`). TLS terminates at a reverse
 proxy ([`operator/interfaces.md`](./operator/interfaces.md)). With
-`--tor-control`, the node publishes an onion for that port and advertises
-`tcp_port` only (no `ssl_port`). Sparrow's onion URL is
-`tcp://<id>.onion:<port>`.
+`--tor-control` and `--electrum-onion`, and `--electrum-listen` bound to
+`127.0.0.1` or `0.0.0.0`, the node publishes an onion for that port and
+advertises `tcp_port` only (no `ssl_port`). Without `--electrum-onion`
+there is no onion and `server.features.hosts` is `{}`. Sparrow's onion URL
+is `tcp://<id>.onion:<port>`.
 
 Esplora is plain HTTP (`--esplora-listen`). There is no WebSocket. A
 wallet that wants push notifications uses Electrum subscriptions. The
@@ -104,14 +106,18 @@ balances and history.
 | Sparrow, private Electrum | Server type **Private Electrum**, TCP `127.0.0.1:50001`. Sparrow sees `electrumx` in `server.version[0]` and sends address lookups as JSON-RPC batches. Silent Payments uses Frigate `blockchain.silentpayments.subscribe`, which is implemented. Add `--sp-tweaks` so that scan is indexed. Sparrow's **Bitcoin Core** server type imports a descriptor wallet and does not apply. |
 | Liana v7+ | Backend **Electrum server** at `127.0.0.1:50001`. The bitcoind backend wants Core's descriptor wallet (Core 24+, 26+ for Taproot) and does not apply. |
 | Specter Desktop 2.0 | **External Electrum**. The Bitcoin Core connection needs `disablewallet=0` and wallet RPC, which this node does not serve. |
-| Cake Wallet | Electrum server as above, plus `--sp-tweaks` and `--sp-tweaks-dust 546` (Cake's electrs dust floor; our default is 1000). `server.version[0]` is `rbitcoin-electrs <ver> electrumx` so Cake's electrs probe will call `blockchain.tweaks.subscribe`. A Cake build that still hardcodes `electrs.cakewallet.com` will not use the server you typed. |
+| Cake Wallet | Electrum server as above, plus `--sp-tweaks` and `--sp-tweaks-dust 545` (Cake's electrs keeps `value >= 546`, and this node omits `value <= SATS`; our default is 1000). `server.version[0]` is `rbitcoin-electrs <ver> electrumx` so Cake's electrs probe will call `blockchain.tweaks.subscribe`. A Cake build that still hardcodes `electrs.cakewallet.com` will not use the server you typed. |
 | Dana, and other wallets on spdk's BlindBit v1 backend | Esplora listener plus `--sp-tweaks`; BlindBit URL `http://127.0.0.1:3000/blindbit/v1`. The client scans locally from tweaks and filters ([`COMPAT.md`](../COMPAT.md#blindbit-oracle-v1-silent-payments-over-http)). |
 | BlueWallet, Stack Wallet, Keeper, Nunchuk, BitBox App, Envoy / Passport, Caravan, MyCitadel, Blockstream Green personal server | The app's custom Electrum or Esplora field. Same listeners as the table above. |
 | BDK wallets on Esplora (Alby Hub's chain source, and the same client shape Mutiny used) | `http://127.0.0.1:3000`, or TLS in front of that port. |
 
-`--sp-tweaks` is refused together with `--prune-seqsigwit`. Cake, Dana and
-Sparrow Silent Payments need the tweak index, so that prune stays off
-for those wallets.
+`--sp-tweaks` can run with `--prune-seqsigwit` when the index is enabled
+before taproot, or later once every height from that origin through the
+dropped range is sealed or still in the last 288 blocks. From then on,
+confirm seals tweaks from the wire block. Once a taproot height has been
+dropped and was never sealed, the index cannot be built. Cake, Dana, and
+Sparrow still need the index, so a pruned wallet node has to cover those
+heights before they are dropped.
 
 ## Wasabi
 

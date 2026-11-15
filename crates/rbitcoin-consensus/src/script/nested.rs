@@ -43,10 +43,8 @@ pub fn try_p2sh_nested_segwit(
     }
 
     let script_sig = &tx.input[input_index.get()].script_sig;
-    if items.is_empty() {
-        return None;
-    }
-    let redeem = items.last().unwrap().as_slice();
+    let (redeem_item, _) = items.split_last()?;
+    let redeem = redeem_item.as_slice();
     let (version, program) = classify::witness_program(Script::from_bytes(redeem))?;
 
     // Core: scriptSig must be exactly CScript() << redeem (minimal single push).
@@ -62,19 +60,17 @@ pub fn try_p2sh_nested_segwit(
         return Some(Err(ConsensusError::Script("EVAL_FALSE".into())));
     }
 
-    Some(match (version, program.len()) {
-        (0, 20) if super::needs_interpreted_ecdsa(job) => {
-            p2wpkh::verify_interpreted(job, input_index, tx, program, amount)
+    Some(match (version, classify::program_len(program)) {
+        (0, classify::ProgramLen::N20(keyhash)) if super::needs_interpreted_ecdsa(job) => {
+            p2wpkh::verify_interpreted(job, input_index, tx, keyhash, amount)
         }
-        (0, 20) => {
-            let keyhash: &[u8; 20] = program.try_into().expect("20-byte witness program");
+        (0, classify::ProgramLen::N20(keyhash)) => {
             p2wpkh::verify_with_keyhash(job, input_index, tx, keyhash, redeem, pre, amount)
         }
-        (0, 32) => {
-            let scripthash: &[u8; 32] = program.try_into().expect("32-byte witness program");
+        (0, classify::ProgramLen::N32(scripthash)) => {
             p2wsh::verify_with_scripthash(job, input_index, tx, scripthash, amount)
         }
-        (0, _) => Err(ConsensusError::Script(
+        (0, classify::ProgramLen::Other(_)) => Err(ConsensusError::Script(
             "WITNESS_PROGRAM_WRONG_LENGTH".into(),
         )),
         // v1..=16 in P2SH: Core VerifyWitnessProgram else-branch (no Taproot,
@@ -95,10 +91,9 @@ pub fn verify_p2sh_legacy(
     amount: Amount,
     outer: &[u8],
 ) -> Result<(), ConsensusError> {
-    if stack.is_empty() {
+    let Some(redeem) = stack.pop() else {
         return Err(ConsensusError::Script("p2sh empty scriptSig".into()));
-    }
-    let redeem = stack.pop().unwrap();
+    };
     check_p2sh_redeem_hash(outer, &redeem)?;
 
     let redeem_script = Script::from_bytes(&redeem);

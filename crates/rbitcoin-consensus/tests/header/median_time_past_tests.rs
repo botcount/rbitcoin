@@ -33,10 +33,19 @@ fn validate_header_on_parent_uses_the_caller_digest() {
     rbitcoin_consensus::grind_regtest_pow(&mut header);
     let hash = header.block_hash().to_byte_array();
     rbitcoin_consensus::clock::with_now(1_700_000_000, || {
-        validate_header_on_parent(&params, Height(1), &header, 0, 0, header.bits, hash).unwrap();
-        let err =
-            validate_header_on_parent(&params, Height(1), &header, 0, 0, header.bits, [0xff; 32])
-                .unwrap_err();
+        validate_header_on_parent(&params, Height(1), &header, 0, 0, None, header.bits, hash)
+            .unwrap();
+        let err = validate_header_on_parent(
+            &params,
+            Height(1),
+            &header,
+            0,
+            0,
+            None,
+            header.bits,
+            [0xff; 32],
+        )
+        .unwrap_err();
         assert!(matches!(err, ConsensusError::InvalidPow), "{err:?}");
         let err = validate_header_on_parent(
             &params,
@@ -44,6 +53,7 @@ fn validate_header_on_parent_uses_the_caller_digest() {
             &header,
             0,
             0,
+            None,
             CompactTarget::from_consensus(0x1d00_ffff),
             hash,
         )
@@ -626,4 +636,49 @@ fn regtest_retarget_refuses_a_period_the_clamp_cannot_carry() {
         let step = difficulty_float(bits.to_consensus()) / difficulty_float(prev.to_consensus());
         assert!((step - 4.0).abs() < 0.01, "difficulty rose {step}x");
     }
+}
+
+#[test]
+fn regtest_retarget_clamps_an_easy_base_and_a_tiny_result() {
+    let mut params = ChainParams::regtest();
+    params.apply_regtest_retarget(1, 4).unwrap();
+    let ret = params.regtest_retarget.unwrap();
+    let easy = params.pow_limit.to_compact_lossy();
+    assert!(Target::from_compact(easy) > ret.ceiling);
+    let t = 1_000_000u32;
+    let clamped = retarget_bits(
+        &params,
+        easy,
+        t + 4,
+        PeriodFirst {
+            time: t,
+            bits: easy,
+        },
+    );
+    assert!(Target::from_compact(clamped) <= ret.ceiling);
+    // Four times the target timespan is the retarget cap, so this easy base
+    // comes back as the ceiling compact.
+    let stretched = retarget_bits(
+        &params,
+        easy,
+        t + 1_000,
+        PeriodFirst {
+            time: t,
+            bits: easy,
+        },
+    );
+    assert_eq!(stretched, ret.ceiling.to_compact_lossy());
+
+    let floor_bits = ret.floor.to_compact_lossy();
+    let sunk = retarget_bits(
+        &params,
+        floor_bits,
+        t,
+        PeriodFirst {
+            time: t + 100,
+            bits: floor_bits,
+        },
+    );
+    assert!(Target::from_compact(sunk) >= ret.floor);
+    assert_ne!(sunk.to_consensus(), 0);
 }

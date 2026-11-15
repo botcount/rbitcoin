@@ -56,7 +56,7 @@ pub fn rpc_btc_network(n: Network) -> BtcNetwork {
         Network::Mainnet => BtcNetwork::Bitcoin,
         Network::Testnet => BtcNetwork::Testnet,
         Network::Signet => BtcNetwork::Signet,
-        Network::Testnet4 => BtcNetwork::Testnet4,
+        Network::Testnet4 | Network::Testnet5 => BtcNetwork::Testnet4,
         Network::Regtest => BtcNetwork::Regtest,
     }
 }
@@ -194,31 +194,24 @@ pub fn generate_with_mempool(
     nblocks: u32,
     script: ScriptBuf,
 ) -> Result<Value, Value> {
-    let miner = require_regtest_miner(ctx, "generate")?;
+    let _miner = require_regtest_miner(ctx, "generate")?;
     if nblocks == 0 {
         return Ok(hashes_json(&[]));
     }
-    let listing = ctx.pool_listing();
     // Catch-up leaves confirmed transactions in the pool, so mine the coinbase
     // only. Any other listing is removed when the block that contains it is
     // accepted, including while relay is off, and before a later block of this
     // call is mined. A refusal before that block leaves the pool as it was.
-    let extras = if matches!(listing, PoolListing::Downloading) {
-        Vec::new()
+    let chain = ctx
+        .chain
+        .as_ref()
+        .ok_or_else(|| rpc_error(ERR_MISC, "generate requires a live chain hub"))?;
+    let mined = if matches!(ctx.pool_listing(), PoolListing::Downloading) {
+        chain.generate_to_script_for_rpc(nblocks, script, Vec::new(), true)
     } else {
-        let min = ctx
-            .chain
-            .as_ref()
-            .map(|c| c.block_min_tx_fee_sat_kvb())
-            .unwrap_or(1);
-        ctx.mempool
-            .as_ref()
-            .map(|mp| mp.select_generate_txs(min))
-            .unwrap_or_default()
+        chain.generate_pool_for_rpc(nblocks, script)
     };
-    let hashes = miner
-        .generate_to_script(nblocks, script, extras, true)
-        .map_err(|e| rpc_error(ERR_MISC, e))?;
+    let hashes = mined.map_err(|e| generate_error(&submit_reject_reason(&e)))?;
     Ok(hashes_json(&hashes))
 }
 
@@ -233,24 +226,14 @@ pub async fn generate_with_mempool_async(
     if nblocks == 0 {
         return Ok(hashes_json(&[]));
     }
-    let blocksonly = ctx.blocksonly;
-    let mempool = ctx.mempool.clone();
-    let min = chain.block_min_tx_fee_sat_kvb();
-    let extras = rbitcoin_net::off_pool(move || -> Vec<Transaction> {
-        let downloading = !blocksonly && mempool.as_ref().is_some_and(|m| !m.pool_maintained());
-        if downloading {
-            return Vec::new();
-        }
-        mempool
-            .as_ref()
-            .map(|mp| mp.select_generate_txs(min))
-            .unwrap_or_default()
-    })
-    .await;
-    let hashes = chain
-        .generate_to_script_for_rpc_async(nblocks, script, extras, true)
-        .await
-        .map_err(|e| rpc_error(ERR_MISC, submit_reject_reason(&e)))?;
+    let mined = if matches!(ctx.pool_listing(), PoolListing::Downloading) {
+        chain
+            .generate_to_script_for_rpc_async(nblocks, script, Vec::new(), true)
+            .await
+    } else {
+        chain.generate_pool_for_rpc_async(nblocks, script).await
+    };
+    let hashes = mined.map_err(|e| generate_error(&submit_reject_reason(&e)))?;
     Ok(hashes_json(&hashes))
 }
 
@@ -374,7 +357,7 @@ pub async fn generateblock_async(ctx: &RpcContext, params: &RpcParams) -> Result
 /// Core reads the count with `getInt<int>`, and `generateBlocks` mines
 /// nothing for a count at or below zero.
 fn generate_count(params: &RpcParams, name: &str) -> Result<u32, Value> {
-    Ok(params.req_core_int(0, name)?.max(0) as u32)
+    Ok(params.req_core_int::<i32>(0, name)?.max(0) as u32)
 }
 
 pub fn generatetoaddress(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -482,10 +465,29 @@ pub fn generateblock_missing_input_error(e: &str, extra: &[Transaction]) -> Valu
     generateblock_validity_error(e)
 }
 
+/// Core `CreateNewBlock`'s `TestBlockValidity` refusal of a block time past
+/// the future limit (bitcoin/bitcoin#36192). Every template and generate RPC
+/// returns it as `-1`.
+const CREATE_TIME_TOO_NEW: &str =
+    "TestBlockValidity failed: time-too-new, block timestamp too far in the future";
+
+/// A `generate*` failure: `-1` with the reject reason, or with Core's
+/// `CreateNewBlock` text when the next block's time is past the future limit.
+fn generate_error(reason: &str) -> Value {
+    if reason == "time-too-new" {
+        return rpc_error(ERR_MISC, CREATE_TIME_TOO_NEW);
+    }
+    rpc_error(ERR_MISC, reason)
+}
+
 /// Core `generateblock` after `TestBlockValidity`: `-25 TestBlockValidity failed: <reason>`.
+/// A time past the future limit fails earlier, in `CreateNewBlock`.
 pub fn generateblock_validity_error(e: &str) -> Value {
     let s = e.strip_prefix("consensus: ").unwrap_or(e);
     let s = s.strip_prefix("protocol: ").unwrap_or(s);
+    if s.contains("time-too-new") {
+        return generate_error("time-too-new");
+    }
     for needle in [
         "bad-txns-inputs-missingorspent",
         "bad-txns-duplicate",
@@ -495,7 +497,6 @@ pub fn generateblock_validity_error(e: &str) -> Value {
         "bad-blk-length",
         "bad-diffbits",
         "time-too-old",
-        "time-too-new",
         "bad-txnmrklroot",
     ] {
         if s.contains(needle) {
@@ -732,6 +733,10 @@ pub fn mocktime_i64(v: &Value) -> Result<i64, Value> {
 const SEGWIT_RULE_REQUIRED: &str =
     r#"getblocktemplate must be called with the segwit rule set (call with {"rules": ["segwit"]})"#;
 const SIGNET_RULE_REQUIRED: &str = r#"getblocktemplate must be called with the signet rule set (call with {"rules": ["segwit", "signet"]})"#;
+/// Core's reply when an active deployment is not an optional rule and the
+/// client did not name it. BIP 54 changes what a valid coinbase is.
+const CLEANUP_RULE_REQUIRED: &str =
+    "Support for 'consensuscleanup' rule requires explicit client support";
 
 /// Core `setClientRules`: a `rules` array of strings. Anything else is no rules.
 fn gbt_client_rules(req: Option<&serde_json::Map<String, Value>>) -> Result<Vec<&str>, Value> {
@@ -817,11 +822,15 @@ pub(crate) fn getblocktemplate(ctx: &RpcContext, params: &RpcParams) -> Result<V
             return Err(rpc_error(ERR_CLIENT_NOT_CONNECTED, "Shutting down"));
         }
     }
-    if gbt_params(ctx).signet_challenge.is_some() && !rules.contains(&"signet") {
+    let params = gbt_params(ctx);
+    if params.signet_challenge.is_some() && !rules.contains(&"signet") {
         return Err(rpc_error(ERR_INVALID_PARAMETER, SIGNET_RULE_REQUIRED));
     }
     if !rules.contains(&"segwit") {
         return Err(rpc_error(ERR_INVALID_PARAMETER, SEGWIT_RULE_REQUIRED));
+    }
+    if params.enforce_bip54 && !rules.contains(&"consensuscleanup") {
+        return Err(rpc_error(ERR_INVALID_PARAMETER, CLEANUP_RULE_REQUIRED));
     }
     gbt_template(ctx)
 }
@@ -972,11 +981,13 @@ fn gbt_tip(ctx: &RpcContext) -> Result<GbtTip, Value> {
 }
 
 /// Core `NextEmptyBlockIndex`: the next block's time floor, its `UpdateTime`
-/// time, and the work it must meet at that time.
+/// time, and the work it must meet at that time. `too_new` when that time is
+/// past the node's future limit, so no block on the tip is valid yet.
 struct NextBlock {
     mintime: u32,
     curtime: u32,
     bits: u32,
+    too_new: bool,
 }
 
 fn next_block(
@@ -988,16 +999,16 @@ fn next_block(
     let now = ctx
         .chain
         .as_ref()
-        .map(|c| c.clock.now_secs() as u32)
+        .map(|c| c.clock.now_secs())
         .unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as u32)
+                .map(|d| d.as_secs())
                 .unwrap_or(0)
         });
     let mintime = rbitcoin_query::next_block_mintime(ctx.query.as_ref(), params, Height(tip_h))
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
-    let curtime = mintime.max(now);
+    let curtime = mintime.max(now as u32);
     let next_h = Height(tip_h.saturating_add(1));
     let bits = rbitcoin_query::expected_next_bits(ctx.query.as_ref(), params, next_h, curtime)
         .map(|c| c.to_consensus())
@@ -1006,6 +1017,7 @@ fn next_block(
         mintime,
         curtime,
         bits,
+        too_new: rbitcoin_consensus::time_too_new(curtime, now),
     })
 }
 
@@ -1140,7 +1152,13 @@ fn gbt_sketch(ctx: &RpcContext) -> Result<GbtSketch, Value> {
         mintime,
         curtime,
         bits,
+        too_new,
     } = next_block(ctx, &params, tip_h, tip_bits)?;
+    // Core bitcoin/bitcoin#36192: `CreateNewBlock`'s `TestBlockValidity`
+    // refuses a template the node itself would reject.
+    if too_new {
+        return Err(rpc_error(ERR_MISC, CREATE_TIME_TOO_NEW));
+    }
     Ok(GbtSketch {
         prev_hex,
         updates,
@@ -1218,6 +1236,9 @@ fn gbt_render(ctx: &RpcContext, sketch: GbtSketch) -> Result<Value, Value> {
     }
     if params.signet_challenge.is_some() {
         rules.push("!signet");
+    }
+    if params.enforce_bip54 {
+        rules.push("!consensuscleanup");
     }
     let mut vbavailable = serde_json::Map::new();
     let mut version = ctx
@@ -1728,30 +1749,24 @@ fn submit_outcome_json(outcome: SubmitBlockOutcome) -> Result<Value, Value> {
     }
 }
 
-/// True when `block`'s parent header is the active tip. A known ancestor that
-/// is not the tip is a competing block; tip spentness does not apply.
-#[doc(hidden)]
-pub fn parent_extends_tip(
+/// The active tip as one read: its height and header fk.
+fn tip_at(
     query: &rbitcoin_query::Query,
-    block: &Block,
-) -> Result<bool, rbitcoin_store::StoreError> {
-    use rbitcoin_store::StoreError;
-    let prev = block.header.prev_blockhash.to_byte_array();
-    let parent_fk = match query.get_header_by_hash(&prev) {
-        Ok(Some((fk, _))) => fk,
-        Ok(None) | Err(StoreError::NotFound) => return Ok(false),
-        Err(e) => return Err(e),
+) -> Result<Option<(u32, rbitcoin_primitives::Fk)>, rbitcoin_store::StoreError> {
+    let Some(h) = query.tip_height() else {
+        return Ok(None);
     };
-    Ok(query.tip_header_fk()? == Some(parent_fk))
+    Ok(query.store().confirmed.get(h)?.map(|fk| (h.0, fk)))
 }
 
-/// Spend height of `block` when its parent is confirmed. The tip parent is a
-/// header-fk compare. Any other parent uses the best-chain hash index.
-#[doc(hidden)]
-pub fn cheap_spend_height(
+/// Spend height of `block` when its parent is confirmed, and whether that
+/// parent is `tip`. The tip parent is a header-fk compare. Any other parent
+/// uses the best-chain hash index.
+fn cheap_spend_height(
     query: &rbitcoin_query::Query,
     block: &Block,
-) -> Result<Option<u32>, rbitcoin_store::StoreError> {
+    tip: Option<(u32, rbitcoin_primitives::Fk)>,
+) -> Result<Option<(u32, bool)>, rbitcoin_store::StoreError> {
     use rbitcoin_store::StoreError;
     let prev = block.header.prev_blockhash.to_byte_array();
     let parent_fk = match query.get_header_by_hash(&prev) {
@@ -1759,10 +1774,14 @@ pub fn cheap_spend_height(
         Ok(None) | Err(StoreError::NotFound) => return Ok(None),
         Err(e) => return Err(e),
     };
-    if query.tip_header_fk()? == Some(parent_fk) {
-        return Ok(query.tip_height().map(|h| h.0.saturating_add(1)));
+    if let Some((h, fk)) = tip {
+        if fk == parent_fk {
+            return Ok(Some((h.saturating_add(1), true)));
+        }
     }
-    Ok(query.height_of_hash(&prev)?.map(|h| h.0.saturating_add(1)))
+    Ok(query
+        .height_of_hash(&prev)?
+        .map(|h| (h.0.saturating_add(1), false)))
 }
 
 /// Core `CheckTxInputs`: a coinbase spend inside the maturity window is
@@ -1859,6 +1878,34 @@ pub fn submit_reason_is_mutated(block: &Block, reason: &str) -> bool {
         || rbitcoin_consensus::block_mutated_without_coinbase(block)
 }
 
+/// Where a [`during_next_submit_inputs`] hook runs.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubmitInputsPoint {
+    /// After the tip read, before the input reads.
+    BeforeInputs,
+    /// After the input reads, before the tip is read again.
+    BeforeRecheck,
+}
+
+#[cfg(debug_assertions)]
+type SubmitInputsHook = Box<dyn FnMut(SubmitInputsPoint)>;
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static SUBMIT_INPUTS_HOOK: std::cell::RefCell<Option<SubmitInputsHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` at each [`SubmitInputsPoint`] of the next `submitblock` input
+/// pre-check on this thread.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn during_next_submit_inputs(f: impl FnMut(SubmitInputsPoint) + 'static) {
+    SUBMIT_INPUTS_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+}
+
 /// Input reads for a block that already passed
 /// `ChainHub::check_block_on_parent`, so its merkle root and structure hold.
 #[doc(hidden)]
@@ -1867,15 +1914,50 @@ pub fn cheap_submit_tx_reject(
     block: &Block,
     maturity: u32,
 ) -> Result<Option<String>, rbitcoin_store::StoreError> {
-    use bitcoin::{OutPoint, TxOut};
-    let spend_height = cheap_spend_height(query, block)?;
-    let parent_is_tip = parent_extends_tip(query, block)?;
-    let txids: Vec<Txid> = block.txdata.iter().map(Transaction::compute_txid).collect();
-    // A parent off the best chain can create the coins this block spends.
-    // Only the branch connect sees them (Core checks inputs in ConnectBlock).
-    if spend_height.is_none() {
+    // Core checks inputs only in ConnectBlock, serialized with every other
+    // connect. A reject read while the chain moved is left to that accept.
+    #[cfg(debug_assertions)]
+    let mut hook = SUBMIT_INPUTS_HOOK.with(|h| h.borrow_mut().take());
+    #[cfg(debug_assertions)]
+    let mut at = |point| {
+        if let Some(f) = hook.as_mut() {
+            f(point);
+        }
+    };
+    let disconnects = || query.disconnect_gen.load(Ordering::Acquire);
+    let gen = disconnects();
+    let tip = tip_at(query)?;
+    #[cfg(debug_assertions)]
+    at(SubmitInputsPoint::BeforeInputs);
+    let reason = tx_reject_on_tip(query, block, maturity, tip)?;
+    #[cfg(debug_assertions)]
+    at(SubmitInputsPoint::BeforeRecheck);
+    if reason.is_none() {
         return Ok(None);
     }
+    // A reject stands only if the chain did not move while it was read. A
+    // connect can resolve a parent txid to a newer instance, and a disconnect
+    // that was undone leaves the tip as it was. The generation moves after
+    // the slot is popped, so read the tip first.
+    if tip_at(query)? != tip || disconnects() != gen {
+        return Ok(None);
+    }
+    Ok(reason)
+}
+
+fn tx_reject_on_tip(
+    query: &rbitcoin_query::Query,
+    block: &Block,
+    maturity: u32,
+    tip: Option<(u32, rbitcoin_primitives::Fk)>,
+) -> Result<Option<String>, rbitcoin_store::StoreError> {
+    use bitcoin::{OutPoint, TxOut};
+    // A parent off the best chain can create the coins this block spends.
+    // Only the branch connect sees them (Core checks inputs in ConnectBlock).
+    let Some((spend_height, parent_is_tip)) = cheap_spend_height(query, block, tip)? else {
+        return Ok(None);
+    };
+    let txids: Vec<Txid> = block.txdata.iter().map(Transaction::compute_txid).collect();
     let parents = confirmed_parents_of(query, block, &txids)?;
     let mut spent = std::collections::HashSet::new();
     let mut created: std::collections::HashMap<OutPoint, TxOut> = std::collections::HashMap::new();
@@ -1920,13 +2002,17 @@ pub fn cheap_submit_tx_reject(
                 else {
                     return Ok(Some("bad-txns-inputs-missingorspent".into()));
                 };
-                if parent_is_tip && query.is_outpoint_spent(&op.txid.to_byte_array(), op.vout)? {
+                if parent_is_tip
+                    && query.is_outpoint_spent_at(
+                        &op.txid.to_byte_array(),
+                        op.vout,
+                        tip.map(|(h, _)| h),
+                    )?
+                {
                     return Ok(Some("bad-txns-inputs-missingorspent".into()));
                 }
-                if let Some(h) = spend_height {
-                    if cheap_immature_coinbase(query, fk, h, maturity)? {
-                        return Ok(Some("bad-txns-premature-spend-of-coinbase".into()));
-                    }
+                if cheap_immature_coinbase(query, fk, spend_height, maturity)? {
+                    return Ok(Some("bad-txns-premature-spend-of-coinbase".into()));
                 }
                 TxOut {
                     value: bitcoin::Amount::from_sat(out.value),
@@ -2065,8 +2151,18 @@ pub fn decode_package_tx_hex(hex: &str) -> Result<Transaction, Value> {
     })
 }
 
-pub fn tx_to_json(tx: &Transaction, extra: Option<Value>, network: BtcNetwork) -> Value {
-    let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
+pub fn tx_to_json(
+    tx: &Transaction,
+    txid: Option<&[u8; 32]>,
+    extra: Option<Value>,
+    network: BtcNetwork,
+) -> Value {
+    let raw = bitcoin::consensus::encode::serialize(tx);
+    let txid_bytes = match txid {
+        Some(id) => *id,
+        None => tx.compute_txid().to_byte_array(),
+    };
+    let txid_hex = hash_hex_display(&txid_bytes);
     let mut vin = Vec::new();
     for (i, inp) in tx.input.iter().enumerate() {
         let mut row = if tx.is_coinbase() {
@@ -2111,16 +2207,16 @@ pub fn tx_to_json(tx: &Transaction, extra: Option<Value>, network: BtcNetwork) -
         }));
     }
     let mut obj = json!({
-        "txid": txid,
-        "hash": hash_hex_display(&tx.compute_wtxid().to_byte_array()),
+        "txid": txid_hex,
+        "hash": hash_hex_display(bitcoin::hashes::sha256d::Hash::hash(&raw).as_byte_array()),
         "version": tx.version.0,
-        "size": tx.total_size(),
+        "size": raw.len(),
         "vsize": tx.vsize(),
         "weight": tx.weight().to_wu(),
         "locktime": tx.lock_time.to_consensus_u32(),
         "vin": vin,
         "vout": vout,
-        "hex": serialize_hex(tx),
+        "hex": rbitcoin_primitives::hex_encode(&raw),
     });
     if let Some(Value::Object(m)) = extra {
         if let Some(o) = obj.as_object_mut() {

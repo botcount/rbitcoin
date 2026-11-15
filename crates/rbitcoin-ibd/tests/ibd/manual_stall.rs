@@ -235,7 +235,7 @@ fn resumed_connect_peer_gets_a_fresh_stall_window() {
     );
     assert!(asked
         .iter()
-        .all(|h| st.inflight.get(h).is_some_and(|r| r.peers.contains(&0))));
+        .all(|h| st.inflight.get(h).is_some_and(|r| r.is_racing(0))));
     assert_eq!(st.slots[0].getdata_wire.window_ms(), Some(151_000));
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -283,6 +283,7 @@ fn reader_of(st: &IbdWorkState, id: usize) -> (IbdReadCtx, mpsc::UnboundedReceiv
         rate: rbitcoin_net::peer_dos::PeerRateLimiter::default_limits(),
         logged_invalid_v2: false,
         ban_score: 0,
+        pong: std::sync::Arc::new(rbitcoin_ibd::ibd::peer_io::IbdPong::new()),
     };
     (ctx, body_rx)
 }
@@ -676,7 +677,7 @@ fn sole_manual_peer_that_stalls_keeps_its_requests() {
         assert_eq!(s.in_flight, owed, "trust_peer={trust_peer}: requests kept");
         assert!(owed
             .iter()
-            .all(|h| st.inflight.get(h).is_some_and(|r| r.peers.contains(&0))));
+            .all(|h| st.inflight.get(h).is_some_and(|r| r.is_racing(0))));
         assert!(st.addr_cooldown.is_empty() && st.addr_strikes.is_empty());
         assert!(!drain_wire(&mut wire)[0].1, "not told to shut down");
 
@@ -725,7 +726,7 @@ fn manual_staller_beside_a_paused_peer_keeps_its_requests() {
     let s = &st.slots[1];
     assert!(s.alive && s.takes_block_requests());
     assert!(s.in_flight.contains(&h(2)));
-    assert!(st.inflight.get(&h(2)).is_some_and(|r| r.peers.contains(&1)));
+    assert!(st.inflight.get(&h(2)).is_some_and(|r| r.is_racing(1)));
     assert!(st.addr_cooldown.is_empty());
     assert!(drain_wire(&mut wire).iter().all(|(_, shut)| !shut));
     let _ = std::fs::remove_dir_all(dir);
@@ -810,6 +811,7 @@ async fn ibd_dial_of_a_connect_target_is_manual() {
             1,
             HashSet::new(),
             &[],
+            false,
             seed.magic,
             "127.0.0.1:0".parse().unwrap(),
             Some(0),

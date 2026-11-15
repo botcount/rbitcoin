@@ -5,7 +5,7 @@ name = "script-oracle"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "Bitcoin Core v32.1 VerifyScript oracle for the script corpus. Not a workspace member."
+description = "Bitcoin Core VerifyScript oracle (submodule pin) for the script corpus. Not a workspace member."
 
 [dependencies]
 bitcoin = "=0.32.102"

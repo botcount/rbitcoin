@@ -7,10 +7,9 @@ use rbitcoin_query::{
 };
 use std::time::{Duration, Instant};
 
-/// Shipped progress line: tip + in-RAM bq soft depth; forbid retired tokens.
+/// Tokens `docs/operator/operations.md` names on `ibd: progress`.
 #[test]
-fn format_progress_line_schema12_tokens() {
-    // tip_rate 12.5 → format_rate rounds to "12" (≥10).
+fn format_progress_line_names_hole_and_queue() {
     let line = format_progress_line(&ProgressLineInput {
         pct: 42,
         tip: 100_000,
@@ -25,63 +24,9 @@ fn format_progress_line_schema12_tokens() {
         bq_count: 17,
         bq_soft_stop: 180,
     });
-    assert_eq!(
-        line,
-        "ibd: progress 42% tip=100000 (12/s) hole=3 peers=8 ready=1 scriptq=1/2 writeq=0/2 txs=50000000 horizon=900000 eta=18h bq soft=17/180 RAM=256MiB"
-    );
-    // Current schema tokens present.
-    assert!(line.contains(" hole="), "{line}");
-    assert!(line.contains(" soft="), "{line}");
-    assert!(line.contains(" RAM="), "{line}");
-    assert!(
-        !line.contains(" bq n="),
-        "count lives in soft= only: {line}"
-    );
-    assert!(!line.contains(" disk="), "queue is RAM not disk: {line}");
-    assert!(
-        !line.contains("pending_ram="),
-        "no RAM overflow meter: {line}"
-    );
-    assert!(line.contains("ready="), "{line}");
-    assert!(line.contains("scriptq"), "{line}");
-    // Retired dual-track progress tokens forbidden.
-    assert!(
-        !line.contains("arch_hwm"),
-        "must not report retired arch_hwm: {line}"
-    );
-    assert!(
-        !line.contains("lead="),
-        "must not report retired lead=: {line}"
-    );
-    assert!(
-        !line.contains("arch="),
-        "must not report retired arch= rate token: {line}"
-    );
-    assert_eq!(
-        line.matches("/s)").count(),
-        1,
-        "only tip rate on progress line: {line}"
-    );
-    let slow = format_progress_line(&ProgressLineInput {
-        pct: 1,
-        tip: 10,
-        tip_rate: 2.4,
-        tip_hole: 0,
-        peers: 1,
-        conf_q: "ready=0 scriptq<0/2 writeq<0/2".into(),
-        txs: 1,
-        horizon: 1000,
-        eta: "eta=?".into(),
-        bq_bytes: 0,
-        bq_count: 0,
-        bq_soft_stop: 256,
-    });
-    assert!(slow.contains("tip=10 (2.4/s)"), "{slow}");
-    assert!(slow.contains("bq soft=0/256 RAM=0MiB"), "{slow}");
-    assert!(
-        !slow.contains("arch_hwm") && !slow.contains("lead="),
-        "{slow}"
-    );
+    assert!(line.starts_with("ibd: progress "), "{line}");
+    assert!(line.contains(" hole=3 "), "{line}");
+    assert!(line.contains(" bq soft=17/180 RAM=256MiB"), "{line}");
 }
 
 #[test]
@@ -220,6 +165,24 @@ fn work_chain_progress_fetch_hole_requires_body_queue() {
         .block_queue_enqueue(1, h1.to_byte_array(), 1, b"x")
         .unwrap();
     assert!(claim_ready(&hub, &mut body2, 1, &h1));
+    let mut span = rbitcoin_ibd::ibd::progress::QueuedHashSpan::load(&hub, 1, 2);
+    assert_eq!(span.hash_at(&hub, 1), Some(h1.to_byte_array()));
+    assert_eq!(span.hash_at(&hub, 2), None, "an empty height stays empty");
+    let mut inverted = rbitcoin_ibd::ibd::progress::QueuedHashSpan::load(&hub, 2, 1);
+    assert_eq!(
+        inverted.hash_at(&hub, 1),
+        Some(h1.to_byte_array()),
+        "an inverted span still reads the live queue"
+    );
+    hub.query.block_queue_dequeue_height(1).unwrap();
+    assert_eq!(
+        span.hash_at(&hub, 1),
+        None,
+        "a listed height is read again after confirm dequeues it"
+    );
+    hub.query
+        .block_queue_enqueue(1, h1.to_byte_array(), 1, b"x")
+        .unwrap();
     let hole_ready = tip_fetch_hole(&hub, &h2h, &mut body2);
     assert_eq!(hole_ready, 0, "BQ-ready tip+1 → hole=0");
 

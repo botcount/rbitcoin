@@ -12,6 +12,15 @@ impl<'a> MedianWindow<'a> {
         }
         Ok(Self { times })
     }
+
+    /// `None` when `times` has fewer than eleven timestamps.
+    pub fn at_least_eleven(times: &'a [u32]) -> Option<Self> {
+        if times.len() < 11 {
+            None
+        } else {
+            Some(Self { times })
+        }
+    }
 }
 
 /// Median of `times` (unsorted OK). The upper middle when the count is even.

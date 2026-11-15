@@ -44,7 +44,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [028](./028-prevout-count.md) | high | Empty prevouts skipped script checks | fixed | `prevout_count_must_match_inputs` |
 | [042](./042-milestone-anchor.md) | medium | Height milestone skipped a low-work fork | fixed | `low_work_fork_does_not_skip_even_at_the_milestone_height` |
 | [041](./041-hygiene.md) | medium | P2PKH policy flags, RPC token, inv cap, log newlines | fixed | `peer_command_logs_have_no_raw_newline` |
-| [037](./037-rpc-esplora-limits.md) | high | RPC body, work queue, waits, and Esplora client id | fixed | `unauthorized_large_content_length_is_401_before_body` |
+| [037](./037-rpc-esplora-limits.md) | high | RPC body, work queue, waits, and Esplora client id | fixed | `unread_body_is_read_before_the_answer_up_to_the_cap` |
 | [039](./039-io-lifetimes.md) | high | Store I/O buffer must outlive the submit | fixed | `enter_failure_with_pending_matches_the_hard_cap` |
 | [047](./047-orphan-reserve.md) | medium | Orphan reserve can refuse every later orphan | fixed | `mempool_under_pressure` |
 | [048](./048-standard-sigops.md) | medium | No standard sigop cap before the interpreter | fixed (block limit, not 16k) | `mempool_accept_life` (`sigop_block_budget`), `mempool_under_pressure` |
@@ -110,8 +110,16 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [104](./104-body-read-cap.md) | high | A body read is capped before it allocates | fixed | `body_read_above_the_cap_is_refused`, `index_read_above_the_cap_is_refused` |
 | [105](./105-scripthash-page-cycle.md) | high | Scripthash page walks stop on a cycle | fixed | `scripthash_page_cycle_is_corrupt`, `scripthash_page_free_cycle_is_corrupt`, `scripthash_page_free_revisit_is_corrupt` |
 | [106](./106-historical-bitrot.md) | medium | Historical body bit-rot is an accepted reindex | accepted | none |
-| [107](./107-torn-spend-page.md) | medium | A torn spend page below the durable marker stays | accepted | none |
+| [107](./107-torn-spend-page.md) | medium | A torn spend page below the durable marker stays | fixed | `historical_page_stays_unwritten_until_spend_checkpoint` |
 | [108](./108-bobberb-store-index.md) | — | Bobberb store-integrity index | accepted | — |
+| [109](./109-filter-send-budget.md) | medium | Filter replies and compact blocks under-counted the send budget | fixed | `filter_and_compact_block_replies_charge_their_consensus_payload` |
+| [110](./110-getcfilters-budget.md) | medium | `getcfilters` kept queueing after the send budget | fixed | `getcfilters_stops_after_the_filter_that_crosses_the_send_budget`, `getcfcheckpt_returns_a_header_every_thousand_heights` |
+| [111](./111-pong-send-budget.md) | medium | Pongs were uncharged, and IBD pings were not rate-limited | fixed | `one_charged_pong_keeps_the_queued_nonce`, `writer_sends_the_queued_pong_then_a_later_nonce_behind_the_replies`, `ibd_pings_coalesce_and_overflow_the_message_window` |
+| [112](./112-stall-solicited-bytes.md) | medium | Stall counted unsolicited socket bytes as block progress | fixed | `disconnect_stalled_drops_a_peer_sending_only_unsolicited_bytes`, `disconnect_stalled_keeps_a_peer_still_sending_a_block`, `relative_slow_zero_throughput_uses_solicited_bytes`, `open_block_bytes_count_a_frame_past_a_headers_message`, `block_progress_stamp_records_solicited_bytes` |
+| [113](./113-proved-header-adopt.md) | medium | A proved header walk rewrote `header.adopt` on every short batch | fixed | `proved_short_batches_do_not_rewrite_header_adopt`, `promoting_a_challenger_persists_that_chains_tip` |
+| [114](./114-respend-after-rejected-write.md) | critical | Re-spend of a same-block spend connects after a merged IBD write rejects | fixed | `respend_of_a_same_block_spend_rejects_on_single_block_retry`, `merged_respend_of_a_same_block_spend_is_rejected_alone` |
+| [115](./115-sp-scan-history.md) | medium | Silent-payment scan dropped history older than 256 blocks (follows 065) | fixed | `sp_timestamp_start_finds_a_payment_older_than_one_chunk` |
+| [116](./116-reconnected-in-block-spend.md) | critical | A reconnected block lost the outputs it spent inside itself | fixed | `reconnected_block_keeps_its_in_block_spend_across_checkpoints`, `reconnected_block_in_block_spend_without_checkpoints`, `reconnected_block_in_block_spend_checkpoint_while_active`, `reconnected_block_in_block_spend_checkpoint_after_disconnect` |
 
 **012–021:** fuzzamoto differential report (`rbitcoin-report.tar.gz`, baseline
 `8f3990f`). Report-local 001–010 are **renumbered** here. Identity/BIP30

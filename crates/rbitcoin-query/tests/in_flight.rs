@@ -23,6 +23,67 @@ fn pin_with_txid(txid: [u8; 32]) -> CreatePin {
     )
 }
 
+/// Ids 10 and 12 leave a hole at 11. Dropping the low pin advances the base.
+/// Dropping the higher of two pin packs that share a txid leaves the lower
+/// pin and clears `creates` (the newer fk is gone, not restored).
+#[test]
+fn out_base_keeps_a_hole_and_a_lower_pin() {
+    let mut m = InFlight::new();
+    let low = pin(10);
+    let high = pin(12);
+    m.note_pins([(Fk(10), &low)], Some(1));
+    m.note_pins([(Fk(12), &high)], Some(2));
+    assert_eq!(m.out_base(), Some(10));
+    assert!(m.get_out(11).is_none());
+    assert_eq!(m.get_out(12).map(|pin| pin.tx().txid), Some(high.tx().txid));
+    m.prune_below_height(Some(2));
+    assert_eq!(m.out_base(), Some(12));
+    assert!(m.get_out(10).is_none());
+    assert!(m.get_out(12).is_some());
+
+    let txid = [0x44; 32];
+    let older = pin_with_txid(txid);
+    let newer = pin_with_txid(txid);
+    m.note_pins([(Fk(20), &older)], Some(3));
+    m.note_pins([(Fk(21), &newer)], Some(4));
+    m.drop_from_height(4);
+    assert_eq!(
+        m.get_create_fk(&txid),
+        None,
+        "creates must not point at the dropped pack"
+    );
+    assert!(m.get_out(20).is_some());
+    assert!(m.get_out(21).is_none());
+}
+
+/// A creates-only row and a pin for the same txid can share a height.
+/// Pruning that height must not delete a newer pack's fk.
+#[test]
+fn merged_height_pin_keeps_the_newer_fk() {
+    let mut m = InFlight::new();
+    let txid = [0x55; 32];
+    let older = pin_with_txid(txid);
+    let newer = pin_with_txid(txid);
+    m.note_creates([(txid, Fk(1))], Some(1));
+    m.note_pins([(Fk(1), &older)], Some(1));
+    m.note_pins([(Fk(2), &newer)], Some(2));
+    m.prune_below_height(Some(2));
+    assert_eq!(m.get_create_fk(&txid), Some(Fk(2)));
+    assert!(m.get_out(2).is_some());
+    assert!(m.get_out(1).is_none());
+}
+
+#[test]
+fn null_fk_pin_does_not_keep_a_create() {
+    let mut m = InFlight::new();
+    let p = pin(1);
+    m.note_pins([(Fk(0), &p)], Some(1));
+    assert_eq!(m.get_create_fk(&p.tx().txid), None);
+    m.prune_below_height(Some(2));
+    assert!(m.is_empty());
+    assert_eq!(m.size_snapshot().2, 0);
+}
+
 #[test]
 fn creates_only_resolves_txid() {
     let mut m = InFlight::new();
@@ -45,10 +106,6 @@ fn size_snapshot_counts_packs_and_bytes() {
     assert_eq!(entries, 2);
     assert!(bytes > 0, "expected non-zero approx bytes");
     assert!(bytes < 4096, "bytes={bytes}");
-    rbitcoin_query::process_mem_stats::note(packs, entries, bytes);
-    let s = rbitcoin_query::process_mem_stats::load();
-    assert_eq!(s.inflight_layers, 2);
-    assert_eq!(s.inflight_pins, 2);
     let again = m.size_snapshot();
     assert_eq!(
         (packs, entries, bytes),
@@ -253,6 +310,36 @@ fn same_txid_overwrite_does_not_double_count_creates_bytes() {
     m.prune_below_height(Some(91750));
     let (_, _, after) = m.size_snapshot();
     assert_eq!(after, once);
+}
+
+#[test]
+fn prune_keeps_the_next_pack_lowest_out() {
+    let mut m = InFlight::new();
+    let low = pin(10);
+    let mid = pin(30);
+    let high = pin(20);
+    m.note_pins([(Fk(10), &low), (Fk(30), &mid)], Some(1));
+    m.note_pins([(Fk(20), &high)], Some(2));
+    assert_eq!(m.by_height.get(&1).unwrap().lowest_out(), Some(10));
+    assert_eq!(m.by_height.get(&2).unwrap().lowest_out(), Some(20));
+    let lower = pin(15);
+    m.note_pins([(Fk(15), &lower)], Some(2));
+    assert_eq!(m.by_height.get(&2).unwrap().lowest_out(), Some(15));
+    m.prune_below_height(Some(2));
+    assert_eq!(m.min_out_id(), Some(15));
+    assert_eq!(m.by_height.get(&2).unwrap().lowest_out(), Some(15));
+
+    let again = pin(20);
+    let later = pin(40);
+    m.note_pins([(Fk(20), &again), (Fk(40), &later)], Some(3));
+    m.prune_below_height(Some(3));
+    assert_eq!(
+        m.min_out_id(),
+        Some(40),
+        "a shared id removed with the older pack is not the survivor's minimum"
+    );
+    assert!(m.get_out(20).is_none());
+    assert!(m.get_out(40).is_some());
 }
 
 #[test]

@@ -25,8 +25,11 @@ pub struct BlockCache {
 #[doc(hidden)]
 pub struct Inner {
     pub by_hash: HashMap<BlockHash, Block>,
-    /// Best-chain hashes by height (contiguous from 0).
+    /// Best-chain hashes, contiguous: `chain[i]` is at height `base + i`.
     pub chain: Vec<BlockHash>,
+    /// Height of `chain[0]`. A reopened store starts the list at its first
+    /// connect, not at genesis.
+    base: u32,
     /// Unconnected bodies a compact announce may serve. Not best-chain.
     servable: HashMap<BlockHash, Block>,
 }
@@ -50,12 +53,7 @@ impl BlockCache {
     }
 
     pub fn tip_height(&self) -> Option<u32> {
-        let g = self.inner.read().unwrap();
-        if g.chain.is_empty() {
-            None
-        } else {
-            Some((g.chain.len() - 1) as u32)
-        }
+        self.inner.read().unwrap().tip_height()
     }
 
     pub fn tip_hash(&self) -> Option<BlockHash> {
@@ -74,6 +72,12 @@ impl BlockCache {
         self.inner.read().unwrap().by_hash.get(hash).cloned()
     }
 
+    /// Whether the cache retains the block body, without copying it.
+    #[doc(hidden)]
+    pub fn has_body(&self, hash: &BlockHash) -> bool {
+        self.inner.read().unwrap().by_hash.contains_key(hash)
+    }
+
     pub fn get_header(&self, hash: &BlockHash) -> Option<Header> {
         self.inner
             .read()
@@ -84,32 +88,18 @@ impl BlockCache {
     }
 
     pub fn hash_at_height(&self, height: u32) -> Option<BlockHash> {
-        self.inner
-            .read()
-            .unwrap()
-            .chain
-            .get(height as usize)
-            .copied()
+        self.inner.read().unwrap().hash_at_height(height)
     }
 
     pub fn header_at_height(&self, height: u32) -> Option<Header> {
         let g = self.inner.read().unwrap();
-        let h = g.chain.get(height as usize)?;
-        g.by_hash.get(h).map(|b| b.header)
+        let h = g.hash_at_height(height)?;
+        g.by_hash.get(&h).map(|b| b.header)
     }
 
-    /// Drop all blocks above `height` (keep 0..=height). No-op if cache shorter.
+    /// Drop all blocks above `height`. No-op if the cache tip is not above it.
     pub fn truncate_to_height(&self, height: u32) {
-        let mut g = self.inner.write().unwrap();
-        let keep = (height as usize).saturating_add(1);
-        if g.chain.len() <= keep {
-            return;
-        }
-        let remove: Vec<BlockHash> = g.chain[keep..].to_vec();
-        g.chain.truncate(keep);
-        for h in remove {
-            g.by_hash.remove(&h);
-        }
+        self.inner.write().unwrap().truncate_to_height(height);
     }
 
     /// Clear entire cache (e.g. after full reorg from genesis).
@@ -135,20 +125,22 @@ impl BlockCache {
         self.inner.write().unwrap().servable.remove(hash);
     }
 
-    /// Append a block that extends the best chain (or becomes genesis at height 0).
+    /// Record `block` as the best-chain block at `height`.
     ///
+    /// Anything cached at or above `height` is dropped first. When the cached
+    /// block at `height - 1` is not its parent, the list restarts at `height`,
+    /// so the cache never names a block the store did not connect there.
     /// Evicts full bodies older than `body_depth` while keeping the hash chain.
-    pub fn push_best(&self, block: Block) -> Result<(), &'static str> {
+    pub fn push_best(&self, height: u32, block: Block) {
         let hash = block.block_hash();
         let mut g = self.inner.write().unwrap();
-        if g.chain.is_empty() {
-            g.by_hash.insert(hash, block);
-            g.chain.push(hash);
-            return Ok(());
-        }
-        let tip = *g.chain.last().unwrap();
-        if block.header.prev_blockhash != tip {
-            return Err("block does not extend best chain");
+        let parent = height.checked_sub(1).and_then(|p| g.hash_at_height(p));
+        if parent == Some(block.header.prev_blockhash) {
+            g.truncate_to_height(height - 1);
+        } else {
+            g.by_hash.clear();
+            g.chain.clear();
+            g.base = height;
         }
         g.by_hash.insert(hash, block);
         g.chain.push(hash);
@@ -159,7 +151,6 @@ impl BlockCache {
                 g.by_hash.remove(&h);
             }
         }
-        Ok(())
     }
 
     /// Headers after the best common locator hash, up to Core `MAX_HEADERS_RESULTS` (2000).
@@ -195,5 +186,30 @@ impl BlockCache {
             }
         }
         out
+    }
+}
+
+impl Inner {
+    fn tip_height(&self) -> Option<u32> {
+        let top = u32::try_from(self.chain.len().checked_sub(1)?).ok()?;
+        Some(self.base.saturating_add(top))
+    }
+
+    fn hash_at_height(&self, height: u32) -> Option<BlockHash> {
+        let i = height.checked_sub(self.base)?;
+        self.chain.get(i as usize).copied()
+    }
+
+    fn truncate_to_height(&mut self, height: u32) {
+        let keep = match height.checked_sub(self.base) {
+            Some(i) => (i as usize).saturating_add(1),
+            None => 0,
+        };
+        if self.chain.len() <= keep {
+            return;
+        }
+        for h in self.chain.split_off(keep) {
+            self.by_hash.remove(&h);
+        }
     }
 }

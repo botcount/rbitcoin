@@ -3,14 +3,10 @@ use rbitcoin_node::config::*;
 use rbitcoin_primitives::Network;
 use rbitcoin_store::HeadScale;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 fn tmp() -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("rbitcoin-node-cfg-{n}"))
+    rbitcoin_store::testutil::fresh_path("node-cfg")
 }
 
 #[test]
@@ -875,6 +871,7 @@ fn network_names_are_recognized_and_reject_invalid() {
         ("signet", Network::Signet),
         ("testnet", Network::Testnet),
         ("testnet4", Network::Testnet4),
+        ("testnet5", Network::Testnet5),
     ] {
         let mut c = NodeConfig::default();
         assert_eq!(c.apply_kv(name, "1").unwrap(), ConfApply::Applied);

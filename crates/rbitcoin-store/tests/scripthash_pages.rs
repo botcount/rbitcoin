@@ -372,3 +372,19 @@ fn page_last_fk_rejects_null_and_flagged() {
     assert!(sh_page_try_append(&mut page, Fk(42)).unwrap());
     assert_eq!(sh_page_last_fk(&page).unwrap(), Some(Fk(42)));
 }
+
+#[test]
+fn sh_page_extent_and_count_roundtrip() {
+    let mut page = [0u8; SH_PAGE_SIZE];
+    sh_page_init_empty(&mut page);
+    sh_page_set_extent(&mut page, 8192, 3).unwrap();
+    sh_page_set_extent_creates(&mut page, 11);
+    sh_page_set_n_fks(&mut page, 6);
+    assert_eq!(sh_page_extent(&page).unwrap(), Some((8192, 3)));
+    assert_eq!(sh_page_extent_creates(&page), 11);
+    assert_eq!(sh_page_n_fks(&page).unwrap(), 6);
+    let mut plain = [0u8; SH_PAGE_SIZE];
+    sh_page_init_empty(&mut plain);
+    assert_eq!(sh_page_extent(&plain).unwrap(), None);
+    assert_eq!(sh_page_extent_creates(&plain), 0);
+}

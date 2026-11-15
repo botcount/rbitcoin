@@ -1,1 +1,2 @@
 mod encode_witness_tests;
+mod witness_commitment_on_serve_tests;

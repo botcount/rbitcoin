@@ -7,6 +7,141 @@ use rbitcoin_primitives::Height;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// An unproved walk may rewind through its lead, which is deeper than 1,024.
+/// A proved walk still stops at [`REWIND_MAX_DEPTH`].
+///
+/// One chain of 1,025. The refused rewinds do not disconnect, so the unproved
+/// apply is the only call that moves the tip.
+#[test]
+fn unproved_lead_rewinds_past_1024_and_a_proved_walk_does_not() {
+    let (dir, mut hub) = tmp_hub();
+    let (kept, side) = confirm_past_1024(&hub, 1_500_080_000);
+    let path = [side];
+    assert!(
+        prepare_header_rewind(&hub, &path, REWIND_MAX_DEPTH)
+            .unwrap()
+            .is_none(),
+        "1,025 blocks is past the proved cap, and this call must not move the tip"
+    );
+    assert_eq!(hub.tip_height(), Some(1_025));
+    let mut proved =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    proved.header_walk.origin = true;
+    proved.header_walk.proven = true;
+    assert_eq!(
+        rbitcoin_ibd::ibd::header_walk::rewind_depth_cap(&proved, &hub),
+        REWIND_MAX_DEPTH
+    );
+    assert!(!apply_header_rewind(&mut proved, &hub, &path).unwrap());
+    assert_eq!(hub.tip_height(), Some(1_025));
+    let mut unproved =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), Some(1_025));
+    unproved.header_walk.origin = true;
+    unproved.header_walk.proven = false;
+    hub.milestone = floor_just_above(hub.chain_work().unwrap());
+    assert_eq!(
+        rbitcoin_ibd::ibd::header_walk::rewind_depth_cap(&unproved, &hub),
+        rbitcoin_ibd::ibd::header_walk::UNPROVEN_LEAD_BLOCKS
+    );
+    assert!(apply_header_rewind(&mut unproved, &hub, &path).unwrap());
+    assert_eq!(hub.tip_height(), Some(0));
+    assert!(
+        hub.query
+            .get_header_by_hash(kept.as_byte_array())
+            .unwrap()
+            .is_some(),
+        "the abandoned header row stays"
+    );
+    let _ = dir;
+}
+
+/// `publish_work` marks the heavier headers proved before the confirmed tip
+/// leaves. That tip is still the unproved lead, so the rewind covers it.
+/// Once the confirmed tip meets the floor, 1,025 blocks is refused.
+#[test]
+fn proved_headers_still_rewind_a_tip_under_the_floor() {
+    let (dir, mut hub) = tmp_hub();
+    let (kept, side) = confirm_past_1024(&hub, 1_500_110_000);
+    let work = hub.chain_work().unwrap();
+    // The refused rewind does not disconnect. It runs first on this chain.
+    hub.milestone = floor_at(work);
+    let mut proved =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    proved.header_walk.origin = true;
+    proved.header_walk.tip.work = work;
+    rbitcoin_ibd::ibd::header_walk::publish_work(&mut proved, &hub);
+    assert!(proved.header_walk.proven);
+    assert_eq!(REWIND_MAX_DEPTH, 1_024);
+    assert!(
+        !apply_header_rewind(&mut proved, &hub, &[side]).unwrap(),
+        "once the confirmed tip meets the floor, 1,025 is past the cap"
+    );
+    assert_eq!(hub.tip_height(), Some(1_025));
+
+    hub.milestone = floor_just_above(work);
+    let mut st =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    st.header_walk.origin = true;
+    // The new headers already cleared the floor. The confirmed chain has not.
+    st.header_walk.tip.work = bitcoin::Work::from_be_bytes([0xff; 32]);
+    rbitcoin_ibd::ibd::header_walk::publish_work(&mut st, &hub);
+    assert!(
+        st.header_walk.proven,
+        "the heavier headers are proved before the tip moves"
+    );
+    assert!(
+        apply_header_rewind(&mut st, &hub, &[side]).unwrap(),
+        "a proved header fork still moves a confirmed tip that is under the floor"
+    );
+    assert_eq!(hub.tip_height(), Some(0));
+    assert!(
+        hub.query
+            .get_header_by_hash(kept.as_byte_array())
+            .unwrap()
+            .is_some(),
+        "the abandoned header row stays"
+    );
+    let _ = dir;
+}
+
+fn confirm_past_1024(hub: &ChainHub, time0: u32) -> (BlockHash, BlockHash) {
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    hub.confirm_empty_regtest(1_025).unwrap();
+    let prev = hub.tip_hash().unwrap();
+    let side = distinct_sib(mine(gen, time0.saturating_add(100), 1), prev);
+    hub.ensure_header(&side.header).unwrap();
+    (prev, side.block_hash())
+}
+
+fn floor_at(work: bitcoin::Work) -> rbitcoin_consensus::Milestone {
+    rbitcoin_consensus::Milestone {
+        height: 1_000_000,
+        anchor: Some(rbitcoin_consensus::MilestoneAnchor {
+            hash: BlockHash::from_byte_array([0xab; 32]),
+            min_work_be: work.to_be_bytes(),
+        }),
+    }
+}
+
+fn floor_just_above(work: bitcoin::Work) -> rbitcoin_consensus::Milestone {
+    let mut min_work_be = work.to_be_bytes();
+    for byte in min_work_be.iter_mut().rev() {
+        let (next, wrapped) = byte.overflowing_add(1);
+        *byte = next;
+        if !wrapped {
+            break;
+        }
+    }
+    rbitcoin_consensus::Milestone {
+        height: 1_000_000,
+        anchor: Some(rbitcoin_consensus::MilestoneAnchor {
+            hash: BlockHash::from_byte_array([0xab; 32]),
+            min_work_be,
+        }),
+    }
+}
+
 fn tmp_hub() -> (rbitcoin_query::testutil::TempDir, ChainHub) {
     rbitcoin_net::chain::tiny_regtest_hub_labeled("ibd-reorg")
 }
@@ -307,7 +442,7 @@ fn commit_deeper_fork_after_prepare() {
         .lock()
         .unwrap_or_else(|err| err.into_inner())
         .expect("side hash armed");
-    let prep = prepare_header_rewind(&hub, &[g1])
+    let prep = prepare_header_rewind(&hub, &[g1], REWIND_MAX_DEPTH)
         .unwrap()
         .expect("deeper fork disconnects to genesis");
     let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());

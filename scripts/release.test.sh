@@ -122,6 +122,50 @@ out="$(bash "$REL" --root "$TOPIC" --dry-run --allow-branch release-topic)"
 assert_ok "dry-run ok when HEAD matches origin/release-topic" \
   grep -q "dry-run ok" <<<"$out"
 
+# A ship tag is the last door. The 0.9.0 tag shipped a lock that still
+# named 0.8.99 because this script never read Cargo.lock.
+add_member() {
+  local dest="$1"
+  mkdir -p "$dest/crates/rbitcoin-node"
+  cat >"$dest/crates/rbitcoin-node/Cargo.toml" <<'EOF'
+[package]
+name = "rbitcoin-node"
+version.workspace = true
+EOF
+  cat >>"$dest/Cargo.toml" <<'EOF'
+
+[workspace]
+members = ["crates/rbitcoin-node"]
+EOF
+}
+
+STALELOCK="$WORKDIR/stalelock"
+mkdir -p "$STALELOCK"
+seed_tree "$STALELOCK"
+add_member "$STALELOCK"
+cat >"$STALELOCK/Cargo.lock" <<'EOF'
+version = 3
+
+[[package]]
+name = "rbitcoin-node"
+version = "0.0.1"
+EOF
+git_c -C "$STALELOCK" add Cargo.toml Cargo.lock crates
+git_c -C "$STALELOCK" commit -q -m lock
+assert_fail_msg "tag refuses a Cargo.lock that is not the workspace version" \
+  "Cargo.lock" \
+  bash "$REL" --root "$STALELOCK" --no-push --allow-branch master
+
+MISSINGLOCK="$WORKDIR/missinglock"
+mkdir -p "$MISSINGLOCK"
+seed_tree "$MISSINGLOCK"
+add_member "$MISSINGLOCK"
+git_c -C "$MISSINGLOCK" add Cargo.toml crates
+git_c -C "$MISSINGLOCK" commit -q -m member
+assert_fail_msg "tag refuses a missing Cargo.lock" \
+  "Cargo.lock is missing" \
+  bash "$REL" --root "$MISSINGLOCK" --no-push --allow-branch master
+
 if [[ "$FAIL" -ne 0 ]]; then
   echo "release.test.sh: $PASS passed, $FAIL failed"
   exit 1

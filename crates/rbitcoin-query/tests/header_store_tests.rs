@@ -14,17 +14,10 @@ use rbitcoin_query::testutil::FixtureChain;
 use rbitcoin_consensus::{genesis_block, ChainParams, ConsensusError};
 use rbitcoin_primitives::{median_time_past_times, MedianWindow};
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use rbitcoin_query::{Query, TxApply};
 
 fn temp_q() -> (std::path::PathBuf, Query) {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("rbitcoin-hdr-mtp-{n}"));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = rbitcoin_store::testutil::fresh_path("hdr-mtp");
     std::fs::create_dir_all(&dir).unwrap();
     let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
     (dir, q)

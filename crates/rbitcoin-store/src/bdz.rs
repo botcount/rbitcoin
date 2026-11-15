@@ -5,6 +5,7 @@
 use crate::error::StoreError;
 use crate::io_handle::IoHandle;
 use crate::readonly_map::ReadonlyMap;
+use rbitcoin_primitives::{le_u32, le_u64};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -432,15 +433,15 @@ impl BdzMphf {
         if &hdr[0..4] != MAGIC2 {
             return Err(StoreError::Corrupt("bdz mphf: bad magic"));
         }
-        let ver = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
+        let ver = le_u32!(hdr, 4);
         if ver != VERSION {
             return Err(StoreError::Corrupt("bdz mphf: bad version"));
         }
-        let n = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
-        let m = u32::from_le_bytes(hdr[12..16].try_into().unwrap());
-        let seed = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
-        let modulus = u32::from_le_bytes(hdr[24..28].try_into().unwrap());
-        let g_bits = u32::from_le_bytes(hdr[28..32].try_into().unwrap());
+        let n = le_u32!(hdr, 8);
+        let m = le_u32!(hdr, 12);
+        let seed = le_u64!(hdr, 16);
+        let modulus = le_u32!(hdr, 24);
+        let g_bits = le_u32!(hdr, 28);
         if g_bits == 0 || g_bits > 32 {
             return Err(StoreError::Corrupt("bdz mphf: g_bits"));
         }
@@ -566,14 +567,14 @@ impl BdzMphf {
         if &hdr[0..4] != MAGIC3 {
             return Err(StoreError::Corrupt("bdz mphf: bad magic"));
         }
-        let ver = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
+        let ver = le_u32!(hdr, 4);
         if ver != VERSION {
             return Err(StoreError::Corrupt("bdz mphf: bad version"));
         }
-        let n = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
-        let m = u32::from_le_bytes(hdr[12..16].try_into().unwrap());
-        let seed = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
-        let g_bits = u32::from_le_bytes(hdr[28..32].try_into().unwrap());
+        let n = le_u32!(hdr, 8);
+        let m = le_u32!(hdr, 12);
+        let seed = le_u64!(hdr, 16);
+        let g_bits = le_u32!(hdr, 28);
         if g_bits != COMPACT_G_BITS {
             return Err(StoreError::Corrupt("bdz mphf: g_bits"));
         }
@@ -743,7 +744,9 @@ pub fn stream_g_pages(
                 && session.free_sq() > 0
                 && in_flight < pool_n
             {
-                let slot = free_slots.pop().unwrap();
+                let Some(slot) = free_slots.pop() else {
+                    break;
+                };
                 let pi = next_page;
                 next_page += 1;
                 let page = page_ids[pi];
@@ -778,16 +781,15 @@ pub fn stream_g_pages(
             for (ud, res) in cqes {
                 let (kind, ep, slot) = crate::uring_session::unpack_ud(ud);
                 let slot = slot as usize;
-                if kind != crate::uring_session::KIND_MPHF_G
-                    || ep != epoch
-                    || slot >= pool_n
-                    || slot_page[slot].is_none()
-                {
+                if kind != crate::uring_session::KIND_MPHF_G || ep != epoch || slot >= pool_n {
                     session.poison();
                     return Err(StoreError::Corrupt("invariant: io_uring leftover cqe"));
                 }
+                let Some(pi) = slot_page[slot].take() else {
+                    session.poison();
+                    return Err(StoreError::Corrupt("invariant: io_uring leftover cqe"));
+                };
                 in_flight = in_flight.saturating_sub(1);
-                let pi = slot_page[slot].take().unwrap();
                 let page = page_ids[pi];
                 let need = g_page_need(n_bytes, page);
                 if res < 0 {

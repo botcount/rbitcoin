@@ -30,7 +30,10 @@ fn classify_standard_templates() {
         v.extend_from_slice(&[0x88, 0xac]);
         v
     });
-    assert_eq!(classify(p2pkh.as_script()), ScriptKind::P2pkh);
+    match classify(p2pkh.as_script()) {
+        ScriptKind::P2pkh(raw) => assert_eq!(&raw[3..23], &[0u8; 20]),
+        other => panic!("p2pkh template, got {other:?}"),
+    }
 
     let p2sh = ScriptBuf::from_bytes({
         let mut v = vec![0xa9, 0x14];

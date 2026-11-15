@@ -2,7 +2,7 @@ use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::hashhead::{initial_slots_for, HashHead, HeadScale};
 use bitcoin_hashes::{sha256, Hash, HashEngine};
-use rbitcoin_primitives::{Fk, TableKind};
+use rbitcoin_primitives::{bytes, le_i32, le_u32, le_u64, Fk, TableKind};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
@@ -46,17 +46,17 @@ impl HeaderRecord {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, StoreError> {
-        if buf.len() < HEADER_RECORD_LEN {
+        let Some(buf) = buf.first_chunk::<HEADER_RECORD_LEN>() else {
             return Err(StoreError::Corrupt("short header record"));
-        }
+        };
         Ok(Self {
-            prev_fk: Fk(u64::from_le_bytes(buf[0..8].try_into().unwrap())),
-            version: i32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            timestamp: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
-            bits: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
-            nonce: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
-            merkle_root: buf[24..56].try_into().unwrap(),
-            hash: buf[56..88].try_into().unwrap(),
+            prev_fk: Fk(le_u64!(buf, 0)),
+            version: le_i32!(buf, 8),
+            timestamp: le_u32!(buf, 12),
+            bits: le_u32!(buf, 16),
+            nonce: le_u32!(buf, 20),
+            merkle_root: bytes!(buf, 24, 32),
+            hash: bytes!(buf, 56, 32),
             size: 0,
             weight: 0,
         })

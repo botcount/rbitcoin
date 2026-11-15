@@ -25,10 +25,10 @@ pub fn verify(
     tx: &Transaction,
     tap_spent: &crypto::TapSpentHashes,
     amount: Amount,
+    output_key: &[u8; 32],
     spk: &[u8],
 ) -> Result<(), ConsensusError> {
-    debug_assert!(spk.len() == 34 && spk.starts_with(&rbitcoin_primitives::P2TR_PREFIX));
-    let output_key = &spk[2..34];
+    let output_key = output_key.as_slice();
 
     let input = &tx.input[input_index.get()];
     let wit_len = input.witness.len();
@@ -161,11 +161,9 @@ pub fn verify_control_commitment(
     let mut curr = TapNodeHash::from_byte_array(tapleaf_hash.to_byte_array());
     for i in 0..nodes {
         let start = CONTROL_BASE + i * CONTROL_NODE;
-        let node = TapNodeHash::from_byte_array(
-            control[start..start + CONTROL_NODE]
-                .try_into()
-                .expect("32-byte merkle node"),
-        );
+        let mut raw = [0u8; CONTROL_NODE];
+        raw.copy_from_slice(&control[start..start + CONTROL_NODE]);
+        let node = TapNodeHash::from_byte_array(raw);
         curr = TapNodeHash::from_node_hashes(curr, node);
     }
     let tweak = TapTweakHash::from_key_and_tweak(internal, Some(curr));
@@ -213,11 +211,9 @@ pub fn verify_script_path(
     if annex.is_some() {
         items.pop();
     }
-    if items.len() < 2 {
+    let (Some(control_bytes), Some(script_bytes)) = (items.pop(), items.pop()) else {
         return Err(ConsensusError::Script("p2tr script path short".into()));
-    }
-    let control_bytes = items.pop().unwrap();
-    let script_bytes = items.pop().unwrap();
+    };
     let mut stack = items;
 
     let script = Script::from_bytes(&script_bytes);

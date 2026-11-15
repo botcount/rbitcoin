@@ -282,7 +282,9 @@ impl InputRecord {
             if buf.len() < off + 4 {
                 return Err(StoreError::Corrupt("input sequence truncated"));
             }
-            let s = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+            let mut seq = [0u8; 4];
+            seq.copy_from_slice(&buf[off..off + 4]);
+            let s = u32::from_le_bytes(seq);
             off += 4;
             s
         };
@@ -618,32 +620,10 @@ pub fn encode_seqsigwit_with_secret(
     encode_input_run_secret(inputs, out, secret);
 }
 
-/// Encode a `spent.body` run (`8 × n_out` bytes) with optional sole-spender overlays.
-///
-/// Duplicate `vout` last-wins. `vout >= n_out`, `fk ≥ 2^40`, or `vin ≥ 2^16` is Corrupt.
-pub fn encode_spent_slots(
-    n_out: u32,
-    pairs: &[(u32, Fk, u32)],
-    out: &mut Vec<u8>,
-) -> Result<(), StoreError> {
-    let n = (n_out as usize).saturating_mul(OutputRecord::SPENT_SLOT_LEN);
-    let start = out.len();
-    out.resize(start.saturating_add(n), 0);
-    for &(vout, fk, vin) in pairs {
-        if vout >= n_out {
-            return Err(StoreError::Corrupt("spent overlay vout"));
-        }
-        let slot = encode_spent_slot(0, fk, vin)?;
-        let off =
-            start.saturating_add((vout as usize).saturating_mul(OutputRecord::SPENT_SLOT_LEN));
-        out[off..off + OutputRecord::SPENT_SLOT_LEN].copy_from_slice(&slot);
-    }
-    Ok(())
-}
-
-/// Encode a zeroed `spent.body` run (`8 × n_out` bytes).
+/// Append a zeroed `spent.body` run (`8 × n_out` bytes).
 pub fn encode_spent_zeros(n_out: u32, out: &mut Vec<u8>) {
-    encode_spent_slots(n_out, &[], out).expect("empty spent overlay");
+    let n = (n_out as usize).saturating_mul(OutputRecord::SPENT_SLOT_LEN);
+    out.resize(out.len().saturating_add(n), 0);
 }
 
 /// Published `spent.body` span for one create (`8 × n_out`).
@@ -750,7 +730,9 @@ pub fn read_inline_prevout(
     if buf.len() < *off + 8 {
         return Err(StoreError::Corrupt("input create_fk truncated"));
     }
-    let id = u64::from_le_bytes(buf[*off..*off + 8].try_into().unwrap());
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&buf[*off..*off + 8]);
+    let id = u64::from_le_bytes(word);
     *off += 8;
     if id == 0 {
         return Err(StoreError::Corrupt("non-coinbase create_fk is null"));
@@ -847,6 +829,99 @@ pub fn decode_spent_slot(raw: &[u8]) -> Result<(u8, Fk, u32), StoreError> {
     le[..7].copy_from_slice(&raw[1..8]);
     let (field, vin) = unpack_spent_field(u64::from_le_bytes(le))?;
     Ok((flags, field, vin))
+}
+
+/// Exact `spent.body` image for one Class A append: `8 × n_out` zeros per create.
+///
+/// `offs[i]` is the byte start of create `i`. `offs` is one longer than the
+/// create count and `offs[last] == bytes.len()`.
+pub struct SpentBodyImage {
+    bytes: Vec<u8>,
+    offs: Vec<usize>,
+}
+
+impl SpentBodyImage {
+    pub fn zeros(n_outs: &[u32]) -> Self {
+        let mut offs = Vec::with_capacity(n_outs.len().saturating_add(1));
+        offs.push(0);
+        let mut n = 0usize;
+        for &n_out in n_outs {
+            n = n.saturating_add((n_out as usize).saturating_mul(OutputRecord::SPENT_SLOT_LEN));
+            offs.push(n);
+        }
+        Self {
+            bytes: vec![0u8; n],
+            offs,
+        }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn offs(&self) -> &[usize] {
+        &self.offs
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    pub fn create_count(&self) -> usize {
+        self.offs.len().saturating_sub(1)
+    }
+
+    pub fn n_out(&self, create: usize) -> u32 {
+        let end_i = create.saturating_add(1);
+        if end_i >= self.offs.len() {
+            return 0;
+        }
+        ((self.offs[end_i].saturating_sub(self.offs[create])) / OutputRecord::SPENT_SLOT_LEN) as u32
+    }
+
+    pub fn record_lens(&self) -> Vec<u64> {
+        self.offs
+            .windows(2)
+            .map(|w| (w[1].saturating_sub(w[0])) as u64)
+            .collect()
+    }
+
+    /// Place each pair. An empty `rows` is an all-zero image of `n_outs`.
+    pub fn from_pairs(n_outs: &[u32], rows: &[Vec<(u32, Fk, u32)>]) -> Result<Self, StoreError> {
+        if !rows.is_empty() && rows.len() != n_outs.len() {
+            return Err(StoreError::Corrupt("spent overlay length"));
+        }
+        let mut image = Self::zeros(n_outs);
+        for (i, row) in rows.iter().enumerate() {
+            for &(vout, fk, vin) in row {
+                image.place(i, vout, fk, vin)?;
+            }
+        }
+        Ok(image)
+    }
+
+    /// Write a sole spender. A slot that already names an equal or lower fk stays.
+    pub fn place(&mut self, create: usize, vout: u32, fk: Fk, vin: u32) -> Result<(), StoreError> {
+        let end_i = create.saturating_add(1);
+        if end_i >= self.offs.len() {
+            return Err(StoreError::Corrupt("spent overlay create"));
+        }
+        let start = self.offs[create];
+        let end = self.offs[end_i];
+        let n_out = end.saturating_sub(start) / OutputRecord::SPENT_SLOT_LEN;
+        if (vout as usize) >= n_out {
+            return Err(StoreError::Corrupt("spent overlay vout"));
+        }
+        let slot = encode_spent_slot(0, fk, vin)?;
+        let off = start + (vout as usize) * OutputRecord::SPENT_SLOT_LEN;
+        let (_flags, existing, _vin) =
+            decode_spent_slot(&self.bytes[off..off + OutputRecord::SPENT_SLOT_LEN])?;
+        if !existing.is_null() && fk.0 >= existing.0 {
+            return Ok(());
+        }
+        self.bytes[off..off + OutputRecord::SPENT_SLOT_LEN].copy_from_slice(&slot);
+        Ok(())
+    }
 }
 
 /// Spent abs for `vout` given the create's `spent.body` range start.
@@ -1084,6 +1159,28 @@ pub fn visit_packed_scripts(
     }
     check_trailing_zero_pad(raw, off)?;
     Ok(())
+}
+
+/// Sum of every output amount of one packed create. Scripts are skipped by
+/// length, not decoded.
+pub fn packed_output_value_sum(raw: &[u8], n_out: u32) -> Result<u64, StoreError> {
+    let (_meta, mut off) = TxRecord::decode_body_meta(raw)?;
+    let mut sum = 0u64;
+    for _ in 0..n_out {
+        let Some(&flags) = raw.get(off) else {
+            return Err(StoreError::Corrupt("packed outputs short"));
+        };
+        let (kind, exp) = split_output_flags(flags)?;
+        let mut o = off + 1;
+        let (v, n) = decode_output_amount(exp, &raw[o..])?;
+        o += n;
+        sum = sum
+            .checked_add(v)
+            .ok_or(StoreError::Corrupt("packed output value sum overflow"))?;
+        off = o + crate::compact::script_kind_v17_disk_used(kind, &raw[o..])?;
+    }
+    check_trailing_zero_pad(raw, off)?;
+    Ok(sum)
 }
 
 /// Sparse pin decode: only materialize `need_vouts` scripts + denserel slots.

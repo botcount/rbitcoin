@@ -216,3 +216,65 @@ fn unknown_sigops_and_older_schema_records_decode() {
         ));
     }
 }
+
+#[test]
+fn decode_packed_prefix_keeps_fee_and_rejects_short() {
+    let tx = sample_tx(false);
+    let (txid, wtxid) = (tx.compute_txid(), tx.compute_wtxid());
+    let packed =
+        encode_packed_live(&tx, &txid, &wtxid, 99, 401, Some(3), 1_700_000_111, &[]).unwrap();
+    let got = decode_packed(&packed, true, true).unwrap();
+    assert_eq!(got.fee_sat, 99);
+    assert_eq!(got.weight, 401);
+    assert_eq!(got.sigop_cost, Some(3));
+    assert_eq!(got.accept_secs, 1_700_000_111);
+    assert_eq!(got.txid, txid);
+    assert_eq!(got.wtxid, wtxid);
+    assert_eq!(serialize(&got.tx), serialize(&tx));
+    let mut v3 = packed.clone();
+    v3.drain(ACCEPT_SECS_OFF..ACCEPT_SECS_OFF + 8);
+    let got = decode_packed(&v3, true, false).unwrap();
+    assert_eq!(got.fee_sat, 99);
+    assert_eq!(got.weight, 401);
+    assert_eq!(got.sigop_cost, Some(3));
+    assert_eq!(got.accept_secs, 0);
+    assert_eq!(got.txid, txid);
+    let mut v2 = v3;
+    v2.drain(SIGOP_COST_OFF..SIGOP_COST_OFF + 8);
+    let got = decode_packed(&v2, false, false).unwrap();
+    assert_eq!(got.fee_sat, 99);
+    assert_eq!(got.weight, 401);
+    assert_eq!(got.sigop_cost, None);
+    assert_eq!(got.txid, txid);
+    assert!(matches!(
+        decode_packed(&packed[..16], true, true),
+        Err(MempoolError::Corrupt("packed live short"))
+    ));
+}
+
+#[test]
+fn take_arr_keeps_four_and_rejects_short() {
+    let mut off = 0usize;
+    let got = take_arr::<4>(&[9, 8, 7, 6, 5], &mut off).unwrap();
+    assert_eq!(got, [9, 8, 7, 6]);
+    assert_eq!(off, 4);
+    match take_arr::<4>(&[1, 2], &mut 0) {
+        Err(MempoolError::Corrupt("packed short")) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("a short window was taken"),
+    }
+}
+
+#[test]
+fn core_dat_empty_roundtrip_and_rejects_short() {
+    let raw = rbitcoin_mempool::CoreMempoolDat::default().encode(None);
+    let got = rbitcoin_mempool::CoreMempoolDat::decode(&raw).unwrap();
+    assert!(got.txs.is_empty());
+    let keyed = rbitcoin_mempool::CoreMempoolDat::default().encode(Some([9u8; 8]));
+    let got = rbitcoin_mempool::CoreMempoolDat::decode(&keyed).unwrap();
+    assert!(got.txs.is_empty());
+    match rbitcoin_mempool::CoreMempoolDat::decode(&[1, 0, 0]) {
+        Err(err) => assert!(err.contains("end of data"), "{err}"),
+        Ok(_) => panic!("a short file decoded"),
+    }
+}

@@ -10,6 +10,7 @@ use rbitcoin_primitives::Height;
 use std::borrow::Borrow;
 use std::hash::BuildHasherDefault;
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -278,11 +279,7 @@ pub fn validate_block_structure_with_pres(
         return Err(ConsensusError::BadBlock("block weight too large"));
     }
 
-    // BIP34 only after the network's buried height (mainnet 227931). From
-    // height 1 this rejects mainnet block 1.
-    if ctx.enforce_height_gates && ctx.params.bip34_active_at(ctx.height.0) {
-        check_bip34_coinbase(&block.txdata[0], ctx.height.0)?;
-    }
+    check_height_gated_rules(block, ctx, &pres)?;
 
     {
         let mut cost = 0u64;
@@ -304,6 +301,33 @@ pub fn validate_block_structure_with_pres(
     Ok(pres)
 }
 
+/// Core `ContextualCheckBlock` rules that read the block's height, in Core's
+/// order: the BIP 54 transaction size, the BIP34 coinbase height, then the
+/// BIP 54 coinbase timelock.
+fn check_height_gated_rules(
+    block: &Block,
+    ctx: &ValidationContext<'_>,
+    pres: &[TxPrecompute],
+) -> Result<(), ConsensusError> {
+    if !ctx.enforce_height_gates {
+        return Ok(());
+    }
+    if ctx.params.enforce_bip54 {
+        for p in pres {
+            reject_bip54_tx_size(p.base_size)?;
+        }
+    }
+    // BIP34 only after the network's buried height (mainnet 227931). From
+    // height 1 this rejects mainnet block 1.
+    if ctx.params.bip34_active_at(ctx.height.0) {
+        check_bip34_coinbase(&block.txdata[0], ctx.height.0)?;
+    }
+    if ctx.params.enforce_bip54 {
+        reject_bip54_coinbase(&block.txdata[0], ctx.height.0)?;
+    }
+    Ok(())
+}
+
 /// Witness commitment before weight. Padding is not the block hash's fault.
 #[doc(hidden)]
 pub fn reject_witness_malleation(
@@ -311,7 +335,24 @@ pub fn reject_witness_malleation(
     ctx: &ValidationContext<'_>,
     pres: &[TxPrecompute],
 ) -> Result<(), ConsensusError> {
-    let has_witness_data = block_has_witness_from_pres(pres);
+    reject_witness_malleation_wtxids(
+        block,
+        ctx,
+        block_has_witness_from_pres(pres),
+        pres.iter().skip(1).map(|p| p.wtxid),
+    )
+}
+
+/// [`reject_witness_malleation`] from wtxids already hashed: `non_cb_wtxids`
+/// is `txdata[1..]` in order. They are collected only when a commitment is
+/// checked.
+#[doc(hidden)]
+pub fn reject_witness_malleation_wtxids(
+    block: &Block,
+    ctx: &ValidationContext<'_>,
+    has_witness_data: bool,
+    non_cb_wtxids: impl IntoIterator<Item = [u8; 32]>,
+) -> Result<(), ConsensusError> {
     let has_commitment = coinbase_has_witness_commitment(block);
     if has_witness_data && ctx.enforce_height_gates && !ctx.params.segwit_active_at(ctx.height.0) {
         return Err(ConsensusError::BadBlock("unexpected witness before segwit"));
@@ -319,7 +360,7 @@ pub fn reject_witness_malleation(
     if (has_witness_data || has_commitment)
         && (ctx.params.segwit_active_at(ctx.height.0) || !ctx.enforce_height_gates)
     {
-        let non_cb: Vec<[u8; 32]> = pres.iter().skip(1).map(|p| p.wtxid).collect();
+        let non_cb: Vec<[u8; 32]> = non_cb_wtxids.into_iter().collect();
         check_witness_commitment_with_wtxids(block, &non_cb)?;
     }
     Ok(())
@@ -573,6 +614,65 @@ pub fn tx_sigop_cost(tx: &Transaction, prev_spks: &[&[u8]], bip16: bool, witness
     cost
 }
 
+/// Core `MAX_TX_BIP54_SIGOPS`: the most BIP 54 signature operations the
+/// inputs of one transaction may carry.
+pub const MAX_TX_BIP54_SIGOPS: u64 = 2_500;
+
+/// BIP 54 signature operations of one input, counted where they can run: the
+/// scriptSig, and the P2SH redeem script for a P2SH prevout or else the
+/// scriptPubKey. Counted as BIP16 does, executed or not. Witness programs
+/// add none (Core `CheckSigopsBIP54`).
+pub fn bip54_sigops_one(inp: &bitcoin::TxIn, spk: &[u8]) -> u64 {
+    let spent = if Script::from_bytes(spk).is_p2sh() {
+        p2sh_sigops_one(inp, spk)
+    } else {
+        script_sigop_count(spk, true)
+    };
+    script_sigop_count(inp.script_sig.as_bytes(), true).saturating_add(spent)
+}
+
+/// BIP 54: the inputs of a non-coinbase `tx`, spending `prev_spks` in order,
+/// carry at most [`MAX_TX_BIP54_SIGOPS`] (`bad-txns-legacy-sigops`).
+pub fn reject_bip54_sigops(tx: &Transaction, prev_spks: &[&[u8]]) -> Result<(), ConsensusError> {
+    tx.input
+        .iter()
+        .zip(prev_spks)
+        .try_fold(0, |total, (inp, spk)| {
+            add_bip54_sigops(total, bip54_sigops_one(inp, spk))
+        })
+        .map(|_| ())
+}
+
+/// Which sigop counts a block's rules take from the prevouts it spends.
+#[derive(Clone, Copy)]
+pub struct SpendSigopRules {
+    pub bip16: bool,
+    pub witness: bool,
+    pub bip54: bool,
+}
+
+/// What one spent prevout adds under [`SpendSigopRules`].
+#[derive(Clone, Copy)]
+pub struct SpendSigops {
+    /// P2SH and witness cost toward the block limit ([`prevout_spk_sigops`]).
+    pub block_cost: u64,
+    /// [`bip54_sigops_one`]. Zero without BIP 54.
+    pub bip54: u64,
+}
+
+impl SpendSigopRules {
+    pub fn count(self, inp: &bitcoin::TxIn, spk: &[u8]) -> SpendSigops {
+        SpendSigops {
+            block_cost: prevout_spk_sigops(inp, spk, self.bip16, self.witness),
+            bip54: if self.bip54 {
+                bip54_sigops_one(inp, spk)
+            } else {
+                0
+            },
+        }
+    }
+}
+
 /// BIP141: coinbase must commit to witness merkle root when segwit is used.
 ///
 /// `precomputed_non_cb` is wtxids for non-coinbase txs (same order as `txdata[1..]`).
@@ -626,6 +726,25 @@ pub fn check_bip34_coinbase(coinbase: &Transaction, height: u32) -> Result<(), C
         return crate::trust::soften(ConsensusError::BadBlock("bip34 height encoding"));
     }
     Ok(())
+}
+
+/// The coinbase `nLockTime` and input `nSequence` a block template gives a
+/// miner for a block at `height`. With BIP 54 they are the ones
+/// [`reject_bip54_coinbase`] accepts. Otherwise the coinbase is not
+/// timelocked.
+#[must_use]
+pub fn template_coinbase_timelock(
+    params: &ChainParams,
+    height: u32,
+) -> (bitcoin::absolute::LockTime, bitcoin::Sequence) {
+    if params.enforce_bip54 {
+        (
+            bitcoin::absolute::LockTime::from_consensus(height.saturating_sub(1)),
+            bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF,
+        )
+    } else {
+        (bitcoin::absolute::LockTime::ZERO, bitcoin::Sequence::MAX)
+    }
 }
 
 /// Serialize `height` the same way Core pushes it into the coinbase scriptSig.
@@ -847,6 +966,16 @@ impl ScriptVerifyFlags {
         }
     }
 
+    /// Unconfirmed-tx checks. Consensus history stays [`Self::consensus_at`].
+    /// Constant scriptCode is on so a legacy `OP_CODESEPARATOR` cannot force
+    /// a new sighash per signature. The interpreter also counts legacy sighash
+    /// bytes only while this flag is on.
+    pub const fn unconfirmed() -> Self {
+        let mut flags = Self::buried(true, true, true, true, true);
+        flags.const_scriptcode = true;
+        flags
+    }
+
     /// Core `GetBlockScriptFlags` for `block_hash` at `ctx`. `bip16_active` is
     /// false only for a BIP16 exception block or genesis.
     pub fn consensus_at(
@@ -983,6 +1112,9 @@ pub struct ScriptCheckJob {
     /// Owned (tests) or shared wire block + index (confirm path).
     pub tx: JobTx,
     pub flags: ScriptVerifyFlags,
+    /// Legacy sighash bytes still allowed for this transaction. One budget
+    /// shared by every input. `u64::MAX` until an unconfirmed check starts.
+    pub(crate) legacy_sighash_left: AtomicU64,
     /// Lookup/structure `TxPrecompute`. Set on the confirm path; tests lazy-`from_tx`.
     pub pre: std::sync::OnceLock<JobPre>,
     skip_segwit_midstates: bool,
@@ -1101,6 +1233,7 @@ impl ScriptCheckJob {
             prevouts,
             tx,
             flags,
+            legacy_sighash_left: AtomicU64::new(u64::MAX),
             pre: std::sync::OnceLock::new(),
             skip_segwit_midstates,
         }
@@ -1140,9 +1273,9 @@ impl ScriptCheckJob {
             // Asked for midstates with no stored row. This is the script
             // fallback, including a coinbase-shaped fixture. IBD stores the
             // row for a non-coinbase segwit transaction and does not ask here.
-            JobPre::Owned(std::sync::Arc::new(crate::TxPrecompute::Script(
+            JobPre::Owned(std::sync::Arc::new(crate::TxPrecompute::Script(Box::new(
                 crate::TxScriptPrecompute::from_tx(&self.tx),
-            )))
+            ))))
         })
     }
 
@@ -1402,6 +1535,12 @@ pub fn check_block_on_parent(
     Ok(())
 }
 
+/// BIP68 sequence disable bit. A set bit means that input has no relative lock.
+pub const SEQUENCE_LOCKTIME_DISABLE_FLAG: u32 = 1 << 31;
+
+/// BIP68 time-lock bit. A set bit means the relative lock counts 512-second units.
+pub const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
+
 /// BIP68 / CSV version gate: Core compares `nVersion` as **unsigned**
 /// (`uint32_t >= 2`). rust-bitcoin exposes `Version(i32)`; cast explicitly so
 /// `0xFFFFFFFF` enforces locks (not signed `-1 < 2`).
@@ -1410,6 +1549,15 @@ pub fn check_block_on_parent(
 #[inline]
 pub fn bip68_active_for_tx(tx: &Transaction) -> bool {
     (tx.version.0 as u32) >= 2
+}
+
+/// BIP68 can lock an input: the version gate holds, and one sequence has the disable bit clear.
+pub fn tx_has_relative_lock(tx: &Transaction) -> bool {
+    bip68_active_for_tx(tx)
+        && tx
+            .input
+            .iter()
+            .any(|inp| inp.sequence.to_consensus_u32() & SEQUENCE_LOCKTIME_DISABLE_FLAG == 0)
 }
 
 /// BIP68 relative locks when `tx.version` as u32 ≥ 2.
@@ -1428,8 +1576,6 @@ pub fn sequence_locks_satisfied(
     if !bip68_active_for_tx(tx) {
         return true;
     }
-    const DISABLE: u32 = 1 << 31;
-    const TYPE_FLAG: u32 = 1 << 22;
     const MASK: u32 = 0x0000_ffff;
     const GRANULARITY: u32 = 9;
 
@@ -1437,7 +1583,7 @@ pub fn sequence_locks_satisfied(
     let mut min_time: i64 = -1;
     for (i, inp) in tx.input.iter().enumerate() {
         let seq = inp.sequence.to_consensus_u32();
-        if seq & DISABLE != 0 {
+        if seq & SEQUENCE_LOCKTIME_DISABLE_FLAG != 0 {
             continue;
         }
         // A missing height slice is unresolved. Height 0 is the genesis coin.
@@ -1446,7 +1592,7 @@ pub fn sequence_locks_satisfied(
             return false;
         };
         let rel = (seq & MASK) as i64;
-        if seq & TYPE_FLAG != 0 {
+        if seq & SEQUENCE_LOCKTIME_TYPE_FLAG != 0 {
             let Some(&raw_mtp) = prev_coin_mtps.get(i) else {
                 return false;
             };
@@ -1476,12 +1622,13 @@ pub fn is_anyone_can_spend(script: &Script) -> bool {
 #[doc(hidden)]
 pub mod facts;
 pub use facts::{
-    add_fee, add_sigops, add_value_in, fee_from_values, fee_sat, fee_with_waived_coinbase,
-    header_gap_on_chain, median_or_bad_header, reject_assemble_block_shape, reject_batch_starts_at,
-    reject_bits, reject_carried_header_hash, reject_confirm_batch, reject_csv_create_height,
-    reject_duplicate_input, reject_empty_confirm_batch, reject_genesis_coinbase_spend,
-    reject_non_final, reject_prev_link, reject_prevout_spent, reject_same_block_create,
-    reject_sequence_locks, reject_spend_cursor, reject_tx_without_inputs,
+    add_bip54_sigops, add_fee, add_sigops, add_value_in, fee_from_values, fee_sat,
+    fee_with_waived_coinbase, header_gap_on_chain, median_or_bad_header,
+    reject_assemble_block_shape, reject_batch_starts_at, reject_bip54_coinbase,
+    reject_bip54_tx_size, reject_carried_header_hash, reject_confirm_batch,
+    reject_csv_create_height, reject_duplicate_input, reject_empty_confirm_batch,
+    reject_genesis_coinbase_spend, reject_non_final, reject_prev_link, reject_prevout_spent,
+    reject_same_block_create, reject_sequence_locks, reject_spend_cursor, reject_tx_without_inputs,
     reject_tx_without_outputs, reject_txid_count, reject_unresolved_spend,
     reject_unspendable_prevout, reject_vout_past_n_out, reject_witness_before_segwit,
     require_linked_parent, require_next_work, require_retarget_first, require_same_block_output,

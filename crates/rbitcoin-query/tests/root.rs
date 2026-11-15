@@ -1273,6 +1273,105 @@ fn block_txstat_rows_have_fees_hash_and_cell_bytes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Block summary rows: stored txid order, stamped fee and weight, and the
+/// output value sum per tx, coinbase first with fee 0. Unstamped rows give
+/// the same rows from the reconstructed block, and the read writes nothing.
+#[test]
+fn block_tx_summary_rows_match_the_wire_block() {
+    let (dir, q) = temp_query("blk-summary");
+    let (h0, cb0) = coinbase_block(0, Fk::NULL, None);
+    let cb0_txid = cb0.tx.txid;
+    let hfk0 = q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+
+    let (h1, cb1) = coinbase_block(1, hfk0, Some(h0.hash));
+    let mut parent = spend_apply(0x11, cb0_txid, 30_0000_0000);
+    parent.inputs[0].witness = vec![vec![0x30; 72], vec![0x02; 33]];
+    parent
+        .outputs
+        .extend([0, 19_9990_0000].map(|v| OutputRecord::unspent(v, vec![0x6a])));
+    parent.tx.output_count = 3;
+    let child = spend_apply(0x22, parent.tx.txid, 30_0000_0000 - 5_000);
+    let applies = [cb1, parent, child];
+    q.connect_block(Height(1), &h1, &applies).unwrap();
+
+    let want: Vec<([u8; 32], u64, u64, u64)> = applies
+        .iter()
+        .zip([0, 10_0000, 5_000])
+        .map(|(ta, fee)| {
+            let tx = rbitcoin_query::testutil::tx_apply_to_tx(ta);
+            let value = tx.output.iter().map(|o| o.value.to_sat()).sum();
+            (ta.tx.txid, fee, tx.weight().to_wu(), value)
+        })
+        .collect();
+    let witness_tx = rbitcoin_query::testutil::tx_apply_to_tx(&applies[1]);
+    assert!(
+        want[1].2 < 4 * witness_tx.total_size() as u64,
+        "witness discount"
+    );
+    let rows = |q: &Query| -> Vec<([u8; 32], u64, u64, u64)> {
+        q.block_tx_summary(&h1.hash)
+            .unwrap()
+            .expect("best chain")
+            .iter()
+            .map(|r| (r.txid, r.fee_sat, r.weight, r.value_sat))
+            .collect()
+    };
+    assert_eq!(rows(&q), want);
+    assert!(q.block_tx_summary(&[0xee; 32]).unwrap().is_none());
+
+    for fk in q.block_tx_fks(Height(1)).unwrap() {
+        unstamp_txstat(&q, fk);
+    }
+    assert!(q.stamped_txstat_block(Height(1)).unwrap().is_none());
+    assert_eq!(rows(&q), want, "unstamped rows come from the wire block");
+    assert!(
+        q.stamped_txstat_block(Height(1)).unwrap().is_none(),
+        "a summary read does not stamp"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The unstamped fallback reads the requested header's own transactions.
+/// After a same-height replace it still gives the first block's rows, never
+/// the replacement's.
+#[test]
+fn block_tx_summary_from_wire_reads_the_requested_header() {
+    let (dir, q) = temp_query("blk-summary-wire");
+    let (h0, cb0) = coinbase_block(0, Fk::NULL, None);
+    let hfk0 = q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let (ha, cba) = coinbase_block(1, hfk0, Some(h0.hash));
+    q.connect_block(Height(1), &ha, std::slice::from_ref(&cba))
+        .unwrap();
+    let a_value: u64 = cba.outputs.iter().map(|o| o.value).sum();
+
+    q.disconnect_tip().unwrap();
+    let (mut hb, mut cbb) = coinbase_block(1, hfk0, Some(h0.hash));
+    hb.nonce = hb.nonce.wrapping_add(1);
+    rehash_header(&mut hb, &h0.hash);
+    cbb.tx.txid[30] = 0xbb;
+    cbb.outputs[0].value -= 1;
+    q.connect_block(Height(1), &hb, std::slice::from_ref(&cbb))
+        .unwrap();
+
+    let a = q
+        .block_tx_summary_from_wire(&ha.hash)
+        .unwrap()
+        .expect("the replaced block's header is still stored");
+    assert_eq!(
+        a.iter().map(|r| (r.txid, r.value_sat)).collect::<Vec<_>>(),
+        vec![(cba.tx.txid, a_value)],
+    );
+    assert_eq!(q.block_tx_summary(&ha.hash).unwrap().unwrap(), a);
+    let b = q.block_tx_summary(&hb.hash).unwrap().expect("best chain");
+    assert_eq!(
+        b.iter().map(|r| (r.txid, r.value_sat)).collect::<Vec<_>>(),
+        vec![(cbb.tx.txid, a_value - 1)],
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn buried_rules_and_a_lying_header_path() {
     let (dir, q) = temp_query("ms-work");
@@ -1368,6 +1467,300 @@ fn a_queued_body_off_the_header_path_is_not_the_milestone_chain() {
     );
     q.note_milestone_header(50, block, [0; 32], one, None);
     assert_eq!(q.milestone_header_at(50), Some(block));
+    let _ = dir;
+}
+
+#[test]
+fn a_confirmed_tip_drops_milestone_hashes_it_passed() {
+    let (dir, q) = temp_query("ms-drop-tip");
+    let mut one_be = [0u8; 32];
+    one_be[31] = 1;
+    let one = bitcoin::Work::from_be_bytes(one_be);
+    let at_five = [0x11u8; 32];
+    let at_nine = [0x22u8; 32];
+    let at_ten = [0x33u8; 32];
+    q.note_milestone_header(
+        5,
+        at_five,
+        [0; 32],
+        one,
+        Some(bitcoin::Work::from_be_bytes([0; 32])),
+    );
+    q.note_milestone_header(9, at_nine, [0; 32], one, None);
+    q.note_milestone_header(10, at_ten, at_nine, one, None);
+    let work = q.milestone_best_work_be();
+    assert!(work.is_some());
+
+    q.drop_milestone_path_through(9);
+    assert_eq!(
+        q.milestone_header_at(5),
+        None,
+        "a height the tip passed is not kept on the path"
+    );
+    assert_eq!(q.milestone_header_at(9), None);
+    assert_eq!(
+        q.milestone_header_at(8),
+        None,
+        "a hole in the range still held is not an ancestor"
+    );
+    assert_eq!(q.milestone_header_at(10), Some(at_ten));
+    assert!(q.has_milestone_path());
+    assert_eq!(
+        q.milestone_best_work_be(),
+        work,
+        "dropping confirmed heights keeps the header-tip work"
+    );
+
+    q.note_milestone_header(4, [0x44; 32], [0; 32], one, None);
+    assert_eq!(q.milestone_header_at(4), Some([0x44; 32]));
+    assert_eq!(
+        q.milestone_header_at(5),
+        None,
+        "a height between the new low and the retained tip stays a hole"
+    );
+    assert_eq!(q.milestone_header_at(10), Some(at_ten));
+
+    q.drop_milestone_path_through(10);
+    assert!(!q.has_milestone_path());
+    assert_eq!(q.milestone_header_at(10), None);
+    let _ = dir;
+}
+
+#[test]
+fn a_header_after_a_dropped_tip_still_adds_its_work() {
+    let (dir, q) = temp_query("ms-drop-extend");
+    let mut base_be = [0u8; 32];
+    base_be[31] = 4;
+    let base = bitcoin::Work::from_be_bytes(base_be);
+    let mut one_be = [0u8; 32];
+    one_be[31] = 1;
+    let one = bitcoin::Work::from_be_bytes(one_be);
+    let h10 = [0x10u8; 32];
+    let h11 = [0x11u8; 32];
+    q.note_milestone_header(10, h10, [0x09; 32], one, Some(base));
+    let through_ten = (base + one).to_be_bytes();
+    q.drop_milestone_path_through(10);
+    assert_eq!(q.milestone_header_at(10), None);
+    assert!(!q.has_milestone_path());
+    assert_eq!(q.milestone_best_work_be(), Some(through_ten));
+
+    q.note_milestone_header(11, h11, h10, one, None);
+    let through_eleven = (base + one + one).to_be_bytes();
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(through_eleven),
+        "a header that links to the dropped tip still adds its work"
+    );
+    assert_eq!(q.milestone_header_at(10), None);
+    assert_eq!(q.milestone_header_at(11), Some(h11));
+
+    q.note_milestone_header(12, [0x12; 32], [0x99; 32], one, None);
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(through_eleven),
+        "a header that does not link to that tip adds nothing"
+    );
+    let _ = dir;
+}
+
+#[test]
+fn a_note_at_the_checkpoint_height_still_links_after_the_drop() {
+    let (dir, q) = temp_query("ms-checkpoint-link");
+    let mut work_be = [0u8; 32];
+    work_be[31] = 4;
+    let one_be = {
+        let mut b = [0u8; 32];
+        b[31] = 1;
+        b
+    };
+    let one = bitcoin::Work::from_be_bytes(one_be);
+    let through_ten = (bitcoin::Work::from_be_bytes(work_be) + one).to_be_bytes();
+    let h10 = [0x10u8; 32];
+    let h10_b = [0x1au8; 32];
+    let h11 = [0x11u8; 32];
+    q.note_milestone_checkpoint_work(10, work_be);
+    q.note_milestone_header(10, h10, [0x09; 32], one, None);
+    q.note_milestone_header(10, h10_b, [0x09; 32], one, None);
+    q.drop_milestone_path_through(10);
+    assert_eq!(q.milestone_header_at(10), None);
+    assert_eq!(q.milestone_best_work_be(), Some(work_be));
+
+    q.note_milestone_header(11, h11, h10, one, None);
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(work_be),
+        "a child of the replaced hash adds nothing"
+    );
+    q.note_milestone_header(11, h11, h10_b, one, None);
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(through_ten),
+        "a child of the hash now at the checkpoint height adds its work"
+    );
+    let _ = dir;
+}
+
+#[test]
+fn a_checkpoint_on_an_invalid_work_tip_still_links_after_the_drop() {
+    let (dir, q) = temp_query("ms-checkpoint-invalid");
+    let mut work_be = [0u8; 32];
+    work_be[31] = 4;
+    let one_be = {
+        let mut b = [0u8; 32];
+        b[31] = 1;
+        b
+    };
+    let one = bitcoin::Work::from_be_bytes(one_be);
+    let through = (bitcoin::Work::from_be_bytes(work_be) + one).to_be_bytes();
+    let h0 = [0x0au8; 32];
+    let h1 = [0x0bu8; 32];
+    q.note_milestone_header(0, h0, [0; 32], one, None);
+    q.note_milestone_checkpoint_work(0, work_be);
+    q.drop_milestone_path_through(0);
+    q.note_milestone_header(1, h1, h0, one, None);
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(through),
+        "a checkpoint at height 0 takes the hash already noted there"
+    );
+
+    let h10 = [0x10u8; 32];
+    let h10_b = [0x1bu8; 32];
+    let h11 = [0x11u8; 32];
+    let base_be = {
+        let mut b = [0u8; 32];
+        b[31] = 2;
+        b
+    };
+    q.note_milestone_header(
+        10,
+        h10,
+        [0; 32],
+        one,
+        Some(bitcoin::Work::from_be_bytes(base_be)),
+    );
+    q.clear_milestone_path_above(5);
+    q.note_milestone_header(10, h10_b, [0; 32], one, None);
+    q.note_milestone_checkpoint_work(10, work_be);
+    q.drop_milestone_path_through(10);
+    q.note_milestone_header(11, h11, h10, one, None);
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(work_be),
+        "a child of the hash from before the rewind adds nothing"
+    );
+    q.note_milestone_header(11, h11, h10_b, one, None);
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(through),
+        "a checkpoint after a rewind takes the hash noted at that height"
+    );
+    let _ = dir;
+}
+
+#[test]
+fn a_note_below_the_retained_base_still_links_the_dropped_tip() {
+    let (dir, q) = temp_query("ms-reopen-link");
+    let zero = bitcoin::Work::from_be_bytes([0; 32]);
+    let mut one_be = [0u8; 32];
+    one_be[31] = 1;
+    let one = bitcoin::Work::from_be_bytes(one_be);
+    let through_five = one.to_be_bytes();
+    let through_six = (one + one).to_be_bytes();
+    let a5 = [0x05u8; 32];
+    let a10 = [0x0au8; 32];
+    q.note_milestone_header(5, a5, [0; 32], one, Some(zero));
+    q.note_milestone_header(10, a10, [0x99; 32], one, None);
+    q.drop_milestone_path_through(9);
+    assert_eq!(q.milestone_header_at(5), None);
+    assert_eq!(q.milestone_header_at(10), Some(a10));
+    q.note_milestone_header(4, [0x04; 32], [0; 32], one, None);
+    assert_eq!(
+        q.milestone_header_at(5),
+        None,
+        "reopening below the base leaves the dropped tip a hole"
+    );
+    assert_eq!(q.milestone_best_work_be(), Some(through_five));
+    q.note_milestone_header(6, [0x06; 32], a5, one, None);
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(through_six),
+        "a header that links to the dropped tip still adds its work"
+    );
+    q.note_milestone_header(7, [0x07; 32], [0x99; 32], one, None);
+    assert_eq!(q.milestone_best_work_be(), Some(through_six));
+    let _ = dir;
+}
+
+#[test]
+fn a_note_into_a_dropped_prefix_still_links_the_work_tip() {
+    let (dir, q) = temp_query("ms-prefix-reuse");
+    let zero = bitcoin::Work::from_be_bytes([0; 32]);
+    let mut one_be = [0u8; 32];
+    one_be[31] = 1;
+    let one = bitcoin::Work::from_be_bytes(one_be);
+    let through_six = (one + one).to_be_bytes();
+    let through_seven = (one + one + one).to_be_bytes();
+    let h5 = [0x05u8; 32];
+    let h6 = [0x06u8; 32];
+    q.note_milestone_header(5, h5, [0; 32], one, Some(zero));
+    q.note_milestone_header(6, h6, h5, one, None);
+    for height in 7..=12 {
+        q.note_milestone_header(height, [height as u8; 32], [0x99; 32], one, None);
+    }
+    assert_eq!(q.milestone_best_work_be(), Some(through_six));
+    q.drop_milestone_path_through(7);
+    assert_eq!(q.milestone_header_at(6), None);
+    assert_eq!(q.milestone_header_at(8), Some([8; 32]));
+    q.note_milestone_header(5, [0x15; 32], [0; 32], one, None);
+    assert_eq!(
+        q.milestone_header_at(6),
+        None,
+        "reopening the dropped prefix leaves the work tip a hole"
+    );
+    assert_eq!(q.milestone_header_at(7), None);
+    assert_eq!(q.milestone_header_at(5), Some([0x15; 32]));
+    assert_eq!(q.milestone_header_at(8), Some([8; 32]));
+    assert_eq!(q.milestone_best_work_be(), Some(through_six));
+    q.note_milestone_header(7, [0x17; 32], h6, one, None);
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(through_seven),
+        "a header that links to the dropped tip still adds its work"
+    );
+    q.note_milestone_header(7, [0x27; 32], [0x99; 32], one, None);
+    assert_eq!(q.milestone_best_work_be(), Some(through_seven));
+    let _ = dir;
+}
+
+#[test]
+fn a_load_pack_drops_milestone_hashes_the_store_tip_passed() {
+    let (dir, q) = temp_query("ms-load-pack");
+    let (mut h0, _) = coinbase_block(0, Fk::NULL, None);
+    h0.hash = rbitcoin_store::block_header_hash(
+        h0.version,
+        &[0u8; 32],
+        &h0.merkle_root,
+        h0.timestamp,
+        h0.bits,
+        h0.nonce,
+    );
+    let hfk = q.put_header(&h0).unwrap();
+    q.store()
+        .confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), hfk)
+        .unwrap();
+    q.store().rebuild_height_fence().unwrap();
+    assert_eq!(q.tip_height(), Some(Height(0)));
+    let mut one_be = [0u8; 32];
+    one_be[31] = 1;
+    let one = bitcoin::Work::from_be_bytes(one_be);
+    q.note_milestone_header(0, [0x11; 32], [0; 32], one, None);
+    q.note_milestone_header(1, [0x22; 32], [0x11; 32], one, None);
+    q.on_load_pack().unwrap();
+    assert_eq!(q.milestone_header_at(0), None);
+    assert_eq!(q.milestone_header_at(1), Some([0x22; 32]));
+    assert!(q.has_milestone_path());
     let _ = dir;
 }
 

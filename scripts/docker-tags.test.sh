@@ -79,6 +79,21 @@ expect "missing v is refused" FAILED "$(tags_for "$r" 0.9.0)"
 expect "prerelease is refused" FAILED "$(tags_for "$r" v1.0.0-rc1)"
 expect "empty is refused" FAILED "$(tags_for "$r" '')"
 
+# Nightly: the dated tag first (it is the image version label), then the
+# moving one. No ship tags are read.
+nightly_for() {
+  local out
+  if out="$(bash "$TAGS" --nightly "$@" 2>/dev/null)"; then
+    printf '%s\n' "$out" | paste -sd ' ' -
+  else
+    echo FAILED
+  fi
+}
+expect "nightly is dated then moving" "nightly-20261112 nightly" "$(nightly_for 20261112)"
+expect "nightly date must be YYYYMMDD" FAILED "$(nightly_for 2026-11-12)"
+expect "nightly needs a date" FAILED "$(nightly_for)"
+expect "nightly takes no ship tag" FAILED "$(nightly_for 20261112 v0.9.0)"
+
 echo
 echo "passed=$PASS failed=$FAIL"
 test "$FAIL" -eq 0

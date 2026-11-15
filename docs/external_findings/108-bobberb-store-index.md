@@ -11,4 +11,4 @@ reproduction steps.
 | G3 | high | A loc stride allocates before the published-end check | fixed | `body_read_above_the_cap_is_refused`, `index_read_above_the_cap_is_refused` ([104](./104-body-read-cap.md)) |
 | G4 | high | Scripthash page walk has no cycle stop | fixed | `scripthash_page_cycle_is_corrupt`, `scripthash_page_free_cycle_is_corrupt`, `scripthash_page_free_revisit_is_corrupt` ([105](./105-scripthash-page-cycle.md)) |
 | G5 | medium | No checksum on historical bodies | accepted | Documented. Bit-rot outside the tip window is a reindex ([106](./106-historical-bitrot.md)) |
-| G6 | medium | Torn `spent.body` page below `spend_durable` | accepted | Documented. Replay does not heal a zeroed slot ([107](./107-torn-spend-page.md)) |
+| G6 | medium | Torn `spent.body` page below `spend_durable` | fixed | The page log serves the slot while `spend.pages.commit` exists ([107](./107-torn-spend-page.md), `historical_page_stays_unwritten_until_spend_checkpoint`) |

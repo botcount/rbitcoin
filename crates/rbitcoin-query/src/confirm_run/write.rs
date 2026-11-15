@@ -71,6 +71,13 @@ pub fn hold_spindle(query: &Query) -> SpindleScope<'_> {
     scope
 }
 
+/// `Some` returns that batch. `None` is empty.
+pub fn take_queued_batch(
+    queued: &mut Option<Vec<([u8; 32], rbitcoin_primitives::Fk)>>,
+) -> Vec<([u8; 32], rbitcoin_primitives::Fk)> {
+    queued.take().unwrap_or_default()
+}
+
 #[doc(hidden)]
 pub fn submit_queued<'a>(
     query: &'a Query,
@@ -133,6 +140,23 @@ pub fn finish_already_committed_write(
         .iter()
         .map(|p| (p.height.0, p.hash))
         .collect();
+    if query.prune_seqsigwit() {
+        let mut wrote = false;
+        for p in &batch.prepared {
+            if !query
+                .pruned_spill_covers(p.header_fk)
+                .map_err(ConfirmError::from)?
+            {
+                query
+                    .note_seqsigwit_ram_for_confirmed(p.height, &p.tx_fks)
+                    .map_err(ConfirmError::from)?;
+                wrote = true;
+            }
+        }
+        if wrote {
+            query.sync_spill_dir().map_err(ConfirmError::from)?;
+        }
+    }
     finish_post_commit_hashes(query, &items)?;
     if let Some(h) = items.iter().map(|(h, _)| *h).max() {
         query.prune_write_create_loc(h);
@@ -344,13 +368,13 @@ fn write_phase_inner(
     let early_drain = if query.store().datadir_hdd() {
         None
     } else {
-        Some(submit_queued(query, queued.take().unwrap()))
+        Some(submit_queued(query, take_queued_batch(&mut queued)))
     };
 
     let overlap = (|| -> Result<_, ConfirmError> {
         // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
         let t_struct = Instant::now();
-        let (struct_ph, slots) = WRITE_REUSE.with(|reuse| {
+        let (struct_ph, mut slots) = WRITE_REUSE.with(|reuse| {
             structural_run(
                 query,
                 params,
@@ -364,6 +388,12 @@ fn write_phase_inner(
             )
         })?;
         let structural_ns = t_struct.elapsed().as_nanos() as u64;
+        push_same_block_spends_of_archived_bodies(
+            query,
+            &batch.prepared,
+            &class_a_wave,
+            &mut slots,
+        )?;
 
         let n_blocks = batch.prepared.len();
         let pending_token = batch
@@ -406,13 +436,17 @@ fn write_phase_inner(
 
         let seal = std::mem::take(&mut batch.index_seal);
         let idx_put_ns = super::index::seal_live_indexes(query, seal)?;
+        // The tip is already published. Prune only once the rows just sealed
+        // cover the height that prune would drop.
+        query.prune_seqsigwit_after_tweak_seal()?;
         if idx_put_ns > 0 {
             crate::note_confirm(&query.confirm_stats().idx_put_ns, idx_put_ns);
             crate::note_confirm(&query.confirm_stats().blockfilter_ns, idx_put_ns);
         }
 
         let spend_ann_ns = {
-            let _gate = hold_spindle(query);
+            // Historical slots are a directory insert. The tail page is one
+            // append, not a random sweep, so this does not take the spindle.
             spindle_mark("ann-begin");
             let ns = post_commit(query, &slots)?;
             spindle_mark("ann-end");
@@ -437,7 +471,7 @@ fn write_phase_inner(
     let drain = if let Some(drain) = early_drain {
         drain
     } else {
-        submit_queued(query, queued.take().unwrap_or_default())
+        submit_queued(query, take_queued_batch(&mut queued))
     };
     spindle_mark("join");
     let t_join = Instant::now();
@@ -446,8 +480,14 @@ fn write_phase_inner(
     if drain_join_ns > 0 {
         crate::note_confirm(&query.confirm_stats().write_drain_join_ns, drain_join_ns);
     }
-    if drain_res.is_err() {
-        query.store().txs.head_note_pending(&restore);
+    // The insert ran whether or not the checks below reject: a reject after
+    // the Class A append leaves these keys in `tx.head`, and an archived
+    // retry of the same blocks queues none. Note the drain on every joined
+    // insert, or the drain stays behind the fence until a fresh write.
+    match (&drain_res, drain_max_fk) {
+        (Ok(_), Some(fk)) => query.note_head_drain_fk(fk),
+        (Ok(_), None) => {}
+        (Err(_), _) => query.store().txs.head_note_pending(&restore),
     }
     let (out, n_blocks, structural_ns, struct_ph, class_c_ns, spend_ann_ns) = match overlap {
         Ok(v) => v,
@@ -460,9 +500,6 @@ fn write_phase_inner(
         }
     };
     drain_res.map_err(ConfirmError::from)?;
-    if let Some(fk) = drain_max_fk {
-        query.note_head_drain_fk(fk);
-    }
 
     // No tip GC of sparse pins (dropped with ScriptOkBatch).
     if let Some(h) = batch.prepared.iter().map(|p| p.height.0).max() {
@@ -528,14 +565,17 @@ pub fn finish_post_commit_hashes(
     }
     let drain_max_fk = queued.iter().filter_map(|(_, fk)| fk.get()).max();
     let mut queued = Some(queued);
-    let early_drain = if query.store().datadir_hdd() || queued.as_ref().unwrap().is_empty() {
+    let queued_empty = match queued.as_ref() {
+        Some(batch) => batch.is_empty(),
+        None => true,
+    };
+    let early_drain = if query.store().datadir_hdd() || queued_empty {
         None
     } else {
-        Some(submit_queued(query, queued.take().unwrap()))
+        Some(submit_queued(query, take_queued_batch(&mut queued)))
     };
 
     let annotate_res = {
-        let _gate = hold_spindle(query);
         spindle_mark("ann-begin");
         let res = (|| -> Result<(), ConfirmError> {
             if !query.spend_index_enabled() {
@@ -555,7 +595,7 @@ pub fn finish_post_commit_hashes(
     let drain = if let Some(drain) = early_drain {
         Some(drain)
     } else {
-        let batch = queued.take().unwrap_or_default();
+        let batch = take_queued_batch(&mut queued);
         if batch.is_empty() {
             None
         } else {
@@ -603,7 +643,9 @@ pub fn replay_spend_annotations(query: &Query) -> Result<u32, ConfirmError> {
         .store()
         .spend_annotated_through()
         .map_err(ConfirmError::from)?;
-    if annotated.is_some_and(|h| h > tip) {
+    // The page-log commit can name a higher height than the marker, and its
+    // freeze tip can sit above both. Hold before replay folds that image.
+    if annotated.is_some_and(|h| h > tip) || query.store().spend_log_above(tip) {
         query
             .store()
             .clamp_spend_durable()
@@ -639,9 +681,30 @@ pub fn publish_spend_marker(query: &Query, tip: u32) -> Result<(), ConfirmError>
 #[doc(hidden)]
 pub fn rewrite_spend_heights(query: &Query, annotated: u32, tip: u32) -> Result<u32, ConfirmError> {
     rbitcoin_log::info!("store: replay spend annotations ({annotated}, {tip}]");
-    let replayed = annotate_spend_heights(query, annotated + 1, tip)?;
+    let replayed = annotate_spend_heights_with(query, annotated + 1, tip, |height| {
+        checkpoint_replay_chunk(query, height)
+    })?;
     publish_spend_marker(query, tip)?;
     Ok(replayed)
+}
+
+/// Publish and fold when the open directory is already at the edge cap.
+///
+/// Startup replay runs before the sync thread exists, so nothing else drains
+/// these notes. The marker moves to this chunk. A crash resumes above it.
+/// The following checkpoint folds the generation this one published. This
+/// does not wait. Pending recovery uses [`annotate_spend_heights`] and does
+/// not take this path: that publish can sit above the capped marker.
+fn checkpoint_replay_chunk(query: &Query, height: u32) -> Result<(), ConfirmError> {
+    if !query.store().spend_checkpoint_early() {
+        return Ok(());
+    }
+    query
+        .store()
+        .checkpoint_spend_through(height)
+        .map_err(ConfirmError::from)?;
+    query.store().relax_spend_pace();
+    Ok(())
 }
 
 /// Finish the spend annotate a failed confirm write left after its tip commit.
@@ -671,6 +734,15 @@ pub fn annotate_pending_spends(query: &Query) -> Result<(), ConfirmError> {
 
 #[doc(hidden)]
 pub fn annotate_spend_heights(query: &Query, start: u32, tip: u32) -> Result<u32, ConfirmError> {
+    annotate_spend_heights_with(query, start, tip, |_| Ok(()))
+}
+
+fn annotate_spend_heights_with(
+    query: &Query,
+    start: u32,
+    tip: u32,
+    mut after_chunk: impl FnMut(u32) -> Result<(), ConfirmError>,
+) -> Result<u32, ConfirmError> {
     let heights: Vec<u32> = (start..=tip).collect();
     let replayed = heights.len() as u32;
     let started = std::time::Instant::now();
@@ -690,11 +762,14 @@ pub fn annotate_spend_heights(query: &Query, start: u32, tip: u32) -> Result<u32
             items.push((h, rec.hash));
         }
         finish_post_commit_hashes(query, &items)?;
+        let height = *chunk.last().unwrap_or(&tip);
+        after_chunk(height)?;
         done = done.saturating_add(chunk.len() as u32);
         let elapsed = logged_at.elapsed().as_millis() as u64;
         if elapsed >= REPLAY_STATUS_MS {
-            let h = *chunk.last().unwrap_or(&tip);
-            rbitcoin_log::info!("store: replay spend annotations {done}/{replayed} height={h}");
+            rbitcoin_log::info!(
+                "store: replay spend annotations {done}/{replayed} height={height}"
+            );
             logged_at = std::time::Instant::now();
         }
     }
@@ -724,12 +799,16 @@ pub fn annotate_slots_from_connected_hash(
         return Ok(());
     };
     for (tx_i, &spend_fk) in tx_fks.iter().enumerate() {
-        let (_meta, ins, _outs) = query
+        // Parent edges live in `input`. Script and witness may be pruned.
+        let edges = query
             .store()
-            .get_tx_full(spend_fk)
-            .map_err(ConfirmError::from)?;
+            .input_edges(spend_fk)
+            .map_err(ConfirmError::from)?
+            .ok_or(ConfirmError::Store(StoreError::Corrupt(
+                "invariant: spend replay missing input edges",
+            )))?;
         if tx_i == 0 {
-            let coinbase = ins.len() == 1 && ins[0].is_coinbase();
+            let coinbase = edges.len() == 1 && edges[0].parent.is_null();
             if !coinbase {
                 return Err(ConfirmError::Store(StoreError::Corrupt(
                     "invariant: coinbase input edge",
@@ -737,12 +816,14 @@ pub fn annotate_slots_from_connected_hash(
             }
             continue;
         }
-        for (inp_i, inp) in ins.into_iter().enumerate() {
-            let rbitcoin_store::InputParent::Prevout { create_fk, vout } = inp.parent else {
+        for (inp_i, edge) in edges.iter().enumerate() {
+            if edge.parent.is_null() {
                 return Err(ConfirmError::Store(StoreError::Corrupt(
                     "invariant: non-coinbase input edge",
                 )));
-            };
+            }
+            let create_fk = edge.parent;
+            let vout = edge.vout;
             let (off, len) = query
                 .store()
                 .tx_spent_range(create_fk)
@@ -774,9 +855,99 @@ pub fn annotate_slots_from_connected_hash(
     Ok(())
 }
 
+/// Annotate slots for the same-block spends of each block whose body this
+/// wave did not append.
+///
+/// Structural has no job for a parent earlier in the same block. Class A
+/// pre-fills that slot only when it appends the body, and a checkpoint after
+/// a disconnect may have zeroed that pre-fill. A block connected again from
+/// the archive writes it here, as open replay does from `input_edges`.
+fn push_same_block_spends_of_archived_bodies(
+    query: &Query,
+    prepared: &[Prepared],
+    class_a_wave: &crate::block_pipeline::ClassAWave,
+    slots: &mut crate::block_pipeline::AnnotateSlots,
+) -> Result<(), ConfirmError> {
+    if !query.spend_index_enabled() {
+        return Ok(());
+    }
+    let mut edges = Vec::new();
+    for p in prepared {
+        // Class A appends a body whole, and a trimmed plan leaves the wave
+        // empty, so the coinbase stands for the block.
+        let body_appended = p
+            .tx_fks
+            .first()
+            .is_some_and(|&fk| class_a_wave.contains(fk));
+        if body_appended {
+            continue;
+        }
+        if !p
+            .spends
+            .iter()
+            .any(|&(_, _, _, create_fk, _)| create_fk.is_null())
+        {
+            continue;
+        }
+        let tx_at: crate::TxidMap<usize> =
+            p.txids.iter().enumerate().map(|(i, t)| (*t, i)).collect();
+        for &(parent_txid, vout, spend_fk, create_fk, vin) in &p.spends {
+            if !create_fk.is_null() {
+                continue;
+            }
+            let parent = tx_at
+                .get(&parent_txid)
+                .and_then(|&i| p.tx_fks.get(i))
+                .copied()
+                .ok_or(ConfirmError::Store(StoreError::Corrupt(
+                    "invariant: same-block spend parent not in its block",
+                )))?;
+            edges.push((parent, vout, spend_fk, vin));
+        }
+    }
+    if edges.is_empty() {
+        return Ok(());
+    }
+    let t_meta = Instant::now();
+    let parents: Vec<rbitcoin_primitives::Fk> = edges.iter().map(|e| e.0).collect();
+    let ranges = query
+        .store()
+        .tx_spent_range_batch(&parents)
+        .map_err(ConfirmError::from)?;
+    let mut offs = Vec::with_capacity(edges.len());
+    for (&(_, vout, _, _), range) in edges.iter().zip(ranges) {
+        let (off, len) = range.ok_or(ConfirmError::Store(StoreError::Corrupt(
+            "invariant: same-block spend parent without spent range",
+        )))?;
+        let abs = rbitcoin_store::spent_abs(off, vout);
+        if abs.saturating_add(rbitcoin_store::OutputRecord::SPENT_SLOT_LEN as u64)
+            > off.saturating_add(len)
+        {
+            return Err(ConfirmError::Store(StoreError::Corrupt(
+                "invariant: same-block spent slot OOB",
+            )));
+        }
+        offs.push(abs);
+    }
+    let metas = query
+        .store()
+        .get_spender_meta_at_abs_batch(&offs)
+        .map_err(ConfirmError::from)?;
+    let meta_ns = t_meta.elapsed().as_nanos() as u64;
+    crate::note_confirm(&query.confirm_stats().spend_meta_ns, meta_ns);
+    crate::note_confirm(&query.confirm_stats().spend_meta_n, offs.len() as u64);
+    for (((parent, vout, spend_fk, vin), abs), meta) in edges.into_iter().zip(offs).zip(metas) {
+        let known = meta.ok_or(ConfirmError::Store(StoreError::Corrupt(
+            "invariant: same-block spent slot short, undecodable, or past the published body",
+        )))?;
+        slots.push((abs, parent, vout, spend_fk, vin), known);
+    }
+    Ok(())
+}
+
 /// After Class A commit, stamp spend creates from append RAM loc
 /// (this pack + just-written packs still in the write loc window).
-/// Write never preads `create.loc`.
+/// This fill never preads `create.loc`.
 pub fn fill_planned_create_layout_after_commit(
     query: &Query,
     batch_parents: &mut crate::BatchParents,

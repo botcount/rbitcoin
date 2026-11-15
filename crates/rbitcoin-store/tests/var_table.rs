@@ -44,10 +44,7 @@ fn read_at(t: &VarTable, off: u64, len: u64) -> Vec<u8> {
 
 #[test]
 fn body_read_past_published_end_is_corrupt() {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let id = N.fetch_add(1, AtomicOrdering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("rbitcoin-var-pub-{id}"));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = rbitcoin_store::testutil::fresh_path("var-pub-end");
     std::fs::create_dir_all(&dir).unwrap();
     let t = VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
     let err = t
@@ -189,10 +186,7 @@ fn put_batch_publish_visible_to_concurrent_readers() {
     let _stress = rbitcoin_store::file::TEST_MMAP_STRESS_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    static N: AtomicU64 = AtomicU64::new(0);
-    let id = N.fetch_add(1, AtomicOrdering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("rbitcoin-var-pub-{id}"));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = rbitcoin_store::testutil::fresh_path("var-pub-readers");
     std::fs::create_dir_all(&dir).unwrap();
     let t = Arc::new(VarTable::create(&dir, "tx", TableKind::TxOut).unwrap());
 

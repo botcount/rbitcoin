@@ -60,6 +60,59 @@ fn timestamp_epoch() {
 }
 
 #[test]
+fn debug_log_file_holds_the_line_when_log_at_returns() {
+    let _g = lock_log_init();
+    let path =
+        std::env::temp_dir().join(format!("rbtc-debug-log-{}-{}", std::process::id(), "holds"));
+    let _ = std::fs::remove_file(&path);
+    reset_debug_log();
+    std::env::set_var("RBITCOIN_DEBUG_LOG", &path);
+    init(Level::Info);
+    log_at(Level::Info, format_args!("ping timeout marker {}", 1201));
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    reset_debug_log();
+    std::env::remove_var("RBITCOIN_DEBUG_LOG");
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        text.contains("ping timeout marker 1201"),
+        "debug log file missing the line: {text:?}"
+    );
+}
+
+#[test]
+fn debug_log_open_failure_stays_off_until_reset() {
+    let _g = lock_log_init();
+    let missing = std::env::temp_dir().join(format!(
+        "rbtc-debug-missing-{}-no-such-dir/debug.log",
+        std::process::id()
+    ));
+    let good =
+        std::env::temp_dir().join(format!("rbtc-debug-log-{}-{}", std::process::id(), "retry"));
+    let _ = std::fs::remove_file(&good);
+    reset_debug_log();
+    std::env::set_var("RBITCOIN_DEBUG_LOG", &missing);
+    init(Level::Info);
+    log_at(Level::Info, format_args!("open failed"));
+    std::env::set_var("RBITCOIN_DEBUG_LOG", &good);
+    log_at(Level::Info, format_args!("must stay off"));
+    let before_reset = std::fs::read_to_string(&good).unwrap_or_default();
+    reset_debug_log();
+    log_at(Level::Info, format_args!("after reset"));
+    let after_reset = std::fs::read_to_string(&good).unwrap_or_default();
+    reset_debug_log();
+    std::env::remove_var("RBITCOIN_DEBUG_LOG");
+    let _ = std::fs::remove_file(&good);
+    assert!(
+        !before_reset.contains("must stay off"),
+        "failed open retried on the next line: {before_reset:?}"
+    );
+    assert!(
+        after_reset.contains("after reset"),
+        "reset did not open the new path: {after_reset:?}"
+    );
+}
+
+#[test]
 fn log_at_respects_level() {
     let _g = lock_log_init();
     init(Level::Error);

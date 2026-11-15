@@ -802,6 +802,13 @@ pub fn connected_to_self_log(addr: impl std::fmt::Display) -> String {
     format!("p2p: connected to self at {addr}, disconnecting")
 }
 
+pub fn log_connected_to_self(addr: impl std::fmt::Display) {
+    rbitcoin_log::info_repeated(
+        rbitcoin_log::RepeatedInfo::ConnectedToSelf,
+        format_args!("{}", connected_to_self_log(addr)),
+    );
+}
+
 pub fn version_handshake_timeout_log(peer: u64) -> String {
     format!("p2p: version handshake timeout, disconnecting peer={peer}")
 }
@@ -947,7 +954,8 @@ pub fn queue_addr_list(
                 crate::NetAddr::Ip(s) => Some((t, Address::new(&s, services))),
                 crate::NetAddr::Onion { .. }
                 | crate::NetAddr::I2p { .. }
-                | crate::NetAddr::Cjdns { .. } => None,
+                | crate::NetAddr::Cjdns { .. }
+                | crate::NetAddr::Name { .. } => None,
             })
             .collect();
         queue_accounted(session, out, NetworkMessage::Addr(list))
@@ -1183,6 +1191,12 @@ pub async fn connect_and_handshake(
 /// Core VERSION/VERACK bound: 60s from TCP connect/accept. Timeout drops the stream.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Inbound handshake bound. `--peer-timeout` can shorten it. It cannot
+/// lengthen it past [`HANDSHAKE_TIMEOUT`].
+pub fn inbound_handshake_limit(peer_timeout_secs: u64) -> Duration {
+    Duration::from_secs(peer_timeout_secs).min(HANDSHAKE_TIMEOUT)
+}
+
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 pub async fn inbound_connect_and_handshake(
     stream: TcpStream,
@@ -1212,37 +1226,36 @@ pub async fn inbound_connect_and_handshake(
         peers.register_connecting(their_addr, bind, true, crate::peers::PeerConnType::Inbound);
     let wire = sess.new_wire();
     sess.attach_tcp_shutdown(tcp_pre);
-    let perms = peers.permission_flags(their_addr, true, bind);
-    let (mut reader, mut writer, wire, tcp_shutdown) =
-        match open_inbound_with_wire(stream, magic, wire, perms).await {
-            Ok(x) => x,
-            Err(NetError::Protocol("magic-prefixed ellswift")) => {
-                while !sess.stop.load(std::sync::atomic::Ordering::SeqCst) {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+    // One deadline from accept through key exchange and VERSION/VERACK.
+    // A per-read deadline would reset on each drip byte.
+    let limit = inbound_handshake_limit(peers.peer_timeout_secs());
+    let opened = tokio::time::timeout(limit, async {
+        let perms = peers.permission_flags(their_addr, true, bind);
+        let (mut reader, mut writer, wire, tcp_shutdown) =
+            match open_inbound_with_wire(stream, magic, wire, perms).await {
+                Ok(x) => x,
+                Err(NetError::Protocol("magic-prefixed ellswift")) => {
+                    while !sess.stop.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    return Err(NetError::Timeout);
                 }
-                return Err(NetError::Timeout);
-            }
-            Err(e) => {
-                let _ = peers.disconnect_id(sess.id);
-                return Err(e);
-            }
+                Err(e) => return Err(e),
+            };
+        match &reader {
+            PeerReader::V1(_) => sess.mark_v1_transport(),
+            PeerReader::V2(_) => sess.mark_v2_transport_ready(),
+        }
+        if let Ok(clone) = tcp_shutdown.try_clone() {
+            sess.attach_tcp_shutdown(clone);
+        }
+        let policy = HandshakePolicy {
+            hub: None,
+            peers: Some(peers),
+            session: Some(sess.as_ref()),
+            conn_type: crate::peers::PeerConnType::Inbound,
         };
-    match reader {
-        PeerReader::V1(_) => sess.mark_v1_transport(),
-        PeerReader::V2(_) => sess.mark_v2_transport_ready(),
-    }
-    if let Ok(clone) = tcp_shutdown.try_clone() {
-        sess.attach_tcp_shutdown(clone);
-    }
-    let policy = HandshakePolicy {
-        hub: None,
-        peers: Some(peers),
-        session: Some(sess.as_ref()),
-        conn_type: crate::peers::PeerConnType::Inbound,
-    };
-    let their_version = match tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        application_handshake(
+        let their_version = application_handshake(
             &mut reader,
             &mut writer,
             magic,
@@ -1252,17 +1265,23 @@ pub async fn inbound_connect_and_handshake(
             true,
             user_agent,
             policy,
-        ),
-    )
-    .await
-    {
-        Ok(Ok(v)) => v,
+        )
+        .await?;
+        Ok((their_version, reader, writer, wire, tcp_shutdown))
+    })
+    .await;
+    let (their_version, reader, writer, wire, tcp_shutdown) = match opened {
+        Ok(Ok(opened)) => opened,
         Ok(Err(e)) => {
             let _ = peers.disconnect_id(sess.id);
             return Err(e);
         }
         Err(_) => {
-            rbitcoin_log::debug!("{}", version_handshake_timeout_log(sess.id));
+            if sess.v2_transport_ready() {
+                rbitcoin_log::debug!("{}", crate::v2::v2_handshake_timeout_log(sess.id));
+            } else {
+                rbitcoin_log::debug!("{}", version_handshake_timeout_log(sess.id));
+            }
             let _ = peers.disconnect_id(sess.id);
             return Err(NetError::Timeout);
         }
@@ -1529,7 +1548,7 @@ pub async fn application_handshake<R: FrameRead, W: FrameWrite>(
     if inbound {
         if let Some(peers) = policy.peers {
             if !peers.check_incoming_nonce(their_version.nonce) {
-                rbitcoin_log::info!("{}", connected_to_self_log(their_addr));
+                log_connected_to_self(their_addr);
                 return Err(NetError::Protocol("connected to self"));
             }
         }
@@ -1686,13 +1705,14 @@ pub fn rand_nonce() -> u64 {
 /// A dedicated writer drains outbound messages while the reader keeps draining
 /// the encrypted channel. `meta` labels the peer for logs and optionally tracks
 /// live outbound follow count.
-/// Control (ping/pong/`sendcmpct`) first, then full bodies, then headers/inv.
+/// Ping and `sendcmpct` first, then bodies, then headers and inv.
+/// A pong is last in the batch. It must not pass a reply already queued
+/// for an earlier message from this peer.
 #[doc(hidden)]
 pub fn outbound_write_rank(out: &PeerOut) -> u8 {
     match out {
-        PeerOut::Msg(
-            NetworkMessage::Ping(_) | NetworkMessage::Pong(_) | NetworkMessage::SendCmpct(_),
-        ) => 0,
+        PeerOut::Msg(NetworkMessage::Ping(_) | NetworkMessage::SendCmpct(_)) => 0,
+        PeerOut::Msg(NetworkMessage::Pong(_)) => 3,
         PeerOut::Encoded(_)
         | PeerOut::Served(_)
         | PeerOut::Msg(NetworkMessage::Block(_))
@@ -1719,15 +1739,37 @@ pub fn take_outbound_write_batch(
     batch
 }
 
+/// Queue one pong when a nonce newer than `written` is stored.
+///
+/// The message goes on the session channel, behind a reply already waiting.
+/// It is not written inside the batch that just finished.
+#[doc(hidden)]
+pub fn requeue_later_pong(session: &crate::peers::LivePeer, written: u64) {
+    let Some(extra) = session.finish_pong_write(written) else {
+        return;
+    };
+    if !session.queue_msg(NetworkMessage::Pong(extra)) {
+        // The claim inside `finish_pong_write` would otherwise stick with
+        // no message on the channel, and the next ping would not queue.
+        let _ = session.finish_pong_write(extra);
+    }
+}
+
 pub async fn run_writer_task(
     mut writer: PeerWriter,
     mut out_rx: mpsc::UnboundedReceiver<PeerOut>,
     writer_session: Option<Arc<crate::peers::LivePeer>>,
 ) {
     while let Some(first) = out_rx.recv().await {
+        // Write the nonce that was queued. A newer ping is queued again
+        // after this write, so it stays behind replies still on the channel.
         for out in take_outbound_write_batch(first, &mut out_rx) {
             let n = crate::peers::outbound_queued_bytes(&out);
             let serve_slot = out.holds_serve_slot();
+            let pong_written = match &out {
+                PeerOut::Msg(NetworkMessage::Pong(queued)) => Some(*queued),
+                _ => None,
+            };
             let err = match out {
                 PeerOut::Msg(msg) | PeerOut::Served(msg) => {
                     writer.write_msg_offload(msg).await.is_err()
@@ -1739,6 +1781,9 @@ pub async fn run_writer_task(
             }
             if err {
                 return;
+            }
+            if let (Some(s), Some(written)) = (&writer_session, pong_written) {
+                requeue_later_pong(s, written);
             }
         }
     }
@@ -2400,7 +2445,7 @@ pub async fn peer_session_with(
                 }
                 // Inbound before local tip announce so GetData during a
                 // generate burst is not queued behind hundreds of cmpctblocks.
-                frame = reader.read_frame_with_progress(magic, |_| {}, |n| {
+                frame = reader.read_frame_with_progress(magic, |_, _| {}, |n| {
                     let mut score = decoy_score.load(Ordering::Relaxed);
                     let keep = crate::peer_dos::decoy_stays(
                         &mut rate,
@@ -2552,9 +2597,10 @@ pub async fn peer_session_with(
                         // Close to free this session's asks. A second strike refuses the address.
                         return Err(rate_limit_disconnect(session.as_deref()));
                     }
-                    // Ping/pong stays on this task when nothing is queued. A
-                    // frame already in `decode_q` must be applied first, or a
-                    // later pong updates the clock ahead of an earlier block.
+                    // A ping or pong already in `decode_q` is applied with those
+                    // frames. A later pong must not move the clock ahead of an
+                    // earlier block. `on_ping` holds its pong while a getdata
+                    // or getblocktxn tail is still unsent.
                     if (frame.is_ping() || frame.is_pong()) && !decode_q.is_empty() {
                         let n = frame.payload_len();
                         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2574,12 +2620,6 @@ pub async fn peer_session_with(
                             },
                         )
                         .await?;
-                        continue;
-                    }
-                    if frame.is_ping() {
-                        if let Some(n) = frame.ping_nonce() {
-                            queue_out(&out_tx, NetworkMessage::Pong(n))?;
-                        }
                         continue;
                     }
                     if frame.is_pong() {
@@ -3251,14 +3291,17 @@ pub fn log_cmpct_filled(
     fetched: &[u64],
     fill: Option<&crate::compact::CmpctFillSets>,
 ) {
-    let stats = crate::compact::reconstruct_stats(
+    let wtxids = crate::compact::block_wtxids(block);
+    let stats = crate::compact::reconstruct_stats_from_wtxids(
         hsi,
         block,
         fill.unwrap_or(&crate::compact::CmpctFillSets::default()),
         fetched,
+        &wtxids,
     );
     rbitcoin_log::info!("{stats}");
-    if let Some(indexes) = crate::compact::outbound_prefill_indexes(block, fill) {
+    if let Some(fill) = fill {
+        let indexes = crate::compact::prefill_indexes_from_wtxids(block, fill, &wtxids);
         hub.remember_cmpct_prefill(block.block_hash(), block.header.prev_blockhash, indexes);
     }
 }
@@ -3506,12 +3549,12 @@ pub fn queue_due_tx_invs(
 #[doc(hidden)]
 #[allow(clippy::result_unit_err)] // a short blocktxn is (); the caller scores the peer
 pub fn apply_cmpct_blocktxn(
-    pc: &PendingCmpct,
+    pc: &mut PendingCmpct,
     bt: &BlockTransactions,
 ) -> Result<(Block, Option<crate::compact::CmpctFillSets>), ()> {
-    crate::compact::apply_block_transactions(&pc.hsi, &pc.partial, bt)
-        .map(|block| (block, pc.fill.clone()))
-        .map_err(|_| ())
+    let block =
+        crate::compact::apply_block_transactions(&pc.hsi, &mut pc.partial, bt).map_err(|_| ())?;
+    Ok((block, pc.fill.take()))
 }
 
 #[doc(hidden)]
@@ -3535,6 +3578,10 @@ pub struct PeerFollowState {
     /// One parked `getblocktxn`. The session reads no frame while this is
     /// non-empty, so a peer that never reads cannot stack reconstructs.
     pub getblocktxn_tail: VecDeque<BlockTransactionsRequest>,
+    /// Ping nonce held until both serve tails are empty. Queuing the pong
+    /// earlier lets it leave before the rest of that reply. A later ping
+    /// replaces this nonce.
+    pub parked_pong: Option<u64>,
 }
 
 /// A live session's follow state. Dropping it, including when
@@ -3581,6 +3628,7 @@ impl PeerFollowState {
             ban_score: 0,
             getdata_tail: VecDeque::new(),
             getblocktxn_tail: VecDeque::new(),
+            parked_pong: None,
         }
     }
 }
@@ -3898,12 +3946,30 @@ pub fn handle_peer_control_msg(
         NetworkMessage::Version(_) => on_redundant_version(session),
         NetworkMessage::Verack => on_redundant_verack(session),
         NetworkMessage::Ping(n) => on_ping(hub, out_tx, follow, session, *n)?,
+        // Extra bytes after the nonce decode as Unknown. The pong still
+        // uses the first eight, the same as a ping with an exact payload.
+        NetworkMessage::Unknown { command, payload }
+            if command.as_ref() == "ping" && payload.len() >= 8 =>
+        {
+            let mut nonce = [0u8; 8];
+            nonce.copy_from_slice(&payload[..8]);
+            on_ping(hub, out_tx, follow, session, u64::from_le_bytes(nonce))?;
+        }
         // A pong that waited behind `decode_q` is applied here. The read arm
-        // only handles a pong when that queue is empty.
+        // only handles a pong when that queue is empty. Extra bytes, or fewer
+        // than eight, decode as Unknown. The ping state still uses the raw
+        // payload, the same as that read arm.
         NetworkMessage::Pong(n) => {
             if let Some(s) = session {
                 let payload = n.to_le_bytes();
                 if let Some(line) = s.on_pong(&payload, s.clock_now()) {
+                    rbitcoin_log::info!("{line}");
+                }
+            }
+        }
+        NetworkMessage::Unknown { command, payload } if command.as_ref() == "pong" => {
+            if let Some(s) = session {
+                if let Some(line) = s.on_pong(payload, s.clock_now()) {
                     rbitcoin_log::info!("{line}");
                 }
             }
@@ -4002,6 +4068,9 @@ pub fn on_getcfilters(
         return Ok(());
     };
     for (h, body) in (m.start_height..).zip(filters) {
+        if session.is_some_and(|s| s.send_over_budget()) {
+            return Ok(());
+        }
         let Some((_, rec)) = filter_q(hub.query.header_at_height(rbitcoin_primitives::Height(h)))?
         else {
             return Ok(());
@@ -4073,13 +4142,11 @@ pub fn on_getcfcheckpt(
         return Ok(());
     }
     let mut filter_headers = Vec::new();
-    let mut h = 1000u32;
-    while h <= stop {
-        let Some(row) = filter_q(hub.query.basic_filter_hashes_and_headers(h, h))? else {
+    if stop >= 1000 {
+        let Some(headers) = filter_q(hub.query.basic_filter_checkpoint_headers(stop))? else {
             return Ok(());
         };
-        filter_headers.push(row[0].1);
-        h = h.saturating_add(1000);
+        filter_headers = headers;
     }
     queue_accounted(
         session,
@@ -4173,8 +4240,32 @@ pub fn on_ping(
         // sees it before sync_with_ping returns.
         let _ = maybe_queue_initial_getheaders(out_tx, hub, s);
     }
-    queue_out(out_tx, NetworkMessage::Pong(n))?;
+    if serve_tail_pending(follow) {
+        follow.parked_pong = Some(n);
+        return Ok(());
+    }
+    follow.parked_pong = None;
+    queue_pong(session, out_tx, n)?;
     Ok(())
+}
+
+fn serve_tail_pending(follow: &PeerFollowState) -> bool {
+    !follow.getdata_tail.is_empty() || !follow.getblocktxn_tail.is_empty()
+}
+
+/// Queue a pong parked by [`on_ping`] once both serve tails are empty.
+fn flush_parked_pong(
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+) -> Result<(), NetError> {
+    if serve_tail_pending(follow) {
+        return Ok(());
+    }
+    let Some(n) = follow.parked_pong.take() else {
+        return Ok(());
+    };
+    queue_pong(session, out_tx, n)
 }
 
 #[doc(hidden)]
@@ -4522,7 +4613,7 @@ pub async fn serve_getdata_tail(
                     "filtered block request received when NODE_BLOOM service disabled"
                 );
                 punish_disconnect(&mut follow.ban_score, session);
-                return Ok(());
+                return flush_parked_pong(out_tx, follow, session);
             }
             // Unknown hash: Core ProcessGetData answers notfound. Silence
             // holds the requester's getdata until the stall floor.
@@ -4551,7 +4642,7 @@ pub async fn serve_getdata_tail(
     if !notfound.is_empty() {
         queue_accounted(session, out_tx, NetworkMessage::NotFound(notfound))?;
     }
-    Ok(())
+    flush_parked_pong(out_tx, follow, session)
 }
 
 pub async fn serve_getdata_full_block(
@@ -4590,7 +4681,7 @@ pub enum CompactServe {
 }
 
 /// Reconstruct and, when the block is near the tip, build the compact
-/// announcement. Store reads and `from_block` stay off the session task.
+/// announcement. Store reads and short ids stay off the session task.
 #[doc(hidden)]
 pub fn compact_serve_outcome(
     cache: &BlockCache,
@@ -4610,15 +4701,16 @@ pub fn compact_serve_outcome(
     if block_h.is_some_and(|h| tip_h.saturating_sub(h) > MAX_CMPCTBLOCK_DEPTH) {
         return Ok(CompactServe::Full(block));
     }
-    match HeaderAndShortIds::from_block(&block, rand_nonce(), ver, &pref) {
-        Ok(hsi) => {
+    let ids = crate::compact::short_id_hashes(&block, ver);
+    match crate::compact::header_and_short_ids(&block, &ids, rand_nonce(), ver, &pref) {
+        Some(hsi) => {
             rbitcoin_log::info!(
                 "{}",
                 crate::compact::cmpct_send_line(block.block_hash(), block.txdata.len(), &hsi)
             );
             Ok(CompactServe::Cmpct(hsi))
         }
-        Err(_) => Ok(CompactServe::Full(block)),
+        None => Ok(CompactServe::Full(block)),
     }
 }
 
@@ -4807,7 +4899,7 @@ pub async fn serve_getblocktxn_tail(
         };
         serve_one_getblocktxn(hub, out_tx, follow, session, req).await?;
     }
-    Ok(())
+    flush_parked_pong(out_tx, follow, session)
 }
 
 pub async fn serve_one_getblocktxn(
@@ -4918,8 +5010,8 @@ pub fn on_inv(
             Inventory::Block(h) | Inventory::WitnessBlock(h) => {
                 if let Some(s) = session {
                     s.note_block_from_peer(*h);
-                    s.note_best_known(*h);
                 }
+                note_advanced_best_known(hub, &follow.pending_headers, session, *h);
                 if on_inv_block_needs_headers(hub, follow, session, h) {
                     need_headers = true;
                 }
@@ -5049,22 +5141,22 @@ pub fn on_inv_txid(
         return None;
     }
     let mp = hub.mempool()?;
-    let in_orphan = mp.try_orphan_missing(txid).is_some();
-    if mp.try_contains(txid) && !in_orphan {
-        if let Some(s) = session {
-            let _ = mp.add_orphan_announcer(txid, s.id);
-        }
-        if !asks_back_local_tx(mp, session, txid) {
-            return None;
-        }
+    // Core `AlreadyHaveTx` (without the reconsiderable set): a recent reject
+    // is not asked for again, from this peer or another. The child of a
+    // rejected parent is in the set by txid.
+    if mp.try_recent_reject_txid(txid) {
+        return None;
+    }
+    // Core `AlreadyHaveTx` does not ask the orphanage by txid: a parked
+    // witness may not be the one announced.
+    if mp.try_contains(txid) && !asks_back_local_tx(mp, session, txid) {
+        return None;
     }
     if let Some(s) = session {
         match mp.note_inv_tx_requested(s.id, txid.to_byte_array(), s.inbound, s.clock_now(), false)
         {
             crate::tx_relay::ParentNote::RequestNow => {}
-            crate::tx_relay::ParentNote::Deferred | crate::tx_relay::ParentNote::GlobalFull => {
-                return None;
-            }
+            crate::tx_relay::ParentNote::Deferred => return None,
             crate::tx_relay::ParentNote::PeerCapped => {
                 *parent_capped = true;
                 return None;
@@ -5095,6 +5187,9 @@ pub fn on_inv_wtxid(
         return None;
     }
     let mp = hub.mempool()?;
+    if mp.try_recent_reject(wtxid) {
+        return None;
+    }
     let ask_back = mp
         .try_txid_for_wtxid(wtxid)
         .is_some_and(|txid| asks_back_local_tx(mp, session, &txid));
@@ -5108,9 +5203,7 @@ pub fn on_inv_wtxid(
                 true,
             ) {
                 crate::tx_relay::ParentNote::RequestNow => {}
-                crate::tx_relay::ParentNote::Deferred | crate::tx_relay::ParentNote::GlobalFull => {
-                    return None;
-                }
+                crate::tx_relay::ParentNote::Deferred => return None,
                 crate::tx_relay::ParentNote::PeerCapped => {
                     *parent_capped = true;
                     return None;
@@ -5120,18 +5213,32 @@ pub fn on_inv_wtxid(
         return Some(Inventory::WTx(*wtxid));
     }
     let s = session?;
-    let _ = mp.add_orphan_announcer_wtxid(wtxid, s.id);
-    if let Some(tx) = mp.try_orphan_tx_wtxid(wtxid) {
-        let missing = mp.orphan_getdata_parents(&tx);
-        mp.schedule_orphan_parents(&missing, s.id, s.inbound, s.clock_now());
-    }
+    let tx = mp.try_orphan_tx_wtxid(wtxid)?;
+    note_parked_announcer(mp, s, &tx);
     None
+}
+
+/// Core `AddTxAnnouncement` for a parked orphan: `s` becomes an announcer
+/// and is asked for the missing parents. An orphan with no parent left to
+/// fetch, such as one whose txid is already pooled, takes no announcer.
+fn note_parked_announcer(
+    mp: &crate::tx_relay::MempoolHub,
+    s: &crate::peers::LivePeer,
+    parked: &Transaction,
+) {
+    let missing = mp.orphan_getdata_parents(parked);
+    if missing.is_empty() {
+        return;
+    }
+    let _ = mp.add_orphan_announcer(&parked.compute_wtxid(), s.id);
+    mp.schedule_orphan_parents(&missing, s.id, s.inbound, s.clock_now());
 }
 
 struct HeadersApply {
     from_peer: Vec<BlockHash>,
     best_known: Vec<BlockHash>,
     admits: Vec<(BlockHash, bitcoin::block::Header)>,
+    evicts: Vec<BlockHash>,
     misbehave: bool,
     /// `(announced height, our tip)` when the peer is a stale fork.
     disconnect: Option<(u32, u32)>,
@@ -5142,6 +5249,352 @@ struct HeadersApply {
     want_bodies: Vec<BlockHash>,
     /// Locator for one follow-up `getheaders`, if the batch still wants a page.
     getheaders: Option<Vec<BlockHash>>,
+    headers_len: usize,
+    /// Best-known header-chain work is under `-minimumchainwork`.
+    peer_below_floor: bool,
+    /// The last header was new, accepted, connected, and beats our tip work.
+    stamp_block_announcement: bool,
+    /// Empty or connecting: a reply to our getheaders. Core never counts an
+    /// unconnecting message, so its rate limit holds.
+    answers_getheaders: bool,
+}
+/// Drop pending headers until `slots` new headers fit under [`MAX_PENDING_HEADERS`].
+///
+/// `slots` is how many headers this call would newly store. A header that
+/// fails claimed proof of work goes first, then one whose path does not reach
+/// a stored header, then a connected fork with less work than `headers`, then
+/// one with the same work. Stop once those slots fit. Ancestors of `prev`
+/// stay. A fork with more work stays. A fork whose work cannot be scored
+/// stays, and so does every connected fork when `headers` cannot.
+fn evict_pending_for_room(
+    hub: &ChainHub,
+    pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
+    prev: BlockHash,
+    headers: &[bitcoin::block::Header],
+    slots: usize,
+) {
+    if !pending_over_cap(pending, slots) {
+        return;
+    }
+    let protected = pending_ancestors(pending, prev);
+    let failed_pow: Vec<BlockHash> = pending
+        .iter()
+        .filter(|(hash, hdr)| !protected.contains(*hash) && !hub.header_claimed_pow_ok(hdr))
+        .map(|(hash, _)| *hash)
+        .collect();
+    drop_hashes_until_fit(pending, slots, failed_pow);
+    if !pending_over_cap(pending, slots) {
+        return;
+    }
+    let failed_forks: Vec<BlockHash> = pending_tips(pending)
+        .into_iter()
+        .filter(|tip| pending_path_fails_claimed_pow(hub, pending, *tip))
+        .collect();
+    drop_tips_until_fit(pending, &protected, slots, &failed_forks);
+    if !pending_over_cap(pending, slots) {
+        return;
+    }
+    drop_hashes_until_fit(
+        pending,
+        slots,
+        disconnected_pending(hub, pending, &protected),
+    );
+    let Some(incoming_work) = incoming_header_work(hub, pending, headers) else {
+        return;
+    };
+    evict_forks_with_work(
+        hub,
+        pending,
+        &protected,
+        slots,
+        incoming_work,
+        std::cmp::Ordering::Less,
+    );
+    evict_forks_with_work(
+        hub,
+        pending,
+        &protected,
+        slots,
+        incoming_work,
+        std::cmp::Ordering::Equal,
+    );
+}
+
+fn pending_over_cap(pending: &HashMap<BlockHash, bitcoin::block::Header>, incoming: usize) -> bool {
+    pending.len().saturating_add(incoming) > MAX_PENDING_HEADERS
+}
+
+fn drop_hashes_until_fit(
+    pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
+    incoming: usize,
+    hashes: impl IntoIterator<Item = BlockHash>,
+) {
+    for hash in hashes {
+        if !pending_over_cap(pending, incoming) {
+            return;
+        }
+        pending.remove(&hash);
+    }
+}
+
+fn drop_tips_until_fit(
+    pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
+    protected: &HashSet<BlockHash>,
+    incoming: usize,
+    tips: &[BlockHash],
+) {
+    for &tip in tips {
+        let mut hash = tip;
+        loop {
+            if !pending_over_cap(pending, incoming) {
+                return;
+            }
+            if protected.contains(&hash) {
+                break;
+            }
+            let Some(parent) = pending.get(&hash).map(|hdr| hdr.prev_blockhash) else {
+                break;
+            };
+            pending.remove(&hash);
+            hash = parent;
+        }
+    }
+}
+
+fn pending_tips(pending: &HashMap<BlockHash, bitcoin::block::Header>) -> Vec<BlockHash> {
+    let has_child: HashSet<BlockHash> = pending.values().map(|hdr| hdr.prev_blockhash).collect();
+    pending
+        .keys()
+        .copied()
+        .filter(|hash| !has_child.contains(hash))
+        .collect()
+}
+
+fn pending_path_fails_claimed_pow(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    tip: BlockHash,
+) -> bool {
+    let mut hash = tip;
+    for _ in 0..PENDING_WALK_LIMIT {
+        if hub.is_connected(&hash) {
+            return false;
+        }
+        let Some(hdr) = pending.get(&hash).copied().or_else(|| hub.header_of(&hash)) else {
+            return false;
+        };
+        if !hub.header_claimed_pow_ok(&hdr) {
+            return true;
+        }
+        hash = hdr.prev_blockhash;
+        if hash.to_byte_array() == [0u8; 32] {
+            return false;
+        }
+    }
+    false
+}
+
+fn disconnected_pending(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    protected: &HashSet<BlockHash>,
+) -> Vec<BlockHash> {
+    let no_pending = HashMap::new();
+    let mut root_of: HashMap<BlockHash, BlockHash> = HashMap::new();
+    let mut root_connects: HashMap<BlockHash, bool> = HashMap::new();
+    let hashes: Vec<BlockHash> = pending.keys().copied().collect();
+    for &hash in &hashes {
+        let root = pending_root(pending, hash, &mut root_of);
+        root_connects.entry(root).or_insert_with(|| {
+            let parent = pending[&root].prev_blockhash;
+            parent != BlockHash::all_zeros()
+                && header_announcement_connects(hub, &no_pending, parent)
+        });
+    }
+    hashes
+        .into_iter()
+        .filter(|hash| !protected.contains(hash) && !root_connects[&root_of[hash]])
+        .collect()
+}
+
+/// Pending slots this message needs. A header this call would write, and
+/// that is not already in `pending`, takes one. A repeat takes one. A header
+/// the store already has, or that is not on the walk from the last hash,
+/// takes none.
+fn newly_stored_slot_count(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    headers: &[bitcoin::block::Header],
+) -> usize {
+    let Some(last) = headers.last() else {
+        return 0;
+    };
+    let mut batch = HashMap::with_capacity(headers.len());
+    for hdr in headers {
+        batch.insert(hdr.block_hash(), *hdr);
+    }
+    // The message overwrites a hash already in `pending`, matching the admit
+    // that runs before the store walk.
+    unstored_header_path(hub, last.block_hash(), |hash| {
+        batch
+            .get(&hash)
+            .copied()
+            .or_else(|| pending.get(&hash).copied())
+    })
+    .into_iter()
+    .filter(|hdr| !pending.contains_key(&hdr.block_hash()))
+    .count()
+}
+
+fn queue_batch_admits(apply: &mut HeadersApply, headers: &[bitcoin::block::Header]) {
+    let mut seen = HashSet::new();
+    for hdr in headers {
+        let hash = hdr.block_hash();
+        if seen.insert(hash) {
+            apply.admits.push((hash, *hdr));
+        }
+    }
+}
+
+/// Headers in this message that `persist_pending_header_path` actually wrote.
+/// A sibling that is not on the walk from the last header stays out.
+fn queue_stored_header_admits(
+    apply: &mut HeadersApply,
+    hub: &ChainHub,
+    headers: &[bitcoin::block::Header],
+) {
+    let mut seen = HashSet::new();
+    for hdr in headers {
+        let hash = hdr.block_hash();
+        if seen.insert(hash) && header_is_stored(hub, &hash) {
+            apply.admits.push((hash, *hdr));
+        }
+    }
+}
+
+/// Persist the walk from `last`, then admit only the headers the store kept.
+fn note_stored_header_path(
+    hub: &ChainHub,
+    apply: &mut HeadersApply,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    headers: &[bitcoin::block::Header],
+    last: BlockHash,
+    work_cmp: Option<std::cmp::Ordering>,
+    announced_h: u32,
+) -> bool {
+    let should_stamp =
+        work_cmp == Some(std::cmp::Ordering::Greater) && !header_is_stored(hub, &last);
+    let stored = persist_pending_header_path(hub, pending, last);
+    apply.stamp_block_announcement = should_stamp && header_is_stored(hub, &last);
+    queue_stored_header_admits(apply, hub, headers);
+    apply.sync_height = Some(announced_h);
+    stored
+}
+
+/// Drop in-flight asks that left the stored walk, and ask for bodies on it.
+fn retarget_stored_header_asks(
+    hub: &ChainHub,
+    apply: &mut HeadersApply,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    last: BlockHash,
+    requested_before: &HashSet<BlockHash>,
+    have_bodies: &HashSet<BlockHash>,
+) {
+    let keep = connecting_header_path(hub, pending, last);
+    let mut requested = requested_before.clone();
+    release_asks_off_path(hub, &mut requested, &keep);
+    apply.drop_asks = requested_before
+        .iter()
+        .copied()
+        .filter(|h| !requested.contains(h))
+        .collect();
+    let mut want =
+        fetchable_header_path_bodies(hub, pending, last, &PendingBlocks::new(), &requested);
+    want.retain(|h| !have_bodies.contains(h) && !requested.contains(h));
+    want.truncate(MAX_SERVE_BLOCKS.saturating_sub(requested.len()));
+    apply.want_bodies = want;
+}
+
+fn incoming_header_work(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    headers: &[bitcoin::block::Header],
+) -> Option<bitcoin::Work> {
+    let last = headers.last()?;
+    let mut with_batch = pending.clone();
+    for hdr in headers {
+        with_batch.insert(hdr.block_hash(), *hdr);
+    }
+    work_of_header_path(hub, &with_batch, last.block_hash())
+}
+
+fn evict_forks_with_work(
+    hub: &ChainHub,
+    pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
+    protected: &HashSet<BlockHash>,
+    incoming: usize,
+    incoming_work: bitcoin::Work,
+    want: std::cmp::Ordering,
+) {
+    if !pending_over_cap(pending, incoming) {
+        return;
+    }
+    let mut keep = protected.clone();
+    let mut victims = Vec::new();
+    for tip in pending_tips(pending) {
+        if pending_path_fails_claimed_pow(hub, pending, tip) {
+            continue;
+        }
+        match work_of_header_path(hub, pending, tip) {
+            Some(work) if work.cmp(&incoming_work) == want => victims.push(tip),
+            _ => keep.extend(pending_ancestors(pending, tip)),
+        }
+    }
+    drop_tips_until_fit(pending, &keep, incoming, &victims);
+}
+
+/// `start` and its ancestors that are in `pending`, walking at most
+/// `PENDING_WALK_LIMIT` steps. Reads only the pending map.
+fn pending_ancestors(
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    start: BlockHash,
+) -> HashSet<BlockHash> {
+    let mut out = HashSet::new();
+    let mut h = start;
+    for _ in 0..PENDING_WALK_LIMIT {
+        let Some(hdr) = pending.get(&h) else {
+            break;
+        };
+        out.insert(h);
+        h = hdr.prev_blockhash;
+    }
+    out
+}
+
+/// The oldest pending ancestor of `hash` (whose parent is not pending),
+/// memoised in `root_of`. Bounded by `PENDING_WALK_LIMIT`.
+fn pending_root(
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    hash: BlockHash,
+    root_of: &mut HashMap<BlockHash, BlockHash>,
+) -> BlockHash {
+    let mut path = Vec::new();
+    let mut h = hash;
+    let root = loop {
+        if let Some(r) = root_of.get(&h) {
+            break *r;
+        }
+        path.push(h);
+        let parent = pending[&h].prev_blockhash;
+        if !pending.contains_key(&parent) || path.len() >= PENDING_WALK_LIMIT {
+            break h;
+        }
+        h = parent;
+    };
+    for p in path {
+        root_of.insert(p, root);
+    }
+    root
 }
 
 fn classify_headers(
@@ -5158,6 +5611,7 @@ fn classify_headers(
         from_peer: Vec::new(),
         best_known: Vec::new(),
         admits: Vec::new(),
+        evicts: Vec::new(),
         misbehave: false,
         disconnect: None,
         sync_height: None,
@@ -5165,11 +5619,15 @@ fn classify_headers(
         drop_asks: Vec::new(),
         want_bodies: Vec::new(),
         getheaders: None,
+        headers_len: n,
+        peer_below_floor: false,
+        stamp_block_announcement: false,
+        answers_getheaders: n == 0,
     };
     let mut ignored_below_floor = false;
     if n == 0 {
         // Empty headers is a failed getheaders response, not an announcement.
-    } else if n > 0 && !noban && headers_are_below_floor(hub, pending_before, headers) {
+    } else if !noban && headers_are_below_floor(hub, pending_before, headers) {
         // Work stays under the floor from the pending headers alone. Do not
         // read parent headers, do not move this peer's best-known tip, and
         // do not ask for the next page of a batch we refused.
@@ -5182,6 +5640,10 @@ fn classify_headers(
         let last = headers[n - 1].block_hash();
         apply.ignore_height = Some(pending_announced_height(&pending, last));
         ignored_below_floor = true;
+        // No header reads: the batch answers our getheaders when its pending
+        // path joins a best-chain block (Core: parent in the block index).
+        let (join, _) = pending_walk(pending_before, headers[0].prev_blockhash);
+        apply.answers_getheaders = is_genesis_hash(&join) || hub.is_connected(&join);
     } else if let Some(first) = headers.first() {
         let prev = first.prev_blockhash;
         if hub.is_block_invalid(&prev)
@@ -5195,15 +5657,45 @@ fn classify_headers(
             apply.misbehave = true;
             return apply;
         }
-        let connecting = header_announcement_connects(hub, pending_before, prev);
+        // The all-zero hash is only genesis's parent. A header claiming it is
+        // not a continuation of any chain we hold.
+        let connecting = prev != BlockHash::all_zeros()
+            && header_announcement_connects(hub, pending_before, prev);
+        apply.answers_getheaders = connecting;
+        let slots = newly_stored_slot_count(hub, &pending, headers);
+        let mut staged_evicts = Vec::new();
+        if connecting && pending.len().saturating_add(slots) > MAX_PENDING_HEADERS {
+            // Claimed proof of work includes the chain pow limit. Evictions
+            // stay staged until the store accepts the batch.
+            if !headers
+                .iter()
+                .take(n)
+                .all(|hdr| hub.header_claimed_pow_ok(hdr))
+            {
+                return apply;
+            }
+            evict_pending_for_room(hub, &mut pending, prev, headers, slots);
+            if pending.len().saturating_add(slots) > MAX_PENDING_HEADERS {
+                return apply;
+            }
+            staged_evicts = pending_before
+                .keys()
+                .filter(|hash| !pending.contains_key(*hash))
+                .copied()
+                .collect();
+        }
         for hdr in headers.iter().take(n) {
             let hash = hdr.block_hash();
             apply.from_peer.push(hash);
             apply.best_known.push(hash);
-            admit_pending_header(&mut pending, hash, *hdr);
-            apply.admits.push((hash, *hdr));
+            // The real map caps in `apply_headers`. This clone has to hold the
+            // whole message so the store walk can see the last header.
+            pending.insert(hash, *hdr);
         }
         if !connecting {
+            // These headers are not sent to the store. A later parent can
+            // still join them.
+            queue_batch_admits(&mut apply, headers);
             if n < MAX_HEADERS_RESULTS {
                 apply.getheaders = Some(headers_sync_locator(hub, None));
             }
@@ -5216,40 +5708,57 @@ fn classify_headers(
             let work_cmp = announced_work_cmp(hub, &pending, last);
             let our_tip = hub.tip_height().unwrap_or(0);
             if announced_tip_is_hopeless(our_tip, announced_h, work_cmp) && !noban {
+                queue_batch_admits(&mut apply, headers);
                 apply.disconnect = Some((announced_h, our_tip));
                 return apply;
             }
+            let mut stored = false;
             if !header_path_meets_minwork(hub, &pending, last) {
                 if noban {
-                    persist_pending_header_path(hub, &pending, last);
-                    apply.sync_height = Some(announced_h);
+                    stored = note_stored_header_path(
+                        hub,
+                        &mut apply,
+                        &pending,
+                        headers,
+                        last,
+                        work_cmp,
+                        announced_h,
+                    );
                 } else {
+                    // Below the floor this path does not touch the store.
+                    queue_batch_admits(&mut apply, headers);
                     apply.ignore_height = Some(announced_h);
                     ignored_below_floor = true;
                 }
                 // Core: do not download bodies until the chain meets
                 // `-minimumchainwork` (`p2p_headers_sync_with_minchainwork`).
             } else {
-                persist_pending_header_path(hub, &pending, last);
-                apply.sync_height = Some(announced_h);
-                let keep = connecting_header_path(hub, &pending, last);
-                let mut requested = requested_before.clone();
-                release_asks_off_path(hub, &mut requested, &keep);
-                apply.drop_asks = requested_before
-                    .iter()
-                    .copied()
-                    .filter(|h| !requested.contains(h))
-                    .collect();
-                let mut want = fetchable_header_path_bodies(
+                // This check is deliberately after the below-floor early path:
+                // that path must not touch the header store or walk parents.
+                stored = note_stored_header_path(
                     hub,
+                    &mut apply,
                     &pending,
+                    headers,
                     last,
-                    &PendingBlocks::new(),
-                    &requested,
+                    work_cmp,
+                    announced_h,
                 );
-                want.retain(|h| !have_bodies.contains(h) && !requested.contains(h));
-                want.truncate(MAX_SERVE_BLOCKS.saturating_sub(requested.len()));
-                apply.want_bodies = want;
+                // Asks follow the stored walk only. A rejected header must
+                // not drop an in-flight body or start a new one.
+                if stored {
+                    retarget_stored_header_asks(
+                        hub,
+                        &mut apply,
+                        &pending,
+                        last,
+                        requested_before,
+                        have_bodies,
+                    );
+                }
+            }
+            if stored {
+                apply.evicts = staged_evicts;
             }
         }
     }
@@ -5257,7 +5766,109 @@ fn classify_headers(
         let from = headers.get(n - 1).map(|h| h.block_hash());
         apply.getheaders = Some(headers_sync_locator(hub, from));
     }
+    if n > 0 {
+        if let Some(last) = headers.last() {
+            apply.peer_below_floor = peer_headers_below_floor(hub, &pending, last.block_hash());
+        }
+    }
     apply
+}
+
+/// This headers message ended the peer's chain, and that chain's work is
+/// under `-minimumchainwork`, while we are still in IBD.
+///
+/// Core drops outbound full-relay and block-relay peers there. A full page
+/// can continue, so it is not their tip yet. Inbound and manual peers stay.
+/// `prior_best_meets_floor` is the peer's stored best-known header from
+/// before this message. Core keeps that when the new header has less work.
+#[doc(hidden)]
+pub fn outbound_insufficient_work_disconnect(
+    in_ibd: bool,
+    header_count: usize,
+    conn: crate::peers::PeerConnType,
+    peer_below_floor: bool,
+    prior_best_meets_floor: bool,
+) -> bool {
+    in_ibd
+        && header_count > 0
+        && header_count < MAX_HEADERS_RESULTS
+        && peer_below_floor
+        && !prior_best_meets_floor
+        && matches!(
+            conn,
+            crate::peers::PeerConnType::OutboundFullRelay | crate::peers::PeerConnType::BlockRelay
+        )
+}
+
+fn peer_headers_below_floor(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    tip: BlockHash,
+) -> bool {
+    let Some(min) = hub.min_chain_work_floor() else {
+        return false;
+    };
+    // Pending work only. `work_of_header_path` reads parent headers, and a
+    // below-floor batch must not.
+    match pending_path_work(hub, pending, tip) {
+        Some(work) => work.to_be_bytes() < min,
+        None => false,
+    }
+}
+
+fn hash_meets_work_floor(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    hash: BlockHash,
+    remembered: Option<bitcoin::Work>,
+) -> bool {
+    let Some(min) = hub.min_chain_work_floor() else {
+        return false;
+    };
+    // The pending map and the tip index can both forget a side header.
+    // The work measured when we stored the hash still counts.
+    let work = pending_path_work(hub, pending, hash).or(remembered);
+    match work {
+        Some(work) => work.to_be_bytes() >= min,
+        None => false,
+    }
+}
+
+/// Core moves `pindexBestKnownBlock` only when the new header's work is
+/// greater or equal. Unknown work does not replace a stored header.
+fn best_known_moves_forward(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    current: Option<BlockHash>,
+    next: BlockHash,
+    remembered_old: Option<bitcoin::Work>,
+) -> Option<bitcoin::Work> {
+    let next_work = pending_path_work(hub, pending, next)?;
+    let Some(old) = current else {
+        return Some(next_work);
+    };
+    let old_work = pending_path_work(hub, pending, old).or(remembered_old);
+    match old_work {
+        Some(old_work) if next_work >= old_work => Some(next_work),
+        Some(_) => None,
+        None => Some(next_work),
+    }
+}
+
+fn note_advanced_best_known(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    session: Option<&crate::peers::LivePeer>,
+    hash: BlockHash,
+) {
+    let Some(s) = session else {
+        return;
+    };
+    if let Some(work) =
+        best_known_moves_forward(hub, pending, s.best_known(), hash, s.best_known_work())
+    {
+        s.note_best_known_with_work(hash, work);
+    }
 }
 
 fn apply_headers(
@@ -5267,22 +5878,30 @@ fn apply_headers(
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
+    if apply.answers_getheaders {
+        let _ = session.is_some_and(|s| s.take_awaiting_headers());
+    }
     if apply.misbehave {
         misbehaving(&mut follow.ban_score, session);
         return Ok(());
+    }
+    // Read before this message. The disconnect compares that hash and the
+    // work saved with it, which outlives the pending map.
+    let prior_best = session.and_then(|s| s.best_known());
+    let prior_work = session.and_then(|s| s.best_known_work());
+    for hash in apply.evicts {
+        follow.pending_headers.remove(&hash);
     }
     for hash in apply.from_peer {
         if let Some(s) = session {
             s.note_block_from_peer(hash);
         }
     }
-    for hash in apply.best_known {
-        if let Some(s) = session {
-            s.note_best_known(hash);
-        }
-    }
     for (hash, hdr) in apply.admits {
         admit_pending_header(&mut follow.pending_headers, hash, hdr);
+    }
+    for hash in apply.best_known {
+        note_advanced_best_known(hub, &follow.pending_headers, session, hash);
     }
     if let Some((announced_h, our_tip)) = apply.disconnect {
         rbitcoin_log::info!("p2p: disconnect stale fork tip announced={announced_h} our={our_tip}");
@@ -5296,6 +5915,26 @@ fn apply_headers(
     }
     if let Some(announced_h) = apply.ignore_height {
         rbitcoin_log::info!("{}", ignoring_low_work_chain_log(announced_h));
+    }
+    if let Some(s) = session.filter(|s| {
+        let prior_meets = apply.peer_below_floor
+            && prior_best.is_some_and(|h| {
+                hash_meets_work_floor(hub, &follow.pending_headers, h, prior_work)
+            });
+        outbound_insufficient_work_disconnect(
+            hub.in_ibd(),
+            apply.headers_len,
+            s.conn_type,
+            apply.peer_below_floor,
+            prior_meets,
+        )
+    }) {
+        rbitcoin_log::info!(
+            "outbound peer headers chain has insufficient work, peer={}",
+            s.id
+        );
+        s.request_disconnect();
+        return Ok(());
     }
     for hash in &apply.drop_asks {
         follow.requested_blocks.remove(hash);
@@ -5343,8 +5982,63 @@ fn queue_claimed_block_getdata(
             requested_blocks.remove(hash);
             hub.forget_asked_block(hash);
         }
+        return sent;
+    }
+    if compact {
+        for hash in &claimed {
+            if compact_getdata_near_tip(hub, hash) {
+                ask_other_hb_for_block(session, *hash);
+            }
+        }
     }
     sent
+}
+
+/// While one peer owes a body, ask other high-bandwidth compact peers too.
+/// At most two more, and an outbound when the announcer is inbound and one
+/// exists. The hub claim stays with the first ask.
+fn ask_other_hb_for_block(session: Option<&crate::peers::LivePeer>, hash: BlockHash) {
+    let Some(announcer) = session else {
+        return;
+    };
+    let Some(peers) = announcer.peer_hub() else {
+        return;
+    };
+    let mut rest: Vec<std::sync::Arc<crate::peers::LivePeer>> = peers
+        .live_peers()
+        .into_iter()
+        .filter(|p| {
+            p.id != announcer.id
+                && p.hb_to.load(Ordering::Relaxed)
+                && !p.stop.load(Ordering::Relaxed)
+                && p.writer().is_some()
+        })
+        .collect();
+    let mut picked = Vec::new();
+    if announcer.inbound {
+        if let Some(i) = rest.iter().position(|p| !p.inbound) {
+            picked.push(rest.remove(i));
+        }
+    }
+    for peer in rest {
+        if picked.len() >= 2 {
+            break;
+        }
+        picked.push(peer);
+    }
+    if picked.is_empty() || !announcer.claim_hb_body_fanout(hash) {
+        return;
+    }
+    for peer in picked {
+        let Some(out) = peer.writer() else {
+            continue;
+        };
+        let _ = queue_accounted(
+            Some(peer.as_ref()),
+            &out,
+            NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
+        );
+    }
 }
 
 /// Send a locator the header job already built. Same in-flight gate as
@@ -5372,7 +6066,6 @@ pub async fn on_headers(
     session: Option<&crate::peers::LivePeer>,
     headers: &[bitcoin::block::Header],
 ) -> Result<(), NetError> {
-    let _ = session.is_some_and(|s| s.take_awaiting_headers());
     let noban = session.is_some_and(|s| s.session_noban());
     let pending = follow.pending_headers.clone();
     let requested = follow.requested_blocks.clone();
@@ -5382,7 +6075,15 @@ pub async fn on_headers(
         classify_headers(hub, &headers, &pending, &requested, &have_bodies, noban)
     })
     .await?;
-    apply_headers(apply, hub, out_tx, follow, session)
+    let accepted = !apply.misbehave;
+    let stamp_block_announcement = apply.stamp_block_announcement;
+    apply_headers(apply, hub, out_tx, follow, session)?;
+    if accepted && stamp_block_announcement {
+        if let Some(s) = session {
+            s.note_last_block_announcement();
+        }
+    }
+    Ok(())
 }
 
 pub async fn on_block(
@@ -5414,8 +6115,8 @@ pub async fn on_block(
     }
     if let Some(s) = session {
         s.note_block_from_peer(hash);
-        s.note_best_known(hash);
     }
+    note_advanced_best_known(hub, &follow.pending_headers, session, hash);
     // One frame at a time: the ping behind this body is not read until we
     // return. A duplicate must not take the process-wide tip-accept lane.
     if hub.already_have(hash) {
@@ -5619,6 +6320,25 @@ pub async fn on_cmpctblock(
         take_requested_block(hub, &mut follow.requested_blocks, &hash);
         return Ok(());
     }
+    // Process the compact block's header before trying reconstruction, as Core
+    // does. This also makes the announcement timestamp contingent on the
+    // header actually entering the block index.
+    let announcement_unknown = !header_is_stored(hub, &hash);
+    let should_stamp = announcement_unknown
+        && header_announcement_connects(hub, &follow.pending_headers, hsi.header.prev_blockhash)
+        && work_of_header_path(hub, &follow.pending_headers, hash)
+            .zip(hub.chain_work().ok())
+            .is_some_and(|(announced, tip)| announced > tip);
+    let pending = follow.pending_headers.clone();
+    run_header_job(hub, move |hub| {
+        persist_pending_header_path(hub, &pending, hash)
+    })
+    .await?;
+    if should_stamp && header_is_stored(hub, &hash) {
+        if let Some(s) = session {
+            s.note_last_block_announcement();
+        }
+    }
     if hub.has_block(&hash) {
         take_requested_block(hub, &mut follow.requested_blocks, &hash);
         return Ok(());
@@ -5644,11 +6364,6 @@ async fn on_cmpctblock_header_announce(
     session: Option<&crate::peers::LivePeer>,
     hash: BlockHash,
 ) -> Result<(), NetError> {
-    let pending = follow.pending_headers.clone();
-    run_header_job(hub, move |hub| {
-        persist_pending_header_path(hub, &pending, hash);
-    })
-    .await?;
     if session.is_some_and(|s| s.send_over_budget()) {
         return Ok(());
     }
@@ -5716,8 +6431,8 @@ pub fn on_cmpctblock_reject_early(
     }
     if let Some(s) = session {
         s.note_block_from_peer(hash);
-        s.note_best_known(hash);
     }
+    note_advanced_best_known(hub, &follow.pending_headers, session, hash);
     Ok(false)
 }
 
@@ -5818,6 +6533,17 @@ pub async fn on_cmpct_got_block(
         Err(e @ NetError::Store(_)) if !net_error_is_store_not_found(&e) => {
             note_store_fault_keep_session(hub, hash, &e);
         }
+        Err(e) if e.is_mutated() => {
+            hub.forget_asked_block(&hash);
+            follow.pending_headers.remove(&hash);
+            follow.requested_blocks.remove(&hash);
+            if let Some(s) = session {
+                s.note_failed_cmpct(hash);
+                s.release_cmpct_taken(hash);
+            }
+            follow.ban_score = follow.ban_score.saturating_add(10);
+            ask_other_hb_for_block(session, hash);
+        }
         _ => {
             if !hub.knows_header(&hsi.header.prev_blockhash) {
                 let _ = queue_getheaders(out_tx, hub, session, true, None);
@@ -5907,6 +6633,7 @@ pub fn on_cmpct_need_txn(
             txs_request: crate::compact::missing_request(hash, &missing),
         }),
     )?;
+    ask_other_hb_for_block(session, hash);
     rbitcoin_log::debug!("cmpct reconstruct {hash} missing={missing_n} awaiting blocktxn");
     Ok(())
 }
@@ -5927,15 +6654,15 @@ pub async fn on_blocktxn(
         misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
-    let Some(pc) = follow.pending_cmpct.remove(&hash) else {
+    let Some(mut pc) = follow.pending_cmpct.remove(&hash) else {
         follow.ban_score = follow.ban_score.saturating_add(5);
         return Ok(());
     };
-    match apply_cmpct_blocktxn(&pc, bt) {
+    match apply_cmpct_blocktxn(&mut pc, bt) {
         Ok((block, fill)) => {
             on_blocktxn_got_block(hub, out_tx, follow, session, &pc, hash, block, fill).await
         }
-        Err(()) => on_blocktxn_apply_fail(out_tx, follow, session, &pc, hash),
+        Err(()) => on_blocktxn_apply_fail(hub, follow, session, &pc, hash),
     }
 }
 
@@ -6008,13 +6735,13 @@ pub async fn on_blocktxn_got_block(
             )
             .await
         }
-        Err(_) => on_blocktxn_unconnectable(out_tx, follow, session, hash),
+        Err(_) => on_blocktxn_unconnectable(hub, follow, session, hash),
     }
 }
 
 #[doc(hidden)]
 pub fn on_blocktxn_apply_fail(
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    hub: &ChainHub,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     pc: &PendingCmpct,
@@ -6026,16 +6753,15 @@ pub fn on_blocktxn_apply_fail(
         s.note_failed_cmpct(hash);
         s.release_cmpct_taken(hash);
     }
+    hub.forget_asked_block(&hash);
     follow.ban_score = follow.ban_score.saturating_add(10);
-    queue_out(
-        out_tx,
-        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-    )
+    ask_other_hb_for_block(session, hash);
+    Ok(())
 }
 
 #[doc(hidden)]
 pub fn on_blocktxn_unconnectable(
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    hub: &ChainHub,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     hash: BlockHash,
@@ -6045,11 +6771,10 @@ pub fn on_blocktxn_unconnectable(
         s.note_failed_cmpct(hash);
         s.release_cmpct_taken(hash);
     }
+    hub.forget_asked_block(&hash);
     follow.ban_score = follow.ban_score.saturating_add(10);
-    queue_out(
-        out_tx,
-        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-    )
+    ask_other_hb_for_block(session, hash);
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6108,7 +6833,7 @@ pub fn schedule_orphan_parent_getdata(
             continue;
         }
         if let Some(p) = ph.live_peers().into_iter().find(|p| p.id == *id) {
-            mp.schedule_orphan_parents(&missing, p.id, p.inbound, now);
+            mp.schedule_announcer_parents(&missing, p.id, p.inbound, now);
         }
     }
 }
@@ -6155,6 +6880,37 @@ fn note_blocksonly_sender(
     }
 }
 
+/// The other announcers of a parked `tx` become its announcers. With a
+/// `session`, its missing parents are asked for from it and from the
+/// announcers still live.
+fn fetch_parked_parents(
+    mp: &crate::tx_relay::MempoolHub,
+    tx: &Transaction,
+    wtxid: &bitcoin::Wtxid,
+    session: Option<&crate::peers::LivePeer>,
+    extra_from: &[u64],
+) {
+    for p in extra_from {
+        let _ = mp.add_orphan_announcer(wtxid, *p);
+    }
+    if mp.try_orphan_missing(wtxid).is_some() {
+        schedule_orphan_parent_getdata(mp, tx, session, extra_from);
+    }
+}
+
+/// Core `AlreadyHaveTx` for a received tx, which is dropped unvalidated: a
+/// recent reject, or a parked wtxid whose sender is no new announcer. Unlike
+/// Core, a mempool hit is not had here; it goes on to the duplicate handling
+/// in [`on_tx`].
+fn already_had_unvalidated(
+    mp: &crate::tx_relay::MempoolHub,
+    txid: &bitcoin::Txid,
+    wtxid: &bitcoin::Wtxid,
+) -> bool {
+    mp.try_recent_reject(wtxid)
+        || (mp.try_orphan_missing(wtxid).is_some() && !mp.try_contains(txid))
+}
+
 pub async fn on_tx(
     hub: &ChainHub,
     _out_tx: &mpsc::UnboundedSender<PeerOut>,
@@ -6182,9 +6938,8 @@ pub async fn on_tx(
             let from = session.map(|s| s.id);
             let trusted = session
                 .is_some_and(|s| s.peer_hub().is_some_and(|ph| ph.session_is_trusted_peer(s)));
-            // A recent reject is final for every peer except the trusted one.
-            // That session already accepted the tx, so judge it again.
-            if mp.try_recent_reject(&wtxid) && !trusted {
+            // The trusted peer already accepted the tx, so judge it again.
+            if !trusted && already_had_unvalidated(mp, &txid, &wtxid) {
                 mp.resolve_tx_request(&txid, &wtxid, false);
                 maybe_force_relay_recent_reject(hub, session, mp, txid, wtxid);
                 return Ok(());
@@ -6199,24 +6954,26 @@ pub async fn on_tx(
             let hub_arc = hub.shared_arc();
             // The blocksonly note shares the admit task. Aborting this
             // session during script verify must not skip the rebroadcast.
-            let admitted = crate::reactor::spawn_with_store_budget(async move {
-                let result = mp_task
-                    .accept_tx_from_work(tx_task, crate::tx_relay::TxOrigin::Relay(from))
-                    .await;
-                if let Ok(r) = &result {
-                    if !mp_task.relay_enabled() {
-                        mp_task.note_unbroadcast(r.txid);
-                        mp_task.rebroadcast_unbroadcast();
-                        mp_task.notify_inv_flush();
-                        if let (Some(h), Some(ph)) = (hub_arc.as_ref(), peers.as_ref()) {
-                            flush_tx_invs(h, ph.as_ref());
+            let admitted = crate::reactor::finish_join(
+                crate::reactor::spawn_with_store_budget(async move {
+                    let result = mp_task
+                        .accept_tx_from_work(tx_task, crate::tx_relay::TxOrigin::Relay(from))
+                        .await;
+                    if let Ok(r) = &result {
+                        if !mp_task.relay_enabled() {
+                            mp_task.note_unbroadcast(r.txid);
+                            mp_task.rebroadcast_unbroadcast();
+                            mp_task.notify_inv_flush();
+                            if let (Some(h), Some(ph)) = (hub_arc.as_ref(), peers.as_ref()) {
+                                flush_tx_invs(h, ph.as_ref());
+                            }
                         }
                     }
-                }
-                result
-            })
-            .await
-            .expect("tx admit");
+                    result
+                })
+                .await,
+                "tx admit",
+            );
             match admitted {
                 Ok(_r) => {
                     mp.resolve_tx_request(&txid, &wtxid, true);
@@ -6253,20 +7010,10 @@ pub async fn on_tx(
                         }
                         TxAcceptLog::Park(_missing) => {
                             rbitcoin_log::debug!("txrelay: park {txid} missingorspent");
-                            for p in &extra_from {
-                                let _ = mp.add_orphan_announcer(&txid, *p);
-                            }
-                            if mp.try_orphan_missing(&txid).is_some() {
-                                schedule_orphan_parent_getdata(mp, tx, session, &extra_from);
-                            }
+                            fetch_parked_parents(mp, tx, &wtxid, session, &extra_from);
                         }
                         TxAcceptLog::ParentFetch(_missing) => {
-                            for p in &extra_from {
-                                let _ = mp.add_orphan_announcer(&txid, *p);
-                            }
-                            if mp.try_orphan_missing(&txid).is_some() {
-                                schedule_orphan_parent_getdata(mp, tx, session, &extra_from);
-                            }
+                            fetch_parked_parents(mp, tx, &wtxid, session, &extra_from);
                         }
                         TxAcceptLog::Reject => {
                             follow.ban_score =
@@ -6466,15 +7213,22 @@ pub fn cmpct_announce_from_block(
     let pref = hub
         .cmpct_prefill_indexes(&block.block_hash())
         .unwrap_or_else(|| vec![0]);
-    cmpct_from_parts(block, rand_nonce(), ver, &pref)
+    let ids = crate::compact::short_id_hashes(block, ver);
+    cmpct_from_parts(block, &ids, rand_nonce(), ver, &pref)
 }
 
-/// Short ids for a block already in hand. No store read.
-fn cmpct_from_parts(block: &Block, nonce: u64, ver: u32, pref: &[usize]) -> Option<NetworkMessage> {
+/// Short ids for a block already in hand. No store read. `ids` is
+/// [`crate::compact::short_id_hashes`] for `ver`.
+fn cmpct_from_parts(
+    block: &Block,
+    ids: &[[u8; 32]],
+    nonce: u64,
+    ver: u32,
+    pref: &[usize],
+) -> Option<NetworkMessage> {
     crate::reactor::assert_not_reactor("cmpct short ids");
-    let hsi = HeaderAndShortIds::from_block(block, nonce, ver, pref)
-        .or_else(|_| HeaderAndShortIds::from_block(block, nonce, ver, &[0]))
-        .ok()?;
+    let hsi = crate::compact::header_and_short_ids(block, ids, nonce, ver, pref)
+        .or_else(|| crate::compact::header_and_short_ids(block, ids, nonce, ver, &[0]))?;
     rbitcoin_log::info!(
         "{}",
         crate::compact::cmpct_send_line(block.block_hash(), block.txdata.len(), &hsi)
@@ -6491,7 +7245,8 @@ async fn cmpct_from_parts_cpu(
     pref: Vec<usize>,
 ) -> Result<Option<NetworkMessage>, NetError> {
     match rbitcoin_consensus::script_pool::run_cpu(move || {
-        cmpct_from_parts(&block, nonce, ver, &pref)
+        let ids = crate::compact::short_id_hashes(&block, ver);
+        cmpct_from_parts(&block, &ids, nonce, ver, &pref)
     })
     .await
     {
@@ -6549,53 +7304,90 @@ async fn cmpct_tip_announce(
     cmpct_from_parts_cpu(block, nonce, ver, pref).await
 }
 
-/// Header persist and prefill for a block already in hand, then short ids.
+/// Header persist and prefill for a block already in hand, then the body
+/// check and short ids.
 ///
-/// An `Arc` hub persists the header on the blocking pool and builds short
-/// ids on `rbtc-scripts-*`. A stack hub (tests) does both inline.
-/// `Ok(None)` is a header the store refused or a body that did not become
-/// a compact message. A closed permit or a failed join is `Err`, the same
-/// class as [`cmpct_tip_announce`].
+/// An `Arc` hub persists the header on the blocking pool and hashes the
+/// body on `rbtc-scripts-*`. A stack hub (tests) does both inline.
+/// `Ok(None)` is a header the store refused, a mutated body, or a body that
+/// did not become a compact message. A closed permit or a failed join is
+/// `Err`, the same class as [`cmpct_tip_announce`].
 async fn cmpct_announce_off_session(
     hub: &ChainHub,
     block: Block,
-    cmpct_version: u32,
+    height: u32,
 ) -> Result<Option<NetworkMessage>, NetError> {
     let Some(owned) = hub.shared_arc() else {
-        return Ok(hb_relay_message(hub, &block, cmpct_version));
+        return Ok(hb_relay_message(hub, &block, height));
     };
+    let cpu_hub = Arc::clone(&owned);
     let permit = block_reconstruct_permit().await?;
     let joined = tokio::task::spawn_blocking(move || {
         let _region = crate::reactor::BlockingRegion::enter();
         let _permit = permit;
-        hb_relay_prepare(owned.as_ref(), block, cmpct_version)
+        hb_relay_prepare(owned.as_ref(), block)
     })
     .await;
-    let Some((block, ver, pref, nonce)) = map_cmpct_relay_join(joined)? else {
+    let Some((block, pref, nonce)) = map_cmpct_relay_join(joined)? else {
         return Ok(None);
     };
-    cmpct_from_parts_cpu(block, nonce, ver, pref).await
+    rbitcoin_consensus::script_pool::run_cpu(move || {
+        hb_relay_cmpct(cpu_hub.as_ref(), &block, height, nonce, &pref)
+    })
+    .await
+    .ok_or(NetError::Protocol("cmpct relay join failed"))
 }
 
-fn hb_relay_prepare(
-    hub: &ChainHub,
-    block: Block,
-    cmpct_version: u32,
-) -> Option<(Block, u32, Vec<usize>, u64)> {
+fn hb_relay_prepare(hub: &ChainHub, block: Block) -> Option<(Block, Vec<usize>, u64)> {
     if ensure_peer_header(hub, &block.header).is_err() {
         return None;
     }
     hub.remember_cmpct_prefill_from_block(&block);
-    let ver = cmpct_version.clamp(1, 2);
     let pref = hub
         .cmpct_prefill_indexes(&block.block_hash())
         .unwrap_or_else(|| vec![0]);
-    Some((block, ver, pref, rand_nonce()))
+    Some((block, pref, rand_nonce()))
 }
 
-fn hb_relay_message(hub: &ChainHub, block: &Block, cmpct_version: u32) -> Option<NetworkMessage> {
-    let (block, ver, pref, nonce) = hb_relay_prepare(hub, block.clone(), cmpct_version)?;
-    cmpct_from_parts(&block, nonce, ver, &pref)
+fn hb_relay_message(hub: &ChainHub, block: &Block, height: u32) -> Option<NetworkMessage> {
+    let (block, pref, nonce) = hb_relay_prepare(hub, block.clone())?;
+    hb_relay_cmpct(hub, &block, height, nonce, &pref)
+}
+
+/// Core sends this from `NewPoWValidBlock`, after `CheckBlock` and
+/// `ContextualCheckBlock`. Callers check the txid merkle root and the
+/// 64-byte mutation where the body arrives. The witness commitment is not
+/// in the block hash, so a peer can change a witness or the coinbase nonce
+/// and keep the header. That check (Core `IsBlockMutated` with the witness
+/// root, which reads the coinbase) runs here on the wtxids the short ids
+/// use, so the check does not hash the transactions again. With compact
+/// prefill on, `hb_relay_prepare` still hashes them for the prefill plan.
+fn hb_relay_cmpct(
+    hub: &ChainHub,
+    block: &Block,
+    height: u32,
+    nonce: u64,
+    pref: &[usize],
+) -> Option<NetworkMessage> {
+    if !block.txdata.first().is_some_and(Transaction::is_coinbase) {
+        return None;
+    }
+    let wtxids = crate::compact::short_id_hashes(block, 2);
+    let ctx = rbitcoin_consensus::ValidationContext::at(&hub.params, Height(height), hub.milestone);
+    if let Err(e) = rbitcoin_consensus::block::reject_witness_malleation_wtxids(
+        block,
+        &ctx,
+        rbitcoin_consensus::block::block_has_witness(block),
+        wtxids.iter().skip(1).copied(),
+    ) {
+        rbitcoin_log::debug!(
+            "p2p: no compact relay of mutated block {}: {}",
+            block.block_hash(),
+            rbitcoin_consensus::block_reject_reason(&e)
+        );
+        return None;
+    }
+    cmpct_from_parts(block, &wtxids, nonce, 2, pref)
 }
 
 /// A panicked or cancelled blocking job is not "no compact message".
@@ -6626,9 +7418,10 @@ fn hb_peer_offered_block(
 
 /// Send `cmpctblock` to peers who asked for high-bandwidth announcements
 /// (`hb_from`: they sent `sendcmpct` announce=1) as soon as a reconstructed
-/// or received body has a PoW-valid header that extends our tip, **before**
-/// `tip-accept` connect. The body is staged for `getblocktxn` before that
-/// message is queued. Does not mark the block connected.
+/// or received body has a PoW-valid header that extends our tip and the
+/// body matches its witness commitment, **before** `tip-accept` connect.
+/// The body is staged for `getblocktxn` before that message is queued.
+/// Does not mark the block connected.
 ///
 /// The compact message is built only when one of those peers would be
 /// offered the block. No such peer returns before the clone and the
@@ -6636,7 +7429,8 @@ fn hb_peer_offered_block(
 ///
 /// Core `NewPoWValidBlock`: the peer already has the parent header and not
 /// this one. `hb_to` is the opposite direction (we asked them to announce
-/// to us). Only the current tip-child (not a reorg branch). Sender is skipped.
+/// to us). Only the current tip-child (not a reorg branch), and only once
+/// segwit is active at its height. Sender is skipped.
 #[doc(hidden)]
 pub async fn relay_new_pow_valid_block(
     hub: &ChainHub,
@@ -6672,7 +7466,13 @@ pub async fn relay_new_pow_valid_block(
     if targets.is_empty() {
         return;
     }
-    let msg = match cmpct_announce_off_session(hub, block.clone(), 2).await {
+    let Some(height) = hub.header_height(&prev).map(|h| h.saturating_add(1)) else {
+        return;
+    };
+    if !hub.params.segwit_active_at(height) {
+        return;
+    }
+    let msg = match cmpct_announce_off_session(hub, block.clone(), height).await {
         Ok(Some(msg)) => msg,
         Ok(None) => return,
         Err(e) => {
@@ -6871,38 +7671,52 @@ pub fn announced_headers_height(
     hub.header_height(&join).unwrap_or(0).saturating_add(steps)
 }
 
-/// Persist `tip`'s pending path oldest-first so `ensure_header` has parents.
-/// Store the pending headers from `tip` back to the last stored one. Headers
-/// already stored were checked when they were written.
-#[doc(hidden)]
-pub fn persist_pending_header_path(
+/// Headers on the walk from `tip` that are not in the store yet, oldest first.
+/// The walk stops at a stored header. That header is not included.
+fn unstored_header_path(
     hub: &ChainHub,
-    pending: &HashMap<BlockHash, bitcoin::block::Header>,
     tip: BlockHash,
-) {
+    mut lookup: impl FnMut(BlockHash) -> Option<bitcoin::block::Header>,
+) -> Vec<bitcoin::block::Header> {
     let mut path = Vec::new();
     let mut h = tip;
     for _ in 0..PENDING_WALK_LIMIT {
-        let Some(hdr) = pending.get(&h) else {
+        let Some(hdr) = lookup(h) else {
             break;
         };
         if header_is_stored(hub, &h) {
             break;
         }
-        path.push(*hdr);
+        path.push(hdr);
         h = hdr.prev_blockhash;
         if is_genesis_hash(&h) {
             break;
         }
     }
     path.reverse();
+    path
+}
+
+/// Persist `tip`'s pending path oldest-first so `ensure_header` has parents.
+/// Store the pending headers from `tip` back to the last stored one. Headers
+/// already stored were checked when they were written.
+///
+/// `false` when a chunk is rejected. Chunks already written in this call stay.
+#[doc(hidden)]
+pub fn persist_pending_header_path(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    tip: BlockHash,
+) -> bool {
+    let path = unstored_header_path(hub, tip, |hash| pending.get(&hash).copied());
     // One store batch. Per-header ensure walks parent heights to genesis, so a
     // full below-floor chain (thousands of headers) is quadratic.
     for chunk in path.chunks(MAX_HEADERS_RESULTS) {
         if hub.ensure_headers_batch(chunk).is_err() {
-            break;
+            return false;
         }
     }
+    true
 }
 
 #[doc(hidden)]
@@ -7229,6 +8043,24 @@ pub fn queue_out(
     queue_accounted(None, out, msg)
 }
 
+/// One charged pong per session. A later ping replaces the nonce and does
+/// not queue another message. No session still queues every pong.
+#[doc(hidden)]
+pub fn queue_pong(
+    session: Option<&crate::peers::LivePeer>,
+    out: &mpsc::UnboundedSender<PeerOut>,
+    nonce: u64,
+) -> Result<(), NetError> {
+    let Some(session) = session else {
+        return queue_out(out, NetworkMessage::Pong(nonce));
+    };
+    session.store_pong_nonce(nonce);
+    if !session.claim_pong_send() {
+        return Ok(());
+    }
+    queue_accounted(Some(session), out, NetworkMessage::Pong(nonce))
+}
+
 /// Send filtered tx announcements in [`TX_INV_BATCH`] chunks.
 ///
 /// The caller already owns the filtered inventories. Chunking does not clone
@@ -7492,7 +8324,7 @@ pub fn headers_reply_for_getheaders(
                     return Ok(vec![h]);
                 }
             } else if hub.stale_relay_allowed(&stop) {
-                let have_body = hub.cache.get_block(&stop).is_some()
+                let have_body = hub.cache.has_body(&stop)
                     || hub
                         .query
                         .is_block_archived(&stop.to_byte_array())

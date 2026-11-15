@@ -1,4 +1,4 @@
-use crate::test_chain::{padded_chain_with, shared_regtest, TestChain};
+use crate::test_chain::{padded_chain_with, shared_regtest, test_tp_config, TestChain};
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::{
@@ -14,10 +14,7 @@ use rbitcoin_primitives::Height;
 use rbitcoin_query::{confirm_scripts_phase, expected_next_bits, median_time_past};
 use rbitcoin_store::merkle_root_from_txids;
 use rbitcoin_sv2::testutil::{solution_coinbase, TpClient};
-use rbitcoin_sv2::{
-    run_sv2_tp, Sv2TpConfig, CONSTRAINTS_COOLDOWN_TEST, FEE_DELTA, SETUP_TIMEOUT,
-    TEMPLATE_INTERVAL, WRITE_TIMEOUT,
-};
+use rbitcoin_sv2::{run_sv2_tp, CONSTRAINTS_COOLDOWN_TEST, FEE_DELTA, TEMPLATE_INTERVAL};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -183,21 +180,9 @@ async fn template_budget_fees_coinbase_and_merkle_path() {
         tc.mempool.accept_tx(tx).expect("mempool accept");
     }
 
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain: Arc::clone(&tc.chain),
-        authority_secret: [7; 32],
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout: SETUP_TIMEOUT,
-        idle_timeout: None,
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: FEE_DELTA,
-        template_interval: TEMPLATE_INTERVAL,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
-    })
-    .await
-    .expect("listen");
+    let tp = run_sv2_tp(test_tp_config(Arc::clone(&tc.chain), [7; 32]))
+        .await
+        .expect("listen");
     let mut c = TpClient::connect(tp.local_addr, tp.authority_pubkey)
         .await
         .expect("handshake");
@@ -236,18 +221,11 @@ async fn holding_session_publishes_when_the_pool_is_maintained() {
     assert!(tc.chain.in_ibd(), "stale pad starts in IBD");
     tc.mempool.set_relay_enabled(false);
     let interval = Duration::from_millis(100);
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain: Arc::clone(&tc.chain),
-        authority_secret: [9; 32],
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout: Duration::from_secs(30),
-        idle_timeout: None,
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: FEE_DELTA,
-        template_interval: interval,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
+    let tp = run_sv2_tp({
+        let mut cfg = test_tp_config(Arc::clone(&tc.chain), [9; 32]);
+        cfg.setup_timeout = Duration::from_secs(30);
+        cfg.template_interval = interval;
+        cfg
     })
     .await
     .expect("listen");
@@ -289,21 +267,9 @@ async fn constraints_cooldown_publishes_the_next_budget() {
         ScriptBuf::from_bytes(vec![OP_CHECKSIG; 4_000]),
     );
     tc.mempool.accept_tx(&heavy).expect("mempool accept");
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain: Arc::clone(&tc.chain),
-        authority_secret: [7; 32],
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout: SETUP_TIMEOUT,
-        idle_timeout: None,
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: FEE_DELTA,
-        template_interval: TEMPLATE_INTERVAL,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
-    })
-    .await
-    .expect("listen");
+    let tp = run_sv2_tp(test_tp_config(Arc::clone(&tc.chain), [7; 32]))
+        .await
+        .expect("listen");
     let mut c = TpClient::connect(tp.local_addr, tp.authority_pubkey)
         .await
         .expect("handshake");
@@ -336,21 +302,9 @@ async fn template_resent_constraints_do_not_rebuild() {
         ScriptBuf::from_bytes(vec![OP_CHECKSIG; 4_000]),
     );
     tc.mempool.accept_tx(&heavy).expect("mempool accept");
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain: Arc::clone(&tc.chain),
-        authority_secret: [7; 32],
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout: SETUP_TIMEOUT,
-        idle_timeout: None,
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: FEE_DELTA,
-        template_interval: TEMPLATE_INTERVAL,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
-    })
-    .await
-    .expect("listen");
+    let tp = run_sv2_tp(test_tp_config(Arc::clone(&tc.chain), [7; 32]))
+        .await
+        .expect("listen");
     let mut c = TpClient::connect(tp.local_addr, tp.authority_pubkey)
         .await
         .expect("handshake");
@@ -380,21 +334,9 @@ async fn template_constraint_rebuilds_are_rate_limited() {
         ScriptBuf::from_bytes(vec![OP_CHECKSIG; 4_000]),
     );
     tc.mempool.accept_tx(&heavy).expect("mempool accept");
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain: Arc::clone(&tc.chain),
-        authority_secret: [7; 32],
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout: SETUP_TIMEOUT,
-        idle_timeout: None,
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: FEE_DELTA,
-        template_interval: TEMPLATE_INTERVAL,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
-    })
-    .await
-    .expect("listen");
+    let tp = run_sv2_tp(test_tp_config(Arc::clone(&tc.chain), [7; 32]))
+        .await
+        .expect("listen");
     let mut c = TpClient::connect(tp.local_addr, tp.authority_pubkey)
         .await
         .expect("handshake");
@@ -419,21 +361,9 @@ async fn template_constraint_rebuilds_are_rate_limited() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_gate_holds_constraints_until_a_fresh_tip() {
     let tc = shared_regtest(1);
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain: Arc::clone(&tc.chain),
-        authority_secret: [7; 32],
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout: SETUP_TIMEOUT,
-        idle_timeout: None,
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: FEE_DELTA,
-        template_interval: TEMPLATE_INTERVAL,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
-    })
-    .await
-    .expect("listen");
+    let tp = run_sv2_tp(test_tp_config(Arc::clone(&tc.chain), [7; 32]))
+        .await
+        .expect("listen");
     let mut c = TpClient::connect(tp.local_addr, tp.authority_pubkey)
         .await
         .expect("handshake");
@@ -475,21 +405,9 @@ async fn constraints_while_ibd_keep_the_last_budget() {
         ScriptBuf::from_bytes(vec![OP_CHECKSIG; 4_000]),
     );
     tc.mempool.accept_tx(&heavy).expect("mempool accept");
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain: Arc::clone(&tc.chain),
-        authority_secret: [7; 32],
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout: SETUP_TIMEOUT,
-        idle_timeout: None,
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: FEE_DELTA,
-        template_interval: TEMPLATE_INTERVAL,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
-    })
-    .await
-    .expect("listen");
+    let tp = run_sv2_tp(test_tp_config(Arc::clone(&tc.chain), [7; 32]))
+        .await
+        .expect("listen");
     let mut c = TpClient::connect(tp.local_addr, tp.authority_pubkey)
         .await
         .expect("handshake");
@@ -546,18 +464,10 @@ async fn first_template(tc: &TestChain) -> FirstTemplate {
 /// [`first_template`] on a session that checks fees every `template_interval`.
 async fn first_template_every(tc: &TestChain, template_interval: Duration) -> FirstTemplate {
     mock_live_tip(tc);
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain: Arc::clone(&tc.chain),
-        authority_secret: [7; 32],
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout: SETUP_TIMEOUT,
-        idle_timeout: None,
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: FEE_DELTA,
-        template_interval,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
+    let tp = run_sv2_tp({
+        let mut cfg = test_tp_config(Arc::clone(&tc.chain), [7; 32]);
+        cfg.template_interval = template_interval;
+        cfg
     })
     .await
     .expect("listen");
@@ -576,11 +486,13 @@ async fn first_template_every(tc: &TestChain, template_interval: Duration) -> Fi
     let p: SetNewPrevHash = binary_sv2::from_bytes(&mut f.payload).expect("decode");
     let tip = tc.chain.tip_header().expect("tip").block_hash();
 
-    let coinbase = solution_coinbase(
+    let mut coinbase = solution_coinbase(
         t.coinbase_prefix.as_ref(),
         t.coinbase_tx_value_remaining,
         t.coinbase_tx_outputs.as_ref(),
     );
+    coinbase.lock_time = LockTime::from_consensus(t.coinbase_tx_locktime);
+    coinbase.input[0].sequence = bitcoin::Sequence(t.coinbase_tx_input_sequence);
     let path: Vec<[u8; 32]> = t
         .merkle_path
         .iter()
@@ -603,6 +515,53 @@ async fn first_template_every(tc: &TestChain, template_interval: Duration) -> Fi
         header,
         coinbase: serialize(&coinbase),
     }
+}
+
+/// On a chain that enforces BIP 54 the template gives the miner the coinbase
+/// `nLockTime` and `nSequence` its block needs, and the block built from
+/// them becomes the tip. The regtest pad cannot mine such a chain, so the
+/// one block under the template is the hub's own, retimed.
+#[tokio::test(flavor = "multi_thread")]
+async fn bip54_template_timelocks_the_coinbase() {
+    let mut params = ChainParams::regtest();
+    params.enforce_bip54 = true;
+    let tc = padded_chain_with("sv2-bip54", 0, params);
+    let mut first = tc
+        .chain
+        .assemble_block_to_script(ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    first.txdata[0].input[0].sequence = bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF;
+    first.header.merkle_root = first.compute_merkle_root().unwrap();
+    rbitcoin_consensus::grind_regtest_pow(&mut first.header);
+    tc.chain.accept_block(first).expect("height 1");
+
+    let FirstTemplate {
+        tp,
+        mut c,
+        template_id,
+        version,
+        mut header,
+        coinbase,
+    } = first_template(&tc).await;
+    let timelocked: Transaction = bitcoin::consensus::deserialize(&coinbase).unwrap();
+    assert_eq!(timelocked.lock_time, LockTime::from_consensus(1));
+    assert_eq!(
+        timelocked.input[0].sequence,
+        bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF
+    );
+
+    rbitcoin_consensus::grind_regtest_pow(&mut header);
+    c.submit_solution(template_id, version, header.time, header.nonce, &coinbase)
+        .await
+        .unwrap();
+    let f = recv_in_time(&mut c).await;
+    assert_eq!(f.msg_type, MESSAGE_TYPE_NEW_TEMPLATE);
+    assert_eq!(tc.chain.tip_height(), Some(2));
+    assert_eq!(
+        tc.chain.tip_header().unwrap().block_hash(),
+        header.block_hash()
+    );
+    tp.shutdown().await;
 }
 
 /// A solution whose header misses the target is dropped before
@@ -770,21 +729,9 @@ async fn submit_solution_ahead_of_the_rolled_time_is_accepted() {
 async fn constraints_flood_closes_the_session() {
     let tc = shared_regtest(0);
     mock_live_tip(&tc);
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain: Arc::clone(&tc.chain),
-        authority_secret: [7; 32],
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout: SETUP_TIMEOUT,
-        idle_timeout: None,
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: FEE_DELTA,
-        template_interval: TEMPLATE_INTERVAL,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
-    })
-    .await
-    .expect("listen");
+    let tp = run_sv2_tp(test_tp_config(Arc::clone(&tc.chain), [7; 32]))
+        .await
+        .expect("listen");
     let mut c = TpClient::connect(tp.local_addr, tp.authority_pubkey)
         .await
         .expect("handshake");
@@ -824,21 +771,9 @@ async fn tip_event_rebuilds_a_template_built_on_its_prev_hash() {
         ScriptBuf::from_bytes(vec![OP_TRUE]),
     );
     tc.mempool.accept_tx(&paid).expect("mempool accept");
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain: Arc::clone(&tc.chain),
-        authority_secret: [7; 32],
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout: SETUP_TIMEOUT,
-        idle_timeout: None,
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: FEE_DELTA,
-        template_interval: TEMPLATE_INTERVAL,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
-    })
-    .await
-    .expect("listen");
+    let tp = run_sv2_tp(test_tp_config(Arc::clone(&tc.chain), [7; 32]))
+        .await
+        .expect("listen");
     let mut c = TpClient::connect(tp.local_addr, tp.authority_pubkey)
         .await
         .expect("handshake");
@@ -877,18 +812,10 @@ async fn silent_session_outlives_the_setup_timeout_and_gets_the_next_tip() {
     let tc = shared_regtest(1);
     mock_live_tip(&tc);
     let setup_timeout = Duration::from_millis(40);
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain: Arc::clone(&tc.chain),
-        authority_secret: [7; 32],
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout,
-        idle_timeout: None,
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: FEE_DELTA,
-        template_interval: TEMPLATE_INTERVAL,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
+    let tp = run_sv2_tp({
+        let mut cfg = test_tp_config(Arc::clone(&tc.chain), [7; 32]);
+        cfg.setup_timeout = setup_timeout;
+        cfg
     })
     .await
     .expect("listen");
@@ -974,18 +901,11 @@ async fn fee_push_after_the_interval_past_the_delta() {
     let tc = shared_regtest(3);
     mock_live_tip(&tc);
     let interval = Duration::from_millis(250);
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain: Arc::clone(&tc.chain),
-        authority_secret: [7; 32],
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout: SETUP_TIMEOUT,
-        idle_timeout: None,
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: 1_000,
-        template_interval: interval,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
+    let tp = run_sv2_tp({
+        let mut cfg = test_tp_config(Arc::clone(&tc.chain), [7; 32]);
+        cfg.fee_delta = 1_000;
+        cfg.template_interval = interval;
+        cfg
     })
     .await
     .expect("listen");
@@ -1159,18 +1079,10 @@ async fn fee_pushes_stay_an_interval_apart_under_steady_admission() {
     mock_live_tip(&tc);
 
     let interval = Duration::from_millis(250);
-    let tp = run_sv2_tp(Sv2TpConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        chain: Arc::clone(&tc.chain),
-        authority_secret: [7; 32],
-        cert_validity: Duration::from_secs(3600),
-        stale_grace: Duration::from_secs(10),
-        setup_timeout: SETUP_TIMEOUT,
-        idle_timeout: None,
-        write_timeout: WRITE_TIMEOUT,
-        fee_delta: FEE_DELTA,
-        template_interval: interval,
-        constraints_cooldown: CONSTRAINTS_COOLDOWN_TEST,
+    let tp = run_sv2_tp({
+        let mut cfg = test_tp_config(Arc::clone(&tc.chain), [7; 32]);
+        cfg.template_interval = interval;
+        cfg
     })
     .await
     .expect("listen");
@@ -1313,6 +1225,38 @@ fn template_time_holds_the_last_of_period_floor() {
         .expect("template");
     assert_eq!(built.prev_hash, prev.to_byte_array());
     assert_eq!(built.header_timestamp, first_time);
+}
+
+/// Core bitcoin/bitcoin#36192: with six blocks at the two-hour future limit
+/// the next block's floor is past it, so no template is built. One second
+/// later the template is stamped at the floor.
+#[test]
+fn template_holds_while_the_next_block_floor_is_past_the_future_limit() {
+    let tc = padded_chain_with("sv2-future-floor", 100, ChainParams::regtest());
+    let now = tc.tip_time + 100_000;
+    let limit = now + 7_200;
+    tc.chain.clock.set_mock(i64::from(now));
+    let mut prev = tc.chain.tip_header().expect("tip").block_hash();
+    for h in 101..=106u32 {
+        let block = mine_empty_regtest(prev, limit, h);
+        prev = block.block_hash();
+        assert_eq!(
+            tc.chain.accept_block(block).unwrap(),
+            rbitcoin_net::AcceptOutcome::Accepted { height: h }
+        );
+    }
+    let tip = tc.chain.query.tip_height().unwrap();
+    assert_eq!(median_time_past(&tc.chain.query, tip).unwrap(), limit);
+
+    let held = rbitcoin_sv2::template::build(&tc.chain, 0, 0).unwrap();
+    assert!(held.is_none(), "no template past the future limit");
+
+    tc.chain.clock.set_mock(i64::from(now + 1));
+    let built = rbitcoin_sv2::template::build(&tc.chain, 0, 0)
+        .unwrap()
+        .expect("template");
+    assert_eq!(built.prev_hash, prev.to_byte_array());
+    assert_eq!(built.header_timestamp, limit + 1);
 }
 
 /// Under `regtest_pow_bits_overlay` the template carries the overlay target,

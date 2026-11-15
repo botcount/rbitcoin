@@ -164,3 +164,29 @@ fn tx_head_mphf_unlinks_leftover_rel_and_bip30_mlt() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn mlt_reads_slot_rels_and_refuses_a_short_header() {
+    let dir = tmp("mlt-fields");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("base.mlt");
+    let mut m = std::collections::HashMap::new();
+    m.insert(0x0102_0304u32, vec![0x1111_1111u32, 0x2222_2222]);
+    write_mlt(&path, &m).unwrap();
+    let got = read_mlt(&path).unwrap();
+    assert_eq!(
+        got.get(&0x0102_0304).map(|v| v.as_slice()),
+        Some([0x1111_1111u32, 0x2222_2222].as_slice())
+    );
+    std::fs::write(&path, [1u8, 2, 3]).unwrap();
+    match read_mlt(&path) {
+        Err(StoreError::Corrupt(msg)) => assert!(msg.contains("short"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
+    std::fs::write(&path, 1u32.to_le_bytes()).unwrap();
+    match read_mlt(&path) {
+        Err(StoreError::Corrupt(msg)) => assert!(msg.contains("truncated"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

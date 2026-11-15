@@ -3,15 +3,11 @@ use rbitcoin_store::StoreError;
 use std::fmt;
 use std::path::PathBuf;
 
-/// Two-hour tip-time cap vs the node clock. Startup refuses a tip beyond this.
-pub const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
+/// Startup refuses a tip more than [`MAX_FUTURE_BLOCK_TIME`] past the node clock.
+pub use rbitcoin_consensus::{time_too_new as tip_too_far_in_future, MAX_FUTURE_BLOCK_TIME};
 
 /// Startup abort when the store tip is more than [`MAX_FUTURE_BLOCK_TIME`] ahead.
 pub const FUTURE_BLOCK_DB_MSG: &str = "Store tip time is more than two hours ahead of the node clock. Check the clock (or --mock-time). Wipe the datadir and redo IBD only if you are sure the clock is correct.";
-
-pub fn tip_too_far_in_future(tip_time: u32, now: u64) -> bool {
-    u64::from(tip_time) > now.saturating_add(MAX_FUTURE_BLOCK_TIME)
-}
 
 #[derive(Debug)]
 pub enum NodeError {

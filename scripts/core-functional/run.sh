@@ -115,11 +115,17 @@ sed \
   -e "s|@BUILDDIR@|${CORE_SRC}|g" \
   -e "s|@RPCAUTH@|${HERE}/rpcauth.py|g" \
   "$HERE/config.ini.template" >"$CONFIG_OUT"
+# Core's test framework loads BUILDDIR/test/with_sanitizer_env.py, which
+# Core's CMake renders from the .in beside it.
+if [[ -f "${CORE_SRC}/test/with_sanitizer_env.py.in" ]]; then
+  sed -e "s|@PROJECT_SOURCE_DIR@|${CORE_SRC}|g" \
+    "${CORE_SRC}/test/with_sanitizer_env.py.in" >"${CORE_SRC}/test/with_sanitizer_env.py"
+fi
 
 SHIM="${HERE}/bitcoind"
 # Dummy Core cache dirs so `_initialize_chain` does not remine 199 then
 # delete our store. Real blocks live in RBITCOIN_CACHE (our store/).
-# v32.1 test_runner always forwards its own temp --cachedir. Ours is last,
+# Core's test_runner always forwards its own temp --cachedir. Ours is last,
 # so the tests use the preseeded tree. There is no --keepcache flag.
 # --jobs 1: Core create_cache.py only runs when jobs>1; we still skip it.
 # --timeout-factor=4: one argv. test_runner treats a bare "4" as a test

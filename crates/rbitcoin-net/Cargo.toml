@@ -31,8 +31,8 @@ serde_json = { workspace = true }
 getrandom = "0.4"
 sha3 = "0.12"
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# POLLRDHUP: peer FIN with unread bytes still in the receive buffer.
+[target.'cfg(unix)'.dependencies]
+# Linux POLLRDHUP, and getrlimit for the listener descriptor reserve.
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
@@ -50,6 +50,14 @@ libc = "0.2"
 [[test]]
 name = "suite"
 path = "tests/suite.rs"
+
+[[test]]
+name = "finish_join"
+path = "tests/finish_join.rs"
+
+[[test]]
+name = "listener_fd"
+path = "tests/listener_fd.rs"
 
 [lints]
 workspace = true

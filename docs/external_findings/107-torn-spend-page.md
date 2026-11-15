@@ -1,9 +1,9 @@
 # 107 — A torn spend page below the durable marker stays
 
 **Severity:** medium
-**Status:** accepted
+**Status:** fixed
 **Found by:** bobberb and muse, 2026-10-18
 
-Spend annotate writes `spent.body` with a 4 KiB in-place read-modify-write. `spend_durable` advances about every 10 minutes after `sync_data`. Replay covers only heights above that marker. A torn page can zero a slot already below it. A zero slot reads as unspent, and replay does not heal it. [046](./046-spend-durability.md) fixed the kill-9 gap where the marker advanced without the data sync. This does not change the write path.
+Historical spend annotate inserts the 8-byte slot into a directory. It does not read or pwrite `spent.body`. The checkpoint rewrites `spend.pages` to the images still named, renames `spend.pages.commit`, and only then advances `spend_durable`. A tail image is shorter than 4 KiB. A zeroed body page below that marker stays spent while the commit exists. The next checkpoint folds a generation the previous one left quiet. Page 0's fold starts at byte 16 so the file header stays put. The short tail page is in that log. Replay still covers only `(A, tip]`. [046](./046-spend-durability.md) fixed the kill-9 gap where the marker advanced without the data sync.
 
-**Regression:** none. The limit is [crash recovery](../crash-recovery.md).
+**Regression:** `historical_page_stays_unwritten_until_spend_checkpoint`

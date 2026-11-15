@@ -239,6 +239,10 @@ fn assert_stderr_opened(text: &str, len: usize, digest: &str) {
 /// Loopback peers report the ASN from `{datadir}/ip_asn.dat`, then a relative
 /// `--asmap` of a lone return maps the same peer to ASN 1.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "binds 127.0.0.2 and .3; only Linux routes all of 127.0.0.0/8 on lo"
+)]
 async fn asmap_loopback_peers_report_their_asn() {
     let wall = llvm_cov_wall(20, 60);
     let fut = async {

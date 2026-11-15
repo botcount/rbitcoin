@@ -18,6 +18,8 @@ index (`tweaks_for_height`), not the scripthash index.
 
 Outpoint subscriptions stop at the same per-connection cap as scripthash
 subscriptions. Tip restatus looks up those outpoints off the connection task.
+A mempool accept looks up only the subscribed outpoints its announce lists,
+also off the connection task.
 
 **Regression:** `rbitcoin-query` `tests::sh_history_caps`,
 `rbitcoin-test` `electrum_scripthash_sub_cap_unsubscribe_frees_slot`,

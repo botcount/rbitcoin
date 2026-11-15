@@ -101,14 +101,14 @@ pub fn next_block_mintime(
     params: &ChainParams,
     tip: Height,
 ) -> Result<u32, ConfirmError> {
-    const MAX_TIMEWARP: u32 = 600;
+    use rbitcoin_consensus::header::MAX_TIMEWARP_BIP94;
     let mut mintime = median_time_past(query, tip)?.saturating_add(1);
     let height = tip.0 + 1;
     let interval = params.difficulty_adjustment_interval();
     if height.is_multiple_of(interval) {
         let (_fk, prev) =
             rbitcoin_consensus::block::require_linked_parent(query.header_at_height(tip)?)?;
-        mintime = mintime.max(prev.timestamp.saturating_sub(MAX_TIMEWARP));
+        mintime = mintime.max(prev.timestamp.saturating_sub(MAX_TIMEWARP_BIP94));
     }
     if interval > 1 && height % interval == interval - 1 {
         let first = Height(height + 1 - interval);
@@ -202,21 +202,19 @@ pub fn expected_next_bits(
     .map_err(ConfirmError::from)
 }
 
-/// Difficulty for the header at `height`, from the parent and the period start.
-///
-/// The header at `height - interval` when `height` is a retarget boundary.
-/// `None` off a boundary, without retargeting, or when that header is missing.
+/// The confirmed header at [`ChainParams::period_first_height`] for the
+/// header at `height`. `None` when that height reads none, or when the header
+/// is missing.
 pub fn period_first(
     query: &Query,
     params: &ChainParams,
     height: u32,
 ) -> Result<Option<PeriodFirst>, ConfirmError> {
-    let interval = params.difficulty_adjustment_interval();
-    if interval == 0 || !height.is_multiple_of(interval) || params.no_pow_retargeting() {
+    let Some(first_height) = params.period_first_height(height) else {
         return Ok(None);
-    }
+    };
     Ok(query
-        .header_at_height(Height(height - interval))?
+        .header_at_height(Height(first_height))?
         .map(|(_fk, first_rec)| PeriodFirst {
             time: first_rec.timestamp,
             bits: CompactTarget::from_consensus(first_rec.bits),

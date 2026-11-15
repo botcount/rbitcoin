@@ -203,6 +203,35 @@ EOF
 assert_fail_msg "no-prune requires analog" "missing analog: p2p_ping.py" \
   python3 "$CHECK" --tests-dir "$TESTS" --inventory "$WORKDIR/inv.toml"
 
+# --- node-behavior names its follow-up issue ---
+nb_inv() {
+  cat >"$1" <<EOF
+pin = "v31.1"
+core_commit = "9be056a8a72b624dae9623b2f7bded92c2a21c91"
+
+[[test]]
+name = "feature_help.py"
+status = "run"
+
+[[test]]
+name = "wallet_basic.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+name = "p2p_ping.py"
+status = "skip"
+reason = "node-behavior"
+analog = "$2"
+EOF
+}
+nb_inv "$WORKDIR/inv.toml" "follow-up: pong order"
+assert_fail_msg "node-behavior requires an issue" "node-behavior needs a #issue: p2p_ping.py" \
+  python3 "$CHECK" --tests-dir "$TESTS" --inventory "$WORKDIR/inv.toml"
+nb_inv "$WORKDIR/inv.toml" "#1483: pong order"
+assert_ok "node-behavior with an issue" \
+  python3 "$CHECK" --tests-dir "$TESTS" --inventory "$WORKDIR/inv.toml"
+
 # --- dangling core_analogs:: name ---
 cat >"$WORKDIR/inv.toml" <<'EOF'
 pin = "v31.1"

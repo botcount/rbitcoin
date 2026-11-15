@@ -158,3 +158,52 @@ fn scripthash_head_insert_many_full_without_rehash() {
     ));
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn sh_head_one_key_roundtrip() {
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-shhead-one-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(occ_sidecar_path(&path));
+    let h = ScriptHashHead::create_with_slots(&path, 64).unwrap();
+    let mut key = [0u8; 32];
+    key[0] = 3;
+    h.insert_many(&[
+        (key, ShHeadValue::inline_one(Fk(19))),
+        (key, ShHeadValue::inline_one(Fk(20))),
+    ])
+    .unwrap();
+    assert_eq!(
+        h.get(&key).unwrap().unwrap(),
+        ShHeadValue::inline_one(Fk(20))
+    );
+    assert_eq!(h.occupied(), 1);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(occ_sidecar_path(&path));
+}
+
+#[test]
+fn occ_sidecar_reads_the_count_and_ignores_short() {
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-shocc-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(occ_sidecar_path(&path));
+    store_occ_sidecar(&path, 17).unwrap();
+    assert_eq!(load_occ_sidecar(&path), Some(17));
+    std::fs::write(occ_sidecar_path(&path), b"SHOCC001").unwrap();
+    assert_eq!(load_occ_sidecar(&path), None);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(occ_sidecar_path(&path));
+}

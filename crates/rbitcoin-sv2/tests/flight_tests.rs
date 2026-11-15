@@ -22,6 +22,8 @@ fn dummy() -> Template {
     Template {
         version: 2,
         coinbase_prefix: Vec::new(),
+        coinbase_sequence: u32::MAX,
+        coinbase_locktime: 0,
         value_remaining: 50,
         coinbase_outputs: Vec::new(),
         merkle_path: Vec::new(),

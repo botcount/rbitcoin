@@ -1,0 +1,3 @@
+Added
+
+- **Totals above `--max-sh-creates` for a trusted local caller.** On the Esplora unix socket, `GET /internal/address/:address` and `GET /internal/scripthash/:hash` answer the same JSON, `?asof=`, and chain-tip headers as `/address/:address` and `/scripthash/:hash`, without the `--max-sh-creates` refusal. `--heavy-sh-creates` still runs them one at a time. TCP Esplora does not mount them, Electrum is unchanged, and the public routes on the socket keep the cap, so an explorer can read a large script's totals once without raising the cap for a public Electrum port. A probe for the route: an unused scripthash (64 zeros) is 200 with zero counters, and 404 on an older node.

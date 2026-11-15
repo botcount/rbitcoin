@@ -9,7 +9,7 @@ description: >-
 
 # Kill missed mutants since the last kill
 
-Proof and the delete-then-journey order:
+The kill order and the hand-edit proof:
 [`TESTING.md`](../../../TESTING.md) (What a mutant kill looks like).
 The cargo-mutants row there owns the night schedule, the backlog
 reset, and the cursor fields. Red / Green, and cargo log redirect:
@@ -76,9 +76,9 @@ The `rev-list` count is how many commits `origin/master` is ahead of
 Walk each `MISSED` line in the batch on the current tree. The kill order and the hand-edit proof are in `TESTING.md`. Two batch rules sit on top of that:
 
 - **Already gone.** The operator text is not in the file. Record it. No edit.
-- A compile error is not a kill. Never `#[mutants::skip]`.
+- A compile error is not a kill. `#[mutants::skip]` only with the reason [`TESTING.md`](../../../TESTING.md) already requires on the attribute.
 
-Group operators one journey kills into one slice. Prove each operator.
+Group operators one test kills into one slice. Prove each operator.
 
 ## Ship
 

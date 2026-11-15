@@ -376,6 +376,27 @@ impl Query {
         })
     }
 
+    /// Stored body on the active chain or disconnected by this process.
+    ///
+    /// An archived span alone does not prove a successful connection. A
+    /// restart forgets disconnected membership, so reopened stale bodies
+    /// are not admitted by this read contract.
+    pub fn connected_block_header(
+        &self,
+        hash: &[u8; 32],
+    ) -> Result<Option<(Fk, HeaderRecord)>, QueryError> {
+        let Some((fk, rec)) = self.get_header_by_hash(hash)? else {
+            return Ok(None);
+        };
+        if self.store.header_txs.get_range(fk)?.is_none() {
+            return Ok(None);
+        }
+        if self.confirmed_height_of_hash(hash)?.is_none() && !self.was_disconnected(hash) {
+            return Ok(None);
+        }
+        Ok(Some((fk, rec)))
+    }
+
     pub fn height_of_hash(&self, hash: &[u8; 32]) -> Result<Option<Height>, QueryError> {
         let Some(tip) = self.tip_height() else {
             return Ok(None);

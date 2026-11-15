@@ -159,6 +159,9 @@ pub fn read_cookie_file(path: &Path, perms: RpcCookiePerms) -> Result<RpcCookie,
 }
 
 /// Read an existing token or write a new CSPRNG token (mode 0600).
+///
+/// A zero-length file holds no secret. An older node left one when it crashed
+/// between creating and writing the token, so it is replaced like a missing file.
 pub fn resolve_rpc_auth(
     datadir: &Path,
     token_path: Option<&Path>,
@@ -166,9 +169,14 @@ pub fn resolve_rpc_auth(
     let path = token_path
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| default_token_path(datadir));
-    if path.is_file() {
-        let auth = read_token_file(&path)?;
-        return Ok((auth, path));
+    match fs::metadata(&path) {
+        Ok(meta) if meta.is_file() && meta.len() > 0 => {
+            let auth = read_token_file(&path)?;
+            return Ok((auth, path));
+        }
+        Ok(meta) if meta.is_file() => fs::remove_file(&path)
+            .map_err(|e| format!("remove empty token {}: {e}", path.display()))?,
+        _ => {}
     }
     let auth = write_token_file(&path)?;
     Ok((auth, path))
@@ -205,11 +213,26 @@ pub fn read_token_file(path: &Path) -> Result<RpcAuth, String> {
     Ok(RpcAuth::new(token))
 }
 
+/// Write a new token to `path`, which must not exist.
+///
+/// A crash before the rename leaves only `rpc.token.tmp`, which the next
+/// write removes.
 pub fn write_token_file(path: &Path) -> Result<RpcAuth, String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("token parent: {e}"))?;
-    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent).map_err(|e| format!("token parent: {e}"))?;
     let auth = RpcAuth::new(random_token());
+    // Stage the whole token, then rename it into place, so a crash leaves no
+    // token or the full token, never a prefix that later starts accept.
+    let staged = rbitcoin_store::file::tmp_sidecar_path(path);
+    match fs::remove_file(&staged) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("remove stale token {}: {e}", staged.display()));
+        }
+        _ => {}
+    }
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -217,35 +240,47 @@ pub fn write_token_file(path: &Path) -> Result<RpcAuth, String> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(path).map_err(|e| format!("token create: {e}"))?;
-    f.write_all(auth.token.as_bytes())
-        .map_err(|e| format!("token write: {e}"))?;
-    f.sync_all().map_err(|e| format!("token sync: {e}"))?;
+    let mut f = opts
+        .open(&staged)
+        .map_err(|e| format!("token create: {e}"))?;
+    let written = f
+        .write_all(auth.token.as_bytes())
+        .map_err(|e| format!("token write: {e}"))
+        .and_then(|()| f.sync_all().map_err(|e| format!("token sync: {e}")));
+    drop(f);
+    // A rename replaces an existing name, so refuse one first. The datadir
+    // lock keeps a second node out of the gap before the rename.
+    let published = written
+        .and_then(|()| match fs::symlink_metadata(path) {
+            Ok(_) => Err(format!("token create: {} exists", path.display())),
+            Err(_) => Ok(()),
+        })
+        .and_then(|()| fs::rename(&staged, path).map_err(|e| format!("token create: {e}")));
+    if let Err(e) = published {
+        let _ = fs::remove_file(&staged);
+        return Err(e);
+    }
+    rbitcoin_store::file::fsync_parent_dir(parent).map_err(|e| format!("token dir sync: {e}"))?;
     Ok(auth)
+}
+
+/// Split `Authorization: <scheme> <credentials>` when the scheme matches in any case (RFC 9110).
+fn auth_credentials<'a>(header: &'a str, scheme: &str) -> Option<&'a str> {
+    let (got, credentials) = header.trim().split_once(' ')?;
+    let credentials = credentials.trim();
+    (got.eq_ignore_ascii_case(scheme) && !credentials.is_empty()).then_some(credentials)
 }
 
 /// Parse `Authorization: Bearer …`.
 pub fn parse_bearer_auth(header: &str) -> Option<&str> {
-    let header = header.trim();
-    header
-        .strip_prefix("Bearer ")
-        .or_else(|| header.strip_prefix("bearer "))
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
+    auth_credentials(header, "Bearer")
 }
 
 /// Decode `Authorization: Basic …` into Core cookie credentials.
 pub fn parse_basic_auth(header: &str) -> Option<String> {
     use base64::Engine;
 
-    let encoded = header
-        .trim()
-        .strip_prefix("Basic ")
-        .or_else(|| header.trim().strip_prefix("basic "))?
-        .trim();
-    if encoded.is_empty() {
-        return None;
-    }
+    let encoded = auth_credentials(header, "Basic")?;
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .ok()?;

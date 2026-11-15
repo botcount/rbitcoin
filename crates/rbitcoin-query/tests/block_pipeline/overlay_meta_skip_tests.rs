@@ -17,7 +17,7 @@ fn overlay_meta_skip_omits_matching_abs() {
     assert_eq!(run.create(Fk(10)), Some((5, false)));
     let spends = spends(&[(0, Fk(11), Fk(10), 0)]);
     let mut scratch = StructuralScratch::default();
-    fill_overlay_skip(&spends, &wave, &mut scratch);
+    fill_overlay_skip(&spends, &wave, &mut scratch.skip);
     assert!(overlay_meta_is_skip(10, 0, Fk(11), 0, &scratch.skip));
     assert!(!overlay_meta_is_skip(10, 0, Fk(11), 1, &scratch.skip));
     assert!(!overlay_meta_is_skip(10, 1, Fk(11), 0, &scratch.skip));
@@ -37,7 +37,7 @@ fn overlay_meta_skip_keeps_conflicting_spender_on_disk_list() {
         (0, Fk(13), Fk(10), 1),
     ]);
     let mut scratch = StructuralScratch::default();
-    fill_overlay_skip(&spends, &wave, &mut scratch);
+    fill_overlay_skip(&spends, &wave, &mut scratch.skip);
     assert!(!overlay_meta_is_skip(10, 0, Fk(11), 0, &scratch.skip));
     assert!(!overlay_meta_is_skip(10, 0, Fk(12), 0, &scratch.skip));
     assert!(!overlay_meta_is_skip(10, 0, Fk(13), 1, &scratch.skip));
@@ -48,6 +48,6 @@ fn overlay_meta_skip_historical_create_stays_on_disk() {
     let wave = ClassAWave::default();
     let spends = spends(&[(0, Fk(11), Fk(10), 0)]);
     let mut scratch = StructuralScratch::default();
-    fill_overlay_skip(&spends, &wave, &mut scratch);
+    fill_overlay_skip(&spends, &wave, &mut scratch.skip);
     assert!(!overlay_meta_is_skip(10, 0, Fk(11), 0, &scratch.skip));
 }

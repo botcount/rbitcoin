@@ -8,7 +8,7 @@ use rbitcoin_net::chain::*;
 use rbitcoin_net::error::NetError;
 use rbitcoin_net::most_work::work_better;
 use rbitcoin_primitives::{Fk, Height};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -60,18 +60,26 @@ fn generate_commit_pad() -> &'static rbitcoin_query::testutil::TempDir {
     PAD.get_or_init(|| {
         let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("generate-commit-pad");
         hub.ensure_genesis().unwrap();
-        hub.generate_to_script(101, ScriptBuf::from_bytes(vec![0x51]), vec![])
-            .unwrap();
+        hub.confirm_empty_regtest(101).unwrap();
         hub.query.flush().expect("flush generate-commit pad");
         dir
     })
 }
 
 fn open_generate_commit_hub(label: &str) -> (rbitcoin_query::testutil::TempDir, ChainHub) {
+    open_generate_commit_hub_with(label, ChainParams::regtest())
+}
+
+/// A private copy of the pad under `params`, which must accept the pad as
+/// its own chain. Rules `params` adds bind the blocks mined on top.
+fn open_generate_commit_hub_with(
+    label: &str,
+    params: ChainParams,
+) -> (rbitcoin_query::testutil::TempDir, ChainHub) {
     let dir = rbitcoin_query::testutil::TempDir::labeled(label).expect(label);
     rbitcoin_store::testutil::copy_store_tree(generate_commit_pad().path(), dir.path());
     let q = rbitcoin_query::Query::open_or_create_tiny(dir.path()).expect("open generate copy");
-    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    let hub = ChainHub::new(q, params, Milestone::NONE);
     (dir, hub)
 }
 
@@ -105,6 +113,12 @@ fn two_threads_claiming_one_block_produce_one_ask() {
     assert_eq!(wins, 1, "one claim wins the ask");
     assert!(hub.already_have_or_asked_block(&hash));
     assert!(!hub.claim_block_ask(&hash), "the loser stays a loser");
+    let other = BlockHash::from_byte_array([0x42; 32]);
+    assert!(hub.claim_block_ask(&other), "a second hash is a new ask");
+    assert!(
+        hub.already_have_or_asked_block(&hash),
+        "the first ask stays in flight"
+    );
 }
 
 /// A full `block.invalid` drops its oldest hash for a new failure, so the
@@ -136,6 +150,28 @@ fn a_full_invalid_file_keeps_the_newest_failure() {
     assert!(
         !kept.windows(32).any(|w| w == &full[12..44]),
         "the oldest one gives way"
+    );
+
+    drop(hub);
+    let mut over = b"rbtcinv1".to_vec();
+    over.extend_from_slice(&4_097u32.to_le_bytes());
+    for i in 0..4_097u32 {
+        let mut raw = [0u8; 32];
+        raw[..4].copy_from_slice(&i.to_le_bytes());
+        raw[31] = 0xcc;
+        over.extend_from_slice(&raw);
+    }
+    std::fs::write(&marks, &over).unwrap();
+    let q = rbitcoin_query::Query::open_or_create_tiny(dir.path()).unwrap();
+    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    let first = BlockHash::from_byte_array({
+        let mut raw = [0u8; 32];
+        raw[31] = 0xcc;
+        raw
+    });
+    assert!(
+        !hub.is_block_invalid(&first),
+        "a count past the cap does not parse"
     );
 }
 
@@ -345,7 +381,7 @@ fn latest_run_chain_surfaces() {
         1,
         &[store_tip, child.block_hash()],
     );
-    hub.cache.push_best(stale.clone()).unwrap();
+    hub.cache.push_best(1, stale.clone());
     let mut stale_tip = stale;
     for n in 2..=store_h {
         stale_tip = mine(
@@ -353,7 +389,7 @@ fn latest_run_chain_surfaces() {
             genesis.header.time.saturating_add(9 + n),
             n,
         );
-        hub.cache.push_best(stale_tip.clone()).unwrap();
+        hub.cache.push_best(n, stale_tip.clone());
     }
     assert_eq!(hub.cache.tip_height(), Some(store_h));
     assert_eq!(hub.query.tip_height().map(|h| h.0), Some(store_h));
@@ -373,7 +409,7 @@ fn latest_run_chain_surfaces() {
         genesis.header.time.saturating_add(40),
         store_h + 1,
     );
-    hub.cache.push_best(ahead.clone()).unwrap();
+    hub.cache.push_best(store_h + 1, ahead.clone());
     assert!(hub.cache.tip_height().unwrap() > store_h);
     assert_eq!(
         hub.tip_hash(),
@@ -552,8 +588,7 @@ fn conflicting_mempool_spend_leaves_with_the_block() {
     let (dir, hub) = tmp_hub();
     hub.ensure_genesis().unwrap();
     let mp = attach_mp(dir.path(), &hub);
-    hub.generate_to_script(101, ScriptBuf::from_bytes(vec![0x51]), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(101).unwrap();
     let cb = hub
         .query
         .reconstruct_block_at_height(Height(1))
@@ -737,8 +772,7 @@ async fn confirmed_private_broadcast_is_not_sent_again_before_the_pool_is_mainta
             .unwrap();
     assert!(hub.attach_mempool(Arc::clone(&mp)).is_ok());
     mp.set_isolated_broadcast(true);
-    hub.generate_to_script(101, ScriptBuf::from_bytes(vec![0x51]), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(101).unwrap();
     let local = mature_spend_tx(&hub, 1);
     let txid = local.compute_txid();
     mp.accept_tx_from(&local, rbitcoin_net::TxOrigin::Local)
@@ -885,7 +919,7 @@ fn chain_hub_prefill_and_version() {
     );
 
     // `feature_dersig.py`: from 102 a version-2 block is `bad-version`.
-    hub.generate_to_script(97, op_true(), vec![]).unwrap();
+    hub.confirm_empty_regtest(97).unwrap();
     assert_eq!(hub.tip_height(), Some(101));
     let bad_version = |height: u32, version: i32| {
         let prev = hub.tip_hash().unwrap();
@@ -1256,8 +1290,7 @@ fn linux_thread_comms() -> Vec<String> {
 #[test]
 fn tip_accept_script_jobs_use_steal_pool() {
     let (dir, hub) = tmp_hub();
-    hub.generate_to_script(101, ScriptBuf::from_bytes(vec![0x51]), vec![])
-        .expect("mature coinbases");
+    hub.confirm_empty_regtest(101).expect("mature coinbases");
     let cb1 = hub.block_at_height(1).unwrap().unwrap().txdata[0].compute_txid();
     let cb2 = hub.block_at_height(2).unwrap().unwrap().txdata[0].compute_txid();
     let spend = |txid, value| Transaction {
@@ -1396,8 +1429,7 @@ fn fresh_tip_accept_maintains_pool_without_peer_relay() {
     );
     // Coinbase at height 1 matures once the tip reaches 101. Those blocks
     // are still inside the pack, with relay off, and must strip.
-    hub.generate_to_script(100, ScriptBuf::from_bytes(vec![0x51]), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(100).unwrap();
     assert!(!mp.relay_enabled());
     let spend = mature_spend_tx(&hub, 1);
     let txid = spend.compute_txid();
@@ -1439,8 +1471,7 @@ fn bulk_confirm_strips_once_the_pool_is_maintained() {
     hub.accept_block(mine(gen, now, 1)).unwrap();
     assert!(mp.pool_maintained());
     assert!(!mp.relay_enabled());
-    hub.generate_to_script(100, ScriptBuf::from_bytes(vec![0x51]), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(100).unwrap();
     let spend = mature_spend_tx(&hub, 1);
     let txid = spend.compute_txid();
     mp.accept_tx(&spend).expect("mature coinbase spend");
@@ -1858,8 +1889,10 @@ fn min_diff_limit_starts_after_two_spacings_and_walks_back() {
                 .saturating_add((spacing as u32 / 2).saturating_mul(height))
         };
         let probe = Header { time, ..parent };
+        let none = HashMap::new();
+        let first = hub.period_first_off_tip(&parent, height - 1, &none);
         let bits = hub
-            .expected_bits_off_tip(&probe, &parent, height - 1, &HashMap::new())
+            .expected_bits_off_tip(&probe, &parent, height - 1, first, &none)
             .unwrap();
         let mut block = mine(prev.block_hash(), time, height);
         block.header.bits = bits;
@@ -1962,27 +1995,192 @@ fn confirmed_seed_does_not_restore_a_disconnected_block() {
     hub.ensure_genesis().unwrap();
     let mut prev = hub.tip_hash().unwrap();
     let mut time = hub.tip_header().unwrap().time;
+    let mut gone = Vec::new();
     for h in 1..=3u32 {
         time = time.saturating_add(1);
         let b = mine(prev, time, h);
         prev = b.block_hash();
+        gone.push(prev);
         hub.accept_block(b).unwrap();
     }
-    let gone = prev;
     hub.rewind_to_height(0).unwrap();
-    assert!(
-        !hub.has_block(&gone),
-        "rewind drops the disconnected tip from the confirmed set"
-    );
+    for (h, hash) in (1u32..).zip(&gone) {
+        assert!(
+            !hub.has_block(hash),
+            "rewind drops disconnected height {h} from the confirmed set"
+        );
+    }
     publish_confirmed_heights(&hub.query, &hub.confirmed);
-    assert!(
-        !hub.has_block(&gone),
-        "the seed copy must not put that block back"
-    );
+    for (h, hash) in (1u32..).zip(&gone) {
+        assert!(
+            !hub.has_block(hash),
+            "the seed copy must not put height {h} back"
+        );
+    }
     assert!(
         hub.has_block(&genesis_block(&hub.params).block_hash()),
         "genesis is still the header at height 0"
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Drop the hub and open a new one on the same store, as a node restart does
+/// (`run.rs` sets prune on the query before the hub is built).
+fn restart_hub(dir: &rbitcoin_query::testutil::TempDir, hub: ChainHub) -> ChainHub {
+    let prune = hub.query.prune_seqsigwit();
+    hub.query.flush().unwrap();
+    drop(hub);
+    let q = rbitcoin_query::Query::open_or_create_tiny(dir.path()).unwrap();
+    q.set_prune_seqsigwit(prune).unwrap();
+    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    hub
+}
+
+/// Tip A1, B1+B2 reorg away from it, then the heavier A2+A3 with A1 resent
+/// by a peer. `prune` is `--prune-seqsigwit`; `restart` reopens the store
+/// before A1 arrives. True when the node ends on A3.
+fn reorg_back_reaches_a3(label: &str, prune: bool, restart: bool) -> bool {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled(label);
+    hub.query.set_prune_seqsigwit(prune).unwrap();
+    hub.ensure_genesis().unwrap();
+    let mut prev = hub.tip_hash().unwrap();
+    let mut time = hub.tip_header().unwrap().time;
+    for h in 1..=2u32 {
+        time += 1;
+        let b = mine(prev, time, h);
+        prev = b.block_hash();
+        hub.accept_block(b).unwrap();
+    }
+    let hub = if restart { restart_hub(&dir, hub) } else { hub };
+    let a1 = mine(prev, time + 1, 3);
+    let b1 = mine(prev, time + 2, 3);
+    let b2 = mine(b1.block_hash(), time + 3, 4);
+    let a2 = mine(a1.block_hash(), time + 4, 4);
+    let a3 = mine(a2.block_hash(), time + 5, 5);
+    let (a1h, a3h) = (a1.block_hash(), a3.block_hash());
+    hub.accept_received_block(a1.clone()).unwrap();
+    let _ = hub.accept_received_block(b1);
+    hub.accept_received_block(b2.clone()).unwrap();
+    assert_eq!(hub.tip_hash(), Some(b2.block_hash()), "B2 is the tip");
+    assert!(
+        !hub.already_have(a1h),
+        "a disconnected block is not one we already have"
+    );
+    let _ = hub.accept_received_block(a2);
+    let _ = hub.accept_received_block(a3);
+    if hub.tip_hash() != Some(a3h) {
+        // The archive could not rebuild A1. The node asks for it and the
+        // peer session takes the resent body.
+        assert!(prune && hub.held_missing_parents().contains(&a1h));
+        let mut follow = rbitcoin_net::peer::PeerFollowState::new();
+        follow.requested_blocks.insert(a1h);
+        hub.note_asked_block(a1h);
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(rbitcoin_net::peer::on_block(
+            &hub,
+            &out_tx,
+            &mut follow,
+            None,
+            &a1,
+        ))
+        .unwrap();
+    }
+    let on_a3 = hub.tip_hash() == Some(a3h);
+    drop(hub);
+    let _ = std::fs::remove_dir_all(dir);
+    on_a3
+}
+
+/// Core keeps the last 288 bodies on a pruned node and reads A1 from disk in
+/// `ConnectTip`. A pruned node that restarted must still reorg back onto A3.
+#[test]
+fn reorg_back_pruned_after_restart_reaches_the_heavier_branch() {
+    assert!(reorg_back_reaches_a3("reorg-back-prune-reopen", true, true));
+}
+
+#[test]
+fn reorg_back_control_unpruned_after_restart() {
+    assert!(reorg_back_reaches_a3(
+        "reorg-back-noprune-reopen",
+        false,
+        true
+    ));
+}
+
+#[test]
+fn reorg_back_control_pruned_without_restart() {
+    assert!(reorg_back_reaches_a3("reorg-back-prune-fresh", true, false));
+}
+
+#[test]
+fn reorg_back_control_unpruned_without_restart() {
+    assert!(reorg_back_reaches_a3(
+        "reorg-back-noprune-fresh",
+        false,
+        false
+    ));
+}
+
+/// After a restart the RAM cache starts at the first block connected, not at
+/// genesis. A height read still returns the store's block at that height.
+#[test]
+fn block_at_height_after_restart_is_the_block_at_that_height() {
+    let (dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("bah-reopen");
+    hub.ensure_genesis().unwrap();
+    let mut hashes = vec![hub.tip_hash().unwrap()];
+    let mut time = hub.tip_header().unwrap().time;
+    for h in 1..=4u32 {
+        if h == 3 {
+            hub = restart_hub(&dir, hub);
+        }
+        time += 1;
+        let b = mine(*hashes.last().unwrap(), time, h);
+        hashes.push(b.block_hash());
+        hub.accept_block(b).unwrap();
+    }
+    for (h, want) in (0u32..).zip(&hashes) {
+        let got = hub.block_at_height(h).unwrap().map(|b| b.block_hash());
+        assert_eq!(got, Some(*want), "block_at_height({h})");
+    }
+    drop(hub);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A disconnect that fails after the store tip dropped still trims the cache
+/// to the store tip, so the block it took off is not "already have".
+#[test]
+fn failed_disconnect_after_the_tip_drops_trims_the_cache() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let mut prev = hub.tip_hash().unwrap();
+    let mut time = hub.tip_header().unwrap().time;
+    for h in 1..=3u32 {
+        time += 1;
+        let b = mine(prev, time, h);
+        prev = b.block_hash();
+        hub.accept_block(b).unwrap();
+    }
+    let top = prev;
+    hub.query
+        .store()
+        .confirmed
+        .set_raw_for_test(&rbitcoin_store::ClassCWrite::for_test(), Height(2), 0)
+        .unwrap();
+    let err = hub.rewind_to_height(1).unwrap_err();
+    assert!(err.to_string().contains("no header"), "{err}");
+    assert_eq!(
+        hub.query.tip_height(),
+        Some(Height(2)),
+        "the store tip dropped"
+    );
+    assert_eq!(hub.cache.tip_height(), Some(2));
+    assert_ne!(hub.tip_hash(), Some(top));
+    assert!(!hub.already_have(top));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -2022,11 +2220,11 @@ fn disconnect_to_without_mempool_skips_block_at_height() {
     let b1 = mine(gen, 1_300_040_000, 1);
     hub.accept_block(b1).unwrap();
     assert!(hub.mempool().is_none());
-    hub.reset_block_at_height_calls();
+    let before = hub.block_at_height_calls();
     hub.rewind_to_height(0).unwrap();
     assert_eq!(
         hub.block_at_height_calls(),
-        0,
+        before,
         "IBD disconnect must not reconstruct the losing branch"
     );
     assert_eq!(hub.tip_height(), Some(0));
@@ -2043,10 +2241,10 @@ fn disconnect_to_with_mempool_still_harvests() {
     let mp =
         rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
     assert!(hub.attach_mempool(mp).is_ok());
-    hub.reset_block_at_height_calls();
+    let before = hub.block_at_height_calls();
     hub.rewind_to_height(0).unwrap();
     assert!(
-        hub.block_at_height_calls() >= 1,
+        hub.block_at_height_calls() > before,
         "tip-mode reorg still reconstructs for reorg_reaccept"
     );
     assert_eq!(hub.tip_height(), Some(0));
@@ -2097,6 +2295,8 @@ fn reorg_pad() -> ReorgPad {
     let gen = hub.tip_hash().unwrap();
     hub.accept_block(mine(gen, hub.clock.now_secs() as u32, 1))
         .unwrap();
+    // Per-block accept. The fault test truncates `txout.body` by half and
+    // relies on Class A appending one height at a time.
     hub.generate_to_script(100, ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let fork = hub.tip_height().unwrap();
@@ -2177,12 +2377,13 @@ fn branch_reorg_tip_events_follow_the_reaccept() {
     let child = pad.child.compute_txid();
     let seen = std::thread::spawn(move || {
         let ev = tips.blocking_recv().expect("tip event");
-        (ev.height, mp.contains(&child))
+        (ev.height, ev.reorg_branch_len, mp.contains(&child))
     });
     let branch = pad_branch(&pad, vec![vec![], vec![], vec![]]);
     pad.hub.accept_branch(&arcs(&branch)).unwrap();
-    let (height, back) = seen.join().unwrap();
+    let (height, reorg_len, back) = seen.join().unwrap();
     assert_eq!(height, pad.fork + 1);
+    assert_eq!(reorg_len, 1, "the first connected block is branch length 1");
     assert!(back, "the child is back before the first tip event");
     let _ = std::fs::remove_dir_all(pad.dir);
 }
@@ -2462,7 +2663,7 @@ fn ensure_header_fork_child_rejects_old_time_and_wrong_bits() {
     let mtp = hub.mtp_off_tip(&b1.header, &empty);
     assert!(mtp <= b1.header.time);
     let child_bits = hub
-        .expected_bits_off_tip(&h2, &b1.header, 1, &empty)
+        .expected_bits_off_tip(&h2, &b1.header, 1, None, &empty)
         .unwrap();
     assert_eq!(child_bits, b1.header.bits);
     let mut far_bits = h2;
@@ -2665,6 +2866,7 @@ fn chain_work_error_leaves_prefix_empty() {
     hub.ensure_genesis().unwrap();
     let b1 = mine(hub.tip_hash().unwrap(), 1_300_000_000, 1);
     hub.accept_block(b1).unwrap();
+    assert!(hub.chain_work().is_ok());
     hub.test_clear_chain_work_prefix();
     hub.query
         .store()
@@ -3010,8 +3212,9 @@ fn header_batch_min_diff_matches_the_unremembered_walk() {
             prev_blockhash: parent.block_hash(),
             ..parent
         };
+        let first = hub.period_first_off_tip(&parent, height - 1, &batch);
         let bits = hub
-            .expected_bits_off_tip(&probe, &parent, height - 1, &batch)
+            .expected_bits_off_tip(&probe, &parent, height - 1, first, &batch)
             .unwrap_or_else(|e| panic!("height {height}: {e}"));
         let mut header = probe;
         header.version = mine(prev.block_hash(), time, height).header.version;
@@ -3123,9 +3326,57 @@ fn submit_header_child_is_headers_only_tip() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// `prev_of` names the parent of genesis, a best-chain block, a disconnected
+/// once-confirmed block, a header-only tip, and a held side body without
+/// rebuilding any archived block.
+#[test]
+fn prev_of_reads_parent_without_archive_rebuild() {
+    let (_dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let b1 = mine(gen, 1_300_031_000, 1);
+    hub.accept_block(b1.clone()).unwrap();
+    let b2 = mine(b1.block_hash(), 1_300_031_100, 2);
+    hub.accept_block(b2.clone()).unwrap();
+    let child = mine(b2.block_hash(), 1_300_031_200, 3);
+    hub.ensure_header(&child.header).unwrap();
+    let side = mine(gen, 1_300_031_300, 1);
+    hub.hold_body(Arc::new(side.clone()), false);
+    assert!(hub.held_body(&side.block_hash()).is_some());
+    hub.query.sample_reset_reconstruct_archived();
+
+    let zero = BlockHash::from_byte_array([0u8; 32]);
+    assert_eq!(hub.prev_of(&gen), Some(zero), "genesis");
+    assert_eq!(hub.prev_of(&b1.block_hash()), Some(gen), "genesis child");
+    assert_eq!(
+        hub.prev_of(&b2.block_hash()),
+        Some(b1.block_hash()),
+        "best chain"
+    );
+    assert_eq!(
+        hub.prev_of(&child.block_hash()),
+        Some(b2.block_hash()),
+        "header-only tip"
+    );
+    assert_eq!(hub.prev_of(&side.block_hash()), Some(gen), "held side body");
+    assert_eq!(
+        hub.prev_of(&BlockHash::from_byte_array([7u8; 32])),
+        None,
+        "unknown hash"
+    );
+    assert_eq!(hub.query.sample_reset_reconstruct_archived(), 0);
+    hub.invalidate_block(b2.block_hash()).unwrap();
+    hub.query.sample_reset_reconstruct_archived();
+    assert_eq!(
+        hub.prev_of(&b2.block_hash()),
+        Some(b1.block_hash()),
+        "disconnected once-confirmed block"
+    );
+    assert_eq!(hub.query.sample_reset_reconstruct_archived(), 0);
+}
+
 /// `best_header_height` and `chaintips` walk ancestry through `prev_of`,
-/// which read-locks `header_tips` and (via `load_side_body`)
-/// `held_bodies`. std's `RwLock` refuses a new reader while a writer
+/// which read-locks `header_tips` and (via `held_body`) `held_bodies`. std's `RwLock` refuses a new reader while a writer
 /// waits, so a walk that holds one of those guards deadlocks against a
 /// writer: the writer waits for the held read, and the walk's second read
 /// waits for the writer.
@@ -3455,7 +3706,7 @@ fn invalidate_evicts_immature_coinbase_spend() {
     let (dir, hub) = tmp_hub();
     hub.ensure_genesis().unwrap();
     let hashes = hub
-        .generate_to_script(103, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .confirm_empty_regtest(103)
         .expect("pad to mature coinbase");
     assert_eq!(hashes.len(), 103);
     assert_eq!(hub.tip_height(), Some(103));
@@ -4028,6 +4279,37 @@ fn side_branch_with_bad_tip(
 }
 
 #[test]
+fn unrecorded_side_walk_stops_past_the_cap() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let genesis = hub.tip_hash().expect("genesis");
+    struct RestoreWalkCap(u32);
+    impl Drop for RestoreWalkCap {
+        fn drop(&mut self) {
+            set_unrecorded_walk_cap(self.0);
+        }
+    }
+    let _restore = RestoreWalkCap(set_unrecorded_walk_cap(3));
+    let b1 = mine(genesis, 1_300_080_000, 1);
+    let b2 = mine(b1.block_hash(), b1.header.time + 600, 2);
+    let b3 = mine(b2.block_hash(), b2.header.time + 600, 3);
+    let b4 = mine(b3.block_hash(), b3.header.time + 600, 4);
+    for block in [&b1, &b2, &b3, &b4] {
+        hub.hold_body(Arc::new(block.clone()), false);
+    }
+    let three = hub
+        .assemble_side_branch(b3.block_hash(), &HashSet::new())
+        .expect("three unrecorded headers stay under the cap");
+    assert_eq!(three.len(), 3);
+    assert!(
+        hub.assemble_side_branch(b4.block_hash(), &HashSet::new())
+            .is_none(),
+        "the fourth unrecorded header stops the walk"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn failed_branch_tip_keeps_the_heavier_valid_prefix() {
     let (dir, hub) = tmp_hub();
     hub.ensure_genesis().unwrap();
@@ -4308,6 +4590,55 @@ fn store_fault_on_tip_connect_does_not_cache_block_invalid() {
     );
     assert_eq!(hub.tip_hash(), Some(t2.block_hash()));
 
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Equal-height accept parks before the branch attempt. A store fault must
+/// drop a hold this call just created. A hold that was already there stays.
+/// An equal-work loser stays parked.
+#[test]
+fn equal_height_store_fault_drops_only_a_fresh_hold() {
+    let (dir, hub, b1, t2) = hub_with_truncated_body();
+    let rival = spend_block(b1.block_hash(), t2.header.time + 1, 2, coinbase_out(&b1));
+    let hash = rival.block_hash();
+    *hub.precious.write().unwrap() = Some(hash);
+    let err = hub
+        .accept_received_block(rival.clone())
+        .expect_err("truncated txout on the equal-height reorg");
+    assert!(matches!(err, NetError::Store(_)), "{err:?}");
+    assert!(
+        hub.held_body(&hash).is_none(),
+        "a fresh equal-height hold must not survive a store fault"
+    );
+    assert!(!hub.is_block_invalid(&hash));
+
+    hub.hold_body(Arc::new(rival.clone()), false);
+    let err = hub
+        .accept_received_block(rival)
+        .expect_err("the same fault with a hold that was already there");
+    assert!(matches!(err, NetError::Store(_)), "{err:?}");
+    assert!(
+        hub.held_body(&hash).is_some(),
+        "a hold from an earlier call stays across the store fault"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let genesis = hub.tip_hash().unwrap();
+    let tip = mine(genesis, 1_300_080_000, 1);
+    hub.accept_block(tip.clone()).unwrap();
+    let loser = mine_distinct(genesis, tip.header.time + 1, 1, &[tip.block_hash()]);
+    let loser_hash = loser.block_hash();
+    let out = hub.accept_received_block(loser).unwrap();
+    assert!(
+        matches!(out, AcceptOutcome::IgnoredWeaker),
+        "equal work without precious stays a loser: {out:?}"
+    );
+    assert!(
+        hub.held_body(&loser_hash).is_some(),
+        "an equal-work loser stays parked"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -4830,8 +5161,7 @@ fn coinbase_spend_rejects_cached_height_after_disconnect() {
 fn check_block_proposal_prices_fees_and_rejects_on_one_chain() {
     let (dir, hub) = tmp_hub();
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(101, op_true.clone(), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(101).unwrap();
 
     let block = hub
         .assemble_block_to_script(op_true.clone(), vec![])
@@ -5108,14 +5438,13 @@ fn check_block_proposal_reads_medians_from_confirmed_headers() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Witness sigops are not in the structure walk. Nine P2WSH inputs of
-/// 10_000 `OP_CHECKSIG` each are over the 80_000 block limit.
+/// Witness sigops are not in the structure walk. Eight P2WSH inputs of
+/// 10_000 `OP_CHECKSIG` each are the 80_000 limit; nine are over it.
 #[test]
 fn check_block_proposal_rejects_witness_sigops_over_the_limit() {
     let (dir, hub) = tmp_hub();
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(101, op_true.clone(), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(101).unwrap();
     let ws = ScriptBuf::from_bytes(vec![0xac; 10_000]);
     let p2wsh = ScriptBuf::new_p2wsh(&ws.wscript_hash());
     let cb = hub
@@ -5124,45 +5453,64 @@ fn check_block_proposal_rejects_witness_sigops_over_the_limit() {
         .unwrap()
         .txdata[0]
         .compute_txid();
-    let per = (50_0000_0000u64 - 1_000) / 9;
-    let fan = Transaction {
-        version: TxVersion::TWO,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint { txid: cb, vout: 0 },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-            witness: Witness::new(),
-        }],
-        output: (0..9)
-            .map(|_| TxOut {
-                value: Amount::from_sat(per),
-                script_pubkey: p2wsh.clone(),
-            })
-            .collect(),
-    };
-    let fan_id = fan.compute_txid();
-    let spend = Transaction {
-        version: TxVersion::TWO,
-        lock_time: LockTime::ZERO,
-        input: (0..9u32)
-            .map(|vout| TxIn {
-                previous_output: OutPoint { txid: fan_id, vout },
+    let spend_fan = |hub: &ChainHub, coinbase: bitcoin::Txid, n: u32| {
+        let per = (50_0000_0000u64 - 1_000) / u64::from(n);
+        let fan = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: coinbase,
+                    vout: 0,
+                },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::from_slice(&[ws.as_bytes()]),
-            })
-            .collect(),
-        output: vec![TxOut {
-            value: Amount::from_sat(per * 9 - 1_000),
-            script_pubkey: op_true.clone(),
-        }],
+                witness: Witness::new(),
+            }],
+            output: (0..n)
+                .map(|_| TxOut {
+                    value: Amount::from_sat(per),
+                    script_pubkey: p2wsh.clone(),
+                })
+                .collect(),
+        };
+        let fan_id = fan.compute_txid();
+        let spend = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: (0..n)
+                .map(|vout| TxIn {
+                    previous_output: OutPoint { txid: fan_id, vout },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::from_slice(&[ws.as_bytes()]),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(per * u64::from(n) - 1_000),
+                script_pubkey: op_true.clone(),
+            }],
+        };
+        hub.assemble_block_to_script(op_true.clone(), vec![fan, spend])
+            .unwrap()
     };
-    let block = hub
-        .assemble_block_to_script(op_true, vec![fan, spend])
-        .unwrap();
+    let at_limit = spend_fan(&hub, cb, 8);
+    match hub.check_block_proposal(&at_limit) {
+        Ok(_) => {}
+        Err(e) => assert_ne!(
+            e, "bad-blk-sigops",
+            "80_000 witness sigops is the limit, not over it"
+        ),
+    }
+    let cb2 = hub
+        .query
+        .reconstruct_block_at_height(Height(2))
+        .unwrap()
+        .txdata[0]
+        .compute_txid();
+    let over = spend_fan(&hub, cb2, 9);
     assert_eq!(
-        hub.check_block_proposal(&block).unwrap_err(),
+        hub.check_block_proposal(&over).unwrap_err(),
         "bad-blk-sigops"
     );
     let _ = std::fs::remove_dir_all(dir);
@@ -5205,8 +5553,7 @@ fn proposal_spend_of_an_unspendable_output_is_missing() {
 
     let (dir, hub) = tmp_hub();
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(101, op_true.clone(), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(101).unwrap();
     let mut op_return = one_sat(
         mature_spend_tx(&hub, 1).input[0].previous_output.txid,
         0,
@@ -5872,8 +6219,7 @@ fn review_trust_local_block_rechecks_marked_script() {
     let wpkh = WPubkeyHash::from_byte_array([0x41; 20]);
     hub.generate_to_script(1, ScriptBuf::new_p2wpkh(&wpkh), vec![])
         .unwrap();
-    hub.generate_to_script(101, op_true.clone(), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(101).unwrap();
     let cb = hub
         .query
         .reconstruct_block_at_height(Height(1))
@@ -6042,8 +6388,7 @@ fn review_trust_proposal_is_silent() {
     );
     assert_proposal_silent();
 
-    hub.generate_to_script(100, op_true.clone(), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(100).unwrap();
     let mut spend = mature_spend_tx(&hub, 1);
     spend.input[0].script_sig = ScriptBuf::from_bytes(vec![0x6a]);
     let script_block = hub.assemble_block_to_script(op_true, vec![spend]).unwrap();
@@ -6423,6 +6768,319 @@ fn bip94_proposal_rejects_a_timewarp() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Regtest with BIP 54 on and a 4-block difficulty period, with one block
+/// mined at each of `times` (seconds after `BIP54_T0`).
+fn bip54_pad(label: &str, times: &[u32]) -> (rbitcoin_query::testutil::TempDir, ChainHub) {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled(label);
+    let mut params = ChainParams::regtest();
+    params.enforce_bip54 = true;
+    params.btc.pow_target_timespan = 4 * params.btc.pow_target_spacing;
+    let hub = ChainHub::new(q, params, Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    for (i, time) in times.iter().enumerate() {
+        hub.clock.set_mock(i64::from(BIP54_T0 + time));
+        bip54_mine(&hub, ScriptBuf::from_bytes(vec![0x51]), vec![]);
+        assert_eq!(
+            bip94_header_at(&hub, i as u32 + 1).time,
+            BIP54_T0 + time,
+            "height {}",
+            i + 1
+        );
+    }
+    (dir, hub)
+}
+
+const BIP54_T0: u32 = 1_700_000_000;
+
+/// The hub's own template with the coinbase BIP 54 asks for. The regtest
+/// miner is not a BIP 54 miner: its coinbase has `nLockTime` 0 and a final
+/// `nSequence`.
+fn bip54_block(hub: &ChainHub, pay: ScriptBuf, extra: Vec<Transaction>) -> Block {
+    let mut block = hub.assemble_block_to_script(pay, extra).unwrap();
+    let height = hub.tip_height().unwrap() + 1;
+    block.txdata[0].lock_time = bitcoin::absolute::LockTime::from_consensus(height - 1);
+    block.txdata[0].input[0].sequence = bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF;
+    bip54_seal(&mut block);
+    block
+}
+
+fn bip54_seal(block: &mut Block) {
+    block.header.merkle_root = block.compute_merkle_root().unwrap();
+    rbitcoin_consensus::grind_regtest_pow(&mut block.header);
+}
+
+fn bip54_mine(hub: &ChainHub, pay: ScriptBuf, extra: Vec<Transaction>) -> Block {
+    let block = bip54_block(hub, pay, extra);
+    hub.accept_block(block.clone())
+        .unwrap_or_else(|e| panic!("height {:?}: {e}", hub.tip_height().map(|h| h + 1)));
+    block
+}
+
+/// Heights 1..=3, 10,000 s apart: a height-4 header two hours before its
+/// parent is still above the median, so only the timewarp floor decides it.
+const BIP54_BEFORE_PERIOD: [u32; 3] = [10_000, 20_000, 30_000];
+
+/// Heights 1..=6. Height 4 opens a period at 100,000 s and heights 5 and 6
+/// are earlier, so a height-7 header just before height 4 is above the
+/// median and only the period's first header decides it.
+const BIP54_INSIDE_PERIOD: [u32; 6] = [10_000, 20_000, 30_000, 100_000, 40_000, 50_000];
+const BIP54_PERIOD_FIRST: u32 = BIP54_T0 + 100_000;
+
+fn is_negative_interval(err: &NetError) -> bool {
+    err.to_string().contains("time-negative-interval")
+}
+
+/// BIP 54 on header sync: a period's first header more than two hours
+/// before its in-batch parent fails, and two hours passes.
+#[test]
+fn bip54_off_tip_period_start_rejects_a_timewarp() {
+    let (dir, hub) = bip54_pad("bip54-off-tip", &BIP54_BEFORE_PERIOD);
+    let h2 = bip94_header_at(&hub, 2);
+    let fork3 = bip94_child(&h2, h2.time + 10_000, 0x31);
+    let warped = bip94_child(&fork3, fork3.time - 7201, 0x41);
+    let err = hub.ensure_headers_batch(&[fork3, warped]).unwrap_err();
+    assert!(is_timewarp(&err), "{err}");
+    let floor = bip94_child(&fork3, fork3.time - 7200, 0x42);
+    hub.ensure_headers_batch(&[fork3, floor])
+        .expect("two hours before the parent");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// BIP 54 on header sync: a period's last header before the period's first
+/// header fails. The first header is confirmed and the parent is in the
+/// batch, then the parent is the confirmed tip.
+#[test]
+fn bip54_header_sync_rejects_a_negative_interval() {
+    let (dir, hub) = bip54_pad("bip54-neg-sync", &BIP54_INSIDE_PERIOD);
+    hub.clock.set_mock(i64::from(BIP54_PERIOD_FIRST));
+    let h5 = bip94_header_at(&hub, 5);
+    let fork6 = bip94_child(&h5, h5.time + 10_000, 0x61);
+    let early = bip94_child(&fork6, BIP54_PERIOD_FIRST - 1, 0x71);
+    let err = hub.ensure_headers_batch(&[fork6, early]).unwrap_err();
+    assert!(is_negative_interval(&err), "{err}");
+    let level = bip94_child(&fork6, BIP54_PERIOD_FIRST, 0x72);
+    hub.ensure_headers_batch(&[fork6, level])
+        .expect("the first header's own time");
+
+    let tip = bip94_header_at(&hub, 6);
+    let early = bip94_child(&tip, BIP54_PERIOD_FIRST - 1, 0x73);
+    let err = hub.ensure_headers_batch(&[early]).unwrap_err();
+    assert!(is_negative_interval(&err), "{err}");
+    let level = bip94_child(&tip, BIP54_PERIOD_FIRST, 0x74);
+    hub.ensure_headers_batch(&[level])
+        .expect("the first header's own time");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// BIP 54 on a branch: the period's last block is judged against the
+/// branch's own first header, here the fork block itself.
+#[test]
+fn bip54_branch_rejects_a_negative_interval() {
+    let (dir, hub) = bip54_pad("bip54-neg-branch", &BIP54_BEFORE_PERIOD);
+    let fork_first = BIP54_T0 + 90_000;
+    hub.clock.set_mock(i64::from(fork_first));
+    let block = |header| Block {
+        header,
+        txdata: vec![],
+    };
+    let h3 = bip94_header_at(&hub, 3);
+    let fork4 = bip94_child(&h3, fork_first, 0x41);
+    let fork5 = bip94_child(&fork4, BIP54_T0 + 40_000, 0x51);
+    let fork6 = bip94_child(&fork5, BIP54_T0 + 50_000, 0x61);
+    let branch = |last: Header| arcs(&[block(fork4), block(fork5), block(fork6), block(last)]);
+    let early = bip94_child(&fork6, fork_first - 1, 0x71);
+    let err = hub
+        .accept_branch_check_headers(&branch(early), Some(3))
+        .unwrap_err();
+    assert!(is_negative_interval(&err), "{err}");
+    let level = bip94_child(&fork6, fork_first, 0x72);
+    hub.accept_branch_check_headers(&branch(level), Some(3))
+        .expect("the first header's own time");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// BIP 54 on a block proposal (Core `TestBlockValidity`) and on the block a
+/// peer sends for the tip: both timestamp rules.
+#[test]
+fn bip54_proposal_and_tip_block_reject_both_time_faults() {
+    let (dir, hub) = bip54_pad("bip54-proposal-warp", &BIP54_BEFORE_PERIOD);
+    let tip = hub.header_of(&hub.tip_hash().unwrap()).unwrap();
+    let template = bip54_block(&hub, ScriptBuf::from_bytes(vec![0x51]), vec![]);
+    let mut warped = template.clone();
+    warped.header.time = tip.time - 7201;
+    assert_eq!(
+        hub.check_block_proposal(&warped).unwrap_err(),
+        "time-timewarp-attack"
+    );
+    let mut floor = template;
+    floor.header.time = tip.time - 7200;
+    hub.check_block_proposal(&floor)
+        .expect("two hours before the parent");
+    let _ = std::fs::remove_dir_all(dir);
+
+    let (dir, hub) = bip54_pad("bip54-proposal-neg", &BIP54_INSIDE_PERIOD);
+    hub.clock.set_mock(i64::from(BIP54_PERIOD_FIRST));
+    let template = bip54_block(&hub, ScriptBuf::from_bytes(vec![0x51]), vec![]);
+    assert_eq!(
+        template.header.time, BIP54_PERIOD_FIRST,
+        "the template keeps to the period's first header"
+    );
+    let mut early = template.clone();
+    early.header.time = BIP54_PERIOD_FIRST - 1;
+    rbitcoin_consensus::grind_regtest_pow(&mut early.header);
+    assert_eq!(
+        hub.check_block_proposal(&early).unwrap_err(),
+        "time-negative-interval"
+    );
+    let err = hub.accept_block(early).unwrap_err();
+    assert!(is_negative_interval(&err), "{err}");
+    assert_eq!(hub.tip_height(), Some(6));
+    hub.check_block_proposal(&template)
+        .expect("the first header's own time");
+    hub.accept_block(template).expect("a valid period end");
+    assert_eq!(hub.tip_height(), Some(7));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// BIP 54 on a block proposal and on the tip block: the coinbase is
+/// timelocked to the height before its block, with a sequence that lets the
+/// locktime apply.
+#[test]
+fn bip54_coinbase_is_timelocked_to_its_height() {
+    let (dir, hub) = bip54_pad("bip54-coinbase", &[10_000]);
+    let pay = || ScriptBuf::from_bytes(vec![0x51]);
+    let rejects = |block: Block, reason: &str| {
+        assert_eq!(hub.check_block_proposal(&block).unwrap_err(), reason);
+        let err = hub.accept_block(block).unwrap_err();
+        assert!(err.to_string().contains(reason), "{err}");
+        assert_eq!(hub.tip_height(), Some(1));
+    };
+
+    let regtest_miner = hub.assemble_block_to_script(pay(), vec![]).unwrap();
+    rejects(regtest_miner, "bad-cb-locktime");
+    for locktime in [0, 2] {
+        let mut block = bip54_block(&hub, pay(), vec![]);
+        block.txdata[0].lock_time = bitcoin::absolute::LockTime::from_consensus(locktime);
+        bip54_seal(&mut block);
+        rejects(block, "bad-cb-locktime");
+    }
+    let mut final_sequence = bip54_block(&hub, pay(), vec![]);
+    final_sequence.txdata[0].input[0].sequence = bitcoin::Sequence::MAX;
+    bip54_seal(&mut final_sequence);
+    rejects(final_sequence, "bad-cb-sequence");
+
+    let mut any_other_sequence = bip54_block(&hub, pay(), vec![]);
+    any_other_sequence.txdata[0].input[0].sequence = bitcoin::Sequence::ZERO;
+    bip54_seal(&mut any_other_sequence);
+    hub.check_block_proposal(&any_other_sequence)
+        .expect("a sequence that is not final");
+    hub.accept_block(any_other_sequence)
+        .expect("a sequence that is not final");
+    assert_eq!(hub.tip_height(), Some(2));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `OP_0 OP_IF <checkmultisigs> <checksigs> OP_ENDIF OP_1`: anyone can spend
+/// it with an empty scriptSig, and BIP 54 counts 20 for each unexecuted
+/// `OP_CHECKMULTISIG` and 1 for each `OP_CHECKSIG`.
+fn bip54_sigop_script(checkmultisigs: usize, checksigs: usize) -> ScriptBuf {
+    use bitcoin::opcodes::all::{
+        OP_CHECKMULTISIG, OP_CHECKSIG, OP_ENDIF, OP_IF, OP_PUSHBYTES_0, OP_PUSHNUM_1,
+    };
+    let mut script = bitcoin::script::Builder::new()
+        .push_opcode(OP_PUSHBYTES_0)
+        .push_opcode(OP_IF);
+    for _ in 0..checkmultisigs {
+        script = script.push_opcode(OP_CHECKMULTISIG);
+    }
+    for _ in 0..checksigs {
+        script = script.push_opcode(OP_CHECKSIG);
+    }
+    script
+        .push_opcode(OP_ENDIF)
+        .push_opcode(OP_PUSHNUM_1)
+        .into_script()
+}
+
+/// Spend output `vout` of `funding` with an empty scriptSig into one output.
+fn bip54_spend(funding: &Transaction, vout: u32, script_pubkey: ScriptBuf) -> Transaction {
+    Transaction {
+        version: bitcoin::transaction::Version::ONE,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint::new(funding.compute_txid(), vout),
+            script_sig: ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        }],
+        output: vec![bitcoin::TxOut {
+            value: funding.output[vout as usize].value,
+            script_pubkey,
+        }],
+    }
+}
+
+/// BIP 54 on a block proposal and on the tip block: a transaction whose
+/// inputs carry more than 2,500 signature operations, and a transaction of
+/// 64 bytes, are invalid. One fewer of either is accepted. The chain is the
+/// shared mature pad with BIP 54 on from height 102. One transaction there
+/// spends a mature coinbase into the outputs under test.
+#[test]
+fn bip54_block_rejects_too_many_sigops_and_a_64_byte_tx() {
+    let mut params = ChainParams::regtest();
+    params.enforce_bip54 = true;
+    let (dir, hub) = open_generate_commit_hub_with("bip54-block-txs", params);
+    let op_true = || ScriptBuf::from_bytes(vec![0x51]);
+    let mut funding = mature_spend_tx(&hub, 1);
+    let each = Amount::from_sat(10_0000_0000);
+    funding.output = [
+        bip54_sigop_script(125, 0),
+        bip54_sigop_script(125, 1),
+        op_true(),
+        op_true(),
+    ]
+    .into_iter()
+    .map(|script_pubkey| TxOut {
+        value: each,
+        script_pubkey,
+    })
+    .collect();
+    bip54_mine(&hub, op_true(), vec![funding.clone()]);
+    let (at_limit, past_limit, plain, plain_too) = (0, 1, 2, 3);
+
+    let rejects = |tx: Transaction, reason: &str| {
+        let tip = hub.tip_height();
+        let block = bip54_block(&hub, op_true(), vec![tx]);
+        assert_eq!(hub.check_block_proposal(&block).unwrap_err(), reason);
+        let err = hub.accept_block(block).unwrap_err();
+        assert!(err.to_string().contains(reason), "{err}");
+        assert_eq!(hub.tip_height(), tip);
+    };
+    let accepts = |tx: Transaction| {
+        let block = bip54_block(&hub, op_true(), vec![tx]);
+        hub.check_block_proposal(&block).expect("proposal");
+        hub.accept_block(block).expect("tip block");
+    };
+
+    accepts(bip54_spend(&funding, at_limit, op_true()));
+    rejects(
+        bip54_spend(&funding, past_limit, op_true()),
+        "bad-txns-legacy-sigops",
+    );
+
+    let small = bip54_spend(&funding, plain, ScriptBuf::from_bytes(vec![0x51; 4]));
+    assert_eq!(small.base_size(), 64);
+    rejects(small, "bad-txns-size");
+    let next = bip54_spend(&funding, plain, ScriptBuf::from_bytes(vec![0x51; 5]));
+    assert_eq!(next.base_size(), 65);
+    accepts(next);
+    let padded = bip54_spend(&funding, plain_too, ScriptBuf::from_bytes(vec![0x51; 3]));
+    assert_eq!(padded.base_size(), 63);
+    accepts(padded);
+    assert_eq!(hub.tip_height(), Some(105));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// BIP94 on header sync: the off-tip retarget scales the period's first
 /// `nBits`, not a min-difficulty parent's. Testnet4 with a 4-block period;
 /// height 4 opens the period at `0x1c3fffc0`, height 7 is a pow-limit block
@@ -6463,7 +7121,8 @@ fn bip94_off_tip_retarget_scales_the_period_first_bits() {
         let mut next = parent;
         next.prev_blockhash = parent.block_hash();
         next.time = parent.time + 1;
-        let bits = hub.expected_bits_off_tip(&next, &parent, 7, &batch);
+        let first = hub.period_first_off_tip(&parent, 7, &batch);
+        let bits = hub.expected_bits_off_tip(&next, &parent, 7, first, &batch);
         let _ = std::fs::remove_dir_all(dir);
         bits.unwrap().to_consensus()
     };
@@ -6478,8 +7137,7 @@ fn bip94_off_tip_retarget_scales_the_period_first_bits() {
 fn check_block_proposal_decodes_only_the_spent_outputs_of_a_wide_parent() {
     let (dir, hub) = tmp_hub();
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(101, op_true.clone(), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(101).unwrap();
     let mut wide = mature_spend_tx(&hub, 1);
     wide.output = (0..1_000u64)
         .map(|i| TxOut {
@@ -6522,6 +7180,521 @@ fn check_block_proposal_decodes_only_the_spent_outputs_of_a_wide_parent() {
         hub.query.store().txs.sample_reset_outputs_decoded(),
         3,
         "only the three spent outputs decoded"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn stored_header_height_walk_clears_the_counter() {
+    let (_dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let _ = hub.take_stored_height_walk_steps();
+    assert_eq!(hub.take_stored_height_walk_steps(), 0);
+    let miss = BlockHash::from_byte_array([0x7a; 32]);
+    assert!(hub.stored_header_height(&miss).is_none());
+    assert_eq!(hub.take_stored_height_walk_steps(), 1);
+}
+
+#[test]
+fn try_apply_held_store_fault_is_not_a_failed_block() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let side = mine(gen, hub.tip_header().unwrap().time.saturating_add(1), 1);
+    let side_hash = side.block_hash();
+    hub.hold_body(Arc::new(side), false);
+    hub.query.fail_next_header_read_cancelled();
+    let err = hub
+        .try_apply_held(None)
+        .expect_err("a cancelled header read is a store fault");
+    assert!(err.is_local_fault(), "{err}");
+    assert!(
+        !hub.is_block_invalid(&side_hash),
+        "a store fault must not mark the held tip"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn header_inv_challenge_clears_once_the_walk_takes_it() {
+    let (_dir, hub) = tmp_hub();
+    hub.note_header_inv_challenge();
+    assert!(hub.header_inv_challenge_pending());
+    hub.clear_header_inv_challenge();
+    assert!(!hub.header_inv_challenge_pending());
+}
+
+#[test]
+fn accept_err_string_bags_classify_time_and_warn() {
+    for needle in [
+        "time-too-new",
+        "time-too-old",
+        "timestamp too far in future",
+        "median-time-past",
+    ] {
+        assert!(
+            accept_err_is_temporary_time(&NetError::Consensus(needle.into())),
+            "{needle}"
+        );
+    }
+    assert!(accept_err_is_temporary_time(&NetError::ConnectFailed {
+        hash: [0; 32],
+        msg: "median-time-past".into(),
+        rules: None,
+    }));
+    assert!(!accept_err_is_temporary_time(&NetError::Consensus(
+        "bad-diffbits".into()
+    )));
+    assert!(accept_err_is_warn_and_apply(&NetError::Consensus(
+        "bad-version".into()
+    )));
+    assert!(accept_err_is_warn_and_apply(&NetError::Mutated(
+        "script verification".into()
+    )));
+    assert!(!accept_err_is_warn_and_apply(&NetError::Consensus(
+        "high-hash".into()
+    )));
+}
+
+#[test]
+fn generate_stops_before_the_fail_latch() {
+    let (_dir, hub) = tmp_hub();
+    hub.generate_fail_before.store(1, Ordering::Relaxed);
+    let err = hub
+        .generate_to_script(2, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .expect_err("the latch stops the second block");
+    assert!(
+        err.to_string()
+            .contains("generate lost the tip during proof-of-work"),
+        "{err}"
+    );
+    assert_eq!(hub.tip_height(), Some(1));
+}
+
+#[test]
+fn remember_failed_accept_skips_not_found() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let missing = BlockHash::from_byte_array([0x11; 32]);
+    hub.remember_failed_accept(missing, &NetError::Consensus("Block not found".into()));
+    assert!(!hub.is_block_invalid(&missing));
+    let marked = BlockHash::from_byte_array([0x22; 32]);
+    hub.remember_failed_accept(marked, &NetError::Consensus("high-hash".into()));
+    assert!(hub.is_block_invalid(&marked));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn prune_failed_stays_pending_when_the_file_cannot_write() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let h1 = BlockHash::from_byte_array([0x31; 32]);
+    let h2 = BlockHash::from_byte_array([0x32; 32]);
+    assert!(hub.note_failed_connect(h1));
+    assert!(hub.note_failed_connect(h2));
+    let marks = dir.path().join("block.invalid");
+    std::fs::remove_file(&marks).unwrap();
+    std::fs::create_dir(&marks).unwrap();
+    hub.reconsider_block(h1).unwrap();
+    assert!(!hub.is_block_invalid(&h1));
+    assert!(hub.is_block_invalid(&h2));
+    assert!(
+        !hub.invalid_marks_on_disk(),
+        "a failed prune write stays pending"
+    );
+    assert!(
+        !hub.note_failed_connect(h2),
+        "retry still cannot write while the path is a directory"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Equal work and equal sequence is a tie. The candidate does not beat the
+/// incumbent; `<=` would prefer it.
+#[test]
+fn held_branch_beats_equal_seq_does_not_prefer_the_candidate() {
+    let w = Work::from_be_bytes([0u8; 32]);
+    assert!(!held_branch_beats(w, false, 5, w, false, 5));
+    assert!(held_branch_beats(w, false, 4, w, false, 5));
+}
+
+#[test]
+fn chaintips_invalid_outranks_a_held_valid_headers_row() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let side = mine(gen, hub.tip_header().unwrap().time.saturating_add(1), 1);
+    let hash = side.block_hash();
+    hub.ensure_header(&side.header).unwrap();
+    hub.fork_tips.write().unwrap().insert(hash);
+    hub.note_invalid_block(hash);
+    hub.hold_body(Arc::new(side), false);
+    let status = hub
+        .chaintips()
+        .into_iter()
+        .find(|t| t.hash == hash)
+        .map(|t| t.status);
+    assert_eq!(status, Some("invalid"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn header_ancestry_stops_at_a_connected_parent() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let b1 = mine(gen, hub.tip_header().unwrap().time.saturating_add(1), 1);
+    hub.accept_block(b1.clone()).unwrap();
+    let child = mine(b1.block_hash(), b1.header.time.saturating_add(1), 2);
+    hub.ensure_header(&child.header).unwrap();
+    hub.note_invalid_block(b1.block_hash());
+    let status = hub
+        .chaintips()
+        .into_iter()
+        .find(|t| t.hash == child.block_hash())
+        .map(|t| t.status);
+    assert_eq!(status, Some("headers-only"));
+    assert!(!hub.is_block_invalid(&child.block_hash()));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn precious_later_equal_work_held_tip_wins() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t0 = hub.tip_header().unwrap().time;
+    let a1 = mine(gen, t0.saturating_add(1), 1);
+    let a1_hash = a1.block_hash();
+    hub.accept_block(a1).unwrap();
+    let b1 = mine_distinct(gen, t0.saturating_add(2), 1, &[a1_hash]);
+    let b1_hash = b1.block_hash();
+    let c1 = mine_distinct(gen, t0.saturating_add(3), 1, &[a1_hash, b1_hash]);
+    let c1_hash = c1.block_hash();
+    assert!(matches!(
+        hub.accept_received_block(b1).unwrap(),
+        AcceptOutcome::IgnoredWeaker
+    ));
+    assert!(matches!(
+        hub.accept_received_block(c1).unwrap(),
+        AcceptOutcome::IgnoredWeaker
+    ));
+    *hub.precious.write().unwrap() = Some(c1_hash);
+    let ranked = hub.best_held_branch().expect("held sides");
+    assert_eq!(
+        ranked.last().unwrap().block_hash(),
+        c1_hash,
+        "equal work prefers the precious held tip"
+    );
+    hub.invalidate_block(a1_hash).unwrap();
+    assert_eq!(hub.tip_hash(), Some(c1_hash));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_block_proposal_allows_time_at_mtp() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    let mut block = hub.assemble_block_to_script(op_true, vec![]).unwrap();
+    let mtp = hub.tip_header().unwrap().time;
+    block.header.time = mtp;
+    rbitcoin_consensus::grind_regtest_pow(&mut block.header);
+    assert_eq!(hub.check_block_proposal(&block), Ok(0));
+    block.header.time = 0;
+    rbitcoin_consensus::grind_regtest_pow(&mut block.header);
+    assert_eq!(
+        hub.check_block_proposal(&block).unwrap_err(),
+        "time-too-old"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// IBD look-ahead height is the last increasing anchor on the fast path.
+/// A stale epoch, a decreasing walk, and a new invalid mark refuse the
+/// publish. Refresh after an invalid ancestor keeps the proved prefix.
+#[test]
+fn ibd_header_publish_tracks_look_ahead_height() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t0 = hub.tip_header().unwrap().time;
+    let epoch0 = hub.ibd_header_epoch();
+    assert_eq!(epoch0, IbdHeaderEpoch::default());
+    let dummy_hi = BlockHash::from_byte_array([0x41; 32]);
+    let dummy_lo = BlockHash::from_byte_array([0x42; 32]);
+    assert_eq!(
+        hub.publish_ibd_header_tip(epoch0, vec![(dummy_hi, 4), (dummy_lo, 3)]),
+        None,
+        "decreasing heights are not a walk"
+    );
+    assert_eq!(hub.best_header_height(), 0);
+    assert_eq!(
+        hub.publish_ibd_header_tip(epoch0, vec![(dummy_lo, 3), (dummy_hi, 9)]),
+        Some(epoch0)
+    );
+    assert_eq!(hub.best_header_height(), 9);
+    hub.refresh_header_report();
+    assert_eq!(
+        hub.best_header_height(),
+        9,
+        "a fast look-ahead stays without a dirty refresh"
+    );
+    assert_eq!(hub.publish_ibd_header_tip(epoch0, vec![]), Some(epoch0));
+    assert_eq!(
+        hub.best_header_height(),
+        0,
+        "empty same-epoch anchors clear the look-ahead"
+    );
+
+    let b1 = mine(gen, t0.saturating_add(1), 1);
+    let b2 = mine(b1.block_hash(), t0.saturating_add(2), 2);
+    let b3 = mine(b2.block_hash(), t0.saturating_add(3), 3);
+    hub.accept_block(b1.clone()).unwrap();
+    hub.ensure_header(&b2.header).unwrap();
+    hub.ensure_header(&b3.header).unwrap();
+    assert_eq!(hub.best_header_height(), 3);
+    let s2 = mine_distinct(
+        b1.block_hash(),
+        t0.saturating_add(20),
+        2,
+        &[b2.block_hash()],
+    );
+    hub.ensure_header(&s2.header).unwrap();
+    hub.note_invalid_block(s2.block_hash());
+    let epoch_side = hub.ibd_header_epoch();
+    assert_eq!(
+        hub.publish_ibd_header_tip(
+            epoch_side,
+            vec![
+                (b1.block_hash(), 1),
+                (b2.block_hash(), 2),
+                (b3.block_hash(), 3)
+            ]
+        ),
+        None,
+        "a new invalid mark needs a refresh"
+    );
+    hub.refresh_header_report();
+    assert_eq!(
+        hub.best_header_height(),
+        3,
+        "an off-walk invalid leaves the walk"
+    );
+    let look = BlockHash::from_byte_array([0x43; 32]);
+    assert_eq!(
+        hub.publish_ibd_header_tip(
+            epoch_side,
+            vec![
+                (b1.block_hash(), 1),
+                (b2.block_hash(), 2),
+                (b3.block_hash(), 3),
+                (look, 8)
+            ]
+        ),
+        Some(epoch_side),
+        "extending a fully proved walk is the reusable fast path"
+    );
+    assert_eq!(hub.best_header_height(), 8);
+
+    hub.note_invalid_block(b2.block_hash());
+    let epoch1 = hub.ibd_header_epoch();
+    assert_ne!(epoch1, epoch0);
+    assert_ne!(epoch1, IbdHeaderEpoch::default());
+    assert_eq!(hub.publish_ibd_header_tip(epoch0, vec![]), None);
+    assert_eq!(
+        hub.publish_ibd_header_tip(epoch1, vec![(b1.block_hash(), 1), (b3.block_hash(), 3)]),
+        None,
+        "a new invalid mark needs a refresh, not the fast path"
+    );
+    hub.refresh_header_report();
+    assert_eq!(
+        hub.best_header_height(),
+        1,
+        "the proved prefix stops below the invalid ancestor"
+    );
+    assert_eq!(
+        hub.publish_ibd_header_tip(epoch1, vec![(b1.block_hash(), 1)]),
+        Some(epoch1),
+        "a prefix of the last walk reuses the proof"
+    );
+    assert_eq!(hub.best_header_height(), 1);
+    let other = BlockHash::from_byte_array([0x44; 32]);
+    assert_eq!(
+        hub.publish_ibd_header_tip(epoch1, vec![(other, 1)]),
+        None,
+        "an unrelated walk is not the reusable prefix"
+    );
+    assert_eq!(hub.best_header_height(), 1);
+    let b2_child = mine(b2.block_hash(), t0.saturating_add(4), 4);
+    hub.ensure_header(&b2_child.header).unwrap();
+    assert_eq!(
+        hub.best_header_height(),
+        1,
+        "a header whose parent is invalid does not raise the proved height"
+    );
+    hub.ensure_header(&b2.header).unwrap();
+    assert_eq!(
+        hub.best_header_height(),
+        1,
+        "re-submitting an invalid header with a connected parent does not raise the proved height"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Reconsider of a losing fork parks the leaf, not an ancestor under it.
+#[test]
+fn reconsider_losing_fork_parks_only_the_leaf() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t0 = hub.tip_header().unwrap().time;
+    let a1 = mine(gen, t0 + 1, 1);
+    let a1_hash = a1.block_hash();
+    hub.accept_block(a1).unwrap();
+    let c2 = mine(a1_hash, t0 + 2, 2);
+    let c2_hash = c2.block_hash();
+    hub.accept_block(c2).unwrap();
+    let c3 = mine(c2_hash, t0 + 3, 3);
+    let c3_hash = c3.block_hash();
+    hub.accept_block(c3).unwrap();
+    let mut b = vec![a1_hash];
+    for h in 2..=4u32 {
+        let block = mine(b[b.len() - 1], t0 + 10 + h, h);
+        b.push(block.block_hash());
+        let _ = hub.accept_received_block(block);
+    }
+    hub.invalidate_block(c2_hash).unwrap();
+    assert_eq!(hub.tip_hash(), Some(b[3]));
+    hub.reconsider_block(c2_hash).unwrap();
+    assert_eq!(hub.tip_hash(), Some(b[3]));
+    let status = |h: BlockHash| {
+        hub.chaintips()
+            .into_iter()
+            .find(|t| t.hash == h)
+            .map(|t| t.status)
+    };
+    assert_eq!(status(c3_hash), Some("valid-fork"));
+    assert_ne!(
+        status(c2_hash),
+        Some("valid-fork"),
+        "an ancestor under a parked leaf is not a fork tip"
+    );
+    let forks: Vec<BlockHash> = hub.fork_tips.read().unwrap().iter().collect();
+    assert!(
+        forks.contains(&c3_hash),
+        "leaf must stay a fork tip: {forks:?}"
+    );
+    assert!(
+        !forks.contains(&c2_hash),
+        "an ancestor under a parked leaf is not itself a fork tip: {forks:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A heavier time-reject fork is tried once and is not a mark. The next
+/// most-work valid fork still connects.
+#[test]
+fn invalidate_skips_a_time_reject_heavier_fork() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t0 = hub.tip_header().unwrap().time;
+    let a1 = mine(gen, t0 + 1, 1);
+    let a1_hash = a1.block_hash();
+    hub.accept_block(a1).unwrap();
+    let a2 = mine(a1_hash, t0 + 2, 2);
+    let a2_hash = a2.block_hash();
+    hub.accept_block(a2).unwrap();
+    let a3 = mine(a2_hash, t0 + 3, 3);
+    hub.accept_block(a3).unwrap();
+    let mut late = Vec::new();
+    let mut prev = a1_hash;
+    for h in 2..=4u32 {
+        let b = mine(prev, 1, h);
+        prev = b.block_hash();
+        late.push(prev);
+        let _ = hub.accept_received_block(b);
+    }
+    let v2 = mine_distinct(a1_hash, t0 + 20, 2, &late);
+    let v2_hash = v2.block_hash();
+    let _ = hub.accept_received_block(v2);
+    hub.invalidate_block(a2_hash).unwrap();
+    assert_eq!(hub.tip_hash(), Some(v2_hash));
+    assert!(!hub.is_block_invalid(&late[2]));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Equal-work precious at the same height reorgs. The new tip is not held.
+#[test]
+fn precious_equal_height_received_block_is_not_held() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t0 = hub.tip_header().unwrap().time;
+    let a1 = mine(gen, t0 + 1, 1);
+    let a1_hash = a1.block_hash();
+    hub.accept_block(a1).unwrap();
+    let b1 = mine_distinct(gen, t0 + 2, 1, &[a1_hash]);
+    let b1_hash = b1.block_hash();
+    *hub.precious.write().unwrap() = Some(b1_hash);
+    let out = hub.accept_received_block(b1).unwrap();
+    assert!(
+        matches!(out, AcceptOutcome::Accepted { height: 1 }),
+        "equal work at the same height follows precious: {out:?}"
+    );
+    assert_eq!(hub.tip_hash(), Some(b1_hash));
+    assert!(
+        hub.held_body(&b1_hash).is_none(),
+        "a connected equal-height tip is not held"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A zero-target held child cannot be ranked. Invalidate still connects the
+/// valid parent and does not return that consensus skip as a fault.
+#[test]
+fn zero_target_held_child_does_not_fail_invalidate() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t0 = hub.tip_header().unwrap().time;
+    let a1 = mine(gen, t0 + 1, 1);
+    let a1_hash = a1.block_hash();
+    hub.accept_block(a1).unwrap();
+    let parent = mine_distinct(gen, t0 + 2, 1, &[a1_hash]);
+    let p = parent.block_hash();
+    let mut child = mine_distinct(p, t0 + 3, 2, &[]);
+    child.header.bits = CompactTarget::from_consensus(0);
+    hub.hold_body(Arc::new(parent), false);
+    hub.hold_body(Arc::new(child), false);
+    hub.invalidate_block(a1_hash).unwrap();
+    assert_eq!(hub.tip_hash(), Some(p));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A store fault while ActivateBestChain connects a side branch is not a
+/// block verdict.
+#[test]
+fn activate_best_side_branch_store_fault_is_not_a_failed_block() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t0 = hub.tip_header().unwrap().time;
+    let b1 = mine(gen, t0 + 1, 1);
+    let b1_hash = b1.block_hash();
+    hub.hold_body(Arc::new(b1), false);
+    let dummy = mine_distinct(gen, t0 + 2, 1, &[b1_hash]);
+    let dummy_hash = dummy.block_hash();
+    hub.hold_body(Arc::new(dummy), false);
+    hub.query.fail_next_header_read_cancelled();
+    let err = hub
+        .invalidate_block(dummy_hash)
+        .expect_err("a cancelled header read while activating the other held tip is a store fault");
+    assert!(err.is_local_fault(), "{err}");
+    assert!(
+        !hub.is_block_invalid(&b1_hash),
+        "a store fault on the side branch is not a block verdict"
     );
     let _ = std::fs::remove_dir_all(dir);
 }

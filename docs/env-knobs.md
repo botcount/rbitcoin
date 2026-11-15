@@ -86,5 +86,5 @@ for signet/mainnet sync. **Not** CLI.
 
 ## Related
 
-- [`OPERATOR.md`](../OPERATOR.md) — CLI / conf
+- [`docs/operator/`](./operator/) — CLI / conf. [`OPERATOR.md`](../OPERATOR.md) is the task index
 - [`docs/io-modality.md`](./io-modality.md) — bulk IO behavior

@@ -13,7 +13,8 @@ test = false
 doctest = false
 
 [features]
-mutants = []
+# Nightly cargo-mutants only. Off for the node build.
+mutants = ["dep:mutants"]
 
 
 [dependencies]
@@ -25,7 +26,11 @@ rbitcoin-electrum = { workspace = true }
 rbitcoin-net = { workspace = true }
 rbitcoin-consensus = { workspace = true }
 bitcoin = { workspace = true }
+# Attribute only. cargo-mutants reads it; it does not change compiled code.
+mutants = { version = "0.0.4", optional = true }
 axum = { workspace = true }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tower = { workspace = true }
 tower-http = { workspace = true }
 tokio = { workspace = true }

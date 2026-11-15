@@ -489,3 +489,69 @@ fn compact_packed_fd_is_bdz3_and_matches_ram() {
     assert!(fd.take_g_page_preads() >= 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn packed_header_fields_survive_the_read() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-bdz-hdr-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("h.bdz");
+    let mut hdr = vec![0u8; 32];
+    hdr[0..4].copy_from_slice(b"BDZ2");
+    hdr[4..8].copy_from_slice(&1u32.to_le_bytes());
+    hdr[8..12].copy_from_slice(&2u32.to_le_bytes());
+    hdr[12..16].copy_from_slice(&4u32.to_le_bytes());
+    hdr[16..24].copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+    hdr[24..28].copy_from_slice(&9u32.to_le_bytes());
+    hdr[28..32].copy_from_slice(&8u32.to_le_bytes());
+    hdr.extend(std::iter::repeat_n(0u8, packed_g_bytes(4, 8) as usize));
+    std::fs::write(&path, &hdr).unwrap();
+    let got = BdzMphf::read_packed_from(&path).unwrap();
+    assert_eq!(got.n, 2);
+    assert_eq!(got.m, 4);
+    assert_eq!(got.seed, 0x0102_0304_0506_0708);
+    assert_eq!(got.modulus, 9);
+    let short = dir.join("short.bdz");
+    std::fs::write(&short, &hdr[..31]).unwrap();
+    match BdzMphf::read_packed_from(&short) {
+        Err(StoreError::Corrupt(m)) => assert!(m.contains("short"), "{m}"),
+        other => panic!("short packed header must be Corrupt, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compact_header_fields_survive_the_read() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-bdz3-hdr-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let keys = [1u64, 2, 3, 4, 5];
+    let ram = BdzMphf::build_compact(&keys).unwrap();
+    let path = dir.join("c.mphf");
+    ram.write_compact_to(&path).unwrap();
+    let got = BdzMphf::read_compact_from(&path).unwrap();
+    assert_eq!(got.n, ram.n);
+    assert_eq!(got.m, ram.m);
+    assert_eq!(got.seed, ram.seed);
+    assert_eq!(got.modulus, ram.modulus);
+    for &k in &keys {
+        assert_eq!(got.index(k).unwrap(), ram.index(k).unwrap());
+    }
+    let short = dir.join("short.mphf");
+    std::fs::write(&short, [0u8; 31]).unwrap();
+    match BdzMphf::read_compact_from(&short) {
+        Err(StoreError::Corrupt(m)) => assert!(m.contains("g length"), "{m}"),
+        other => panic!("short compact header must be Corrupt, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -30,12 +30,16 @@ pub fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+// The package suite does not pass `--cfg loom`, so this body is not in that binary.
 #[cfg(loom)]
+#[cfg_attr(feature = "mutants", mutants::skip)]
 pub fn lock<T>(mutex: &Mutex<T>) -> loom::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+// The package suite does not pass `--cfg shuttle`, so this body is not in that binary.
 #[cfg(shuttle)]
+#[cfg_attr(feature = "mutants", mutants::skip)]
 pub fn lock<T>(mutex: &Mutex<T>) -> shuttle::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|p| p.into_inner())
 }

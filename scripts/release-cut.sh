@@ -118,6 +118,8 @@ fi
 if [[ "$MODE" == "dev-next" ]]; then
   release_set_cargo_version "$REL_DEV_NEXT"
   release_set_nix_version "$REL_DEV_NEXT"
+  release_set_lock_versions "$ver" "$REL_DEV_NEXT"
+  release_check_lock_versions "$REL_DEV_NEXT"
   release_cut_changelog_dev_next "$REL_DEV_NEXT" "$REL_TOWARD" "$ver" "$REL_MAINT"
   echo "release-cut: $ver → $REL_DEV_NEXT (dev)"
   print_plan
@@ -126,6 +128,8 @@ fi
 
 release_set_cargo_version "$REL_SHIP"
 release_set_nix_version "$REL_SHIP"
+release_set_lock_versions "$ver" "$REL_SHIP"
+release_check_lock_versions "$REL_SHIP"
 release_cut_changelog_ship "$REL_SHIP" "$DATE"
 notes="$(release_changelog_notes "$REL_SHIP")"
 [[ -n "$(printf '%s\n' "$notes" | grep -v '^[[:space:]]*$')" ]] || \

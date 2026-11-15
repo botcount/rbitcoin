@@ -6,3 +6,4 @@ mod inhibit;
 mod lock;
 mod regtest_rpc;
 mod run;
+mod tor_control;

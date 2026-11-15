@@ -61,6 +61,7 @@ fn slot_at(id: usize, ip: Ipv4Addr, height: u32) -> (PeerSlot, mpsc::UnboundedRe
             requested,
             solicited_bytes,
             solicited_ms,
+            open_block_bytes: Arc::new(AtomicU64::new(0)),
             any_rx_ms: Arc::new(AtomicU64::new(0)),
             getdata_wire: GetdataWire::new(),
             peer_height: height,
@@ -1161,6 +1162,9 @@ fn a_fork_retarget_uses_the_challenger_period() {
         period.bits,
         9,
     );
+    // Look-ahead past the soft cap is a checkpoint, so the parent row is not
+    // there until this test writes the chain the decoy hangs off.
+    hub.ensure_headers_batch(&main_a).unwrap();
     hub.ensure_headers_batch(&[decoy]).unwrap();
     st.record_height(decoy.block_hash(), 20);
     let fork_a = extend_chain(&hub, &genesis, &main_a, 10, 2);

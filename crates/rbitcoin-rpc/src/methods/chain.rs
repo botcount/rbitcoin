@@ -35,12 +35,14 @@ pub fn getbestblockhash(ctx: &RpcContext) -> Result<Value, Value> {
 
 pub fn getblockhash(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["height"])?;
-    let height = params.req_u64(0, "height")? as u32;
+    let out_of_range = || rpc_error(ERR_INVALID_PARAMETER, "Block height out of range");
+    let height =
+        u32::try_from(params.req_core_int::<i32>(0, "height")?).map_err(|_| out_of_range())?;
     let (_, rec) = ctx
         .query
         .header_at_height(Height(height))
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
-        .ok_or_else(|| rpc_error(ERR_INVALID_PARAMETER, "Block height out of range"))?;
+        .ok_or_else(out_of_range)?;
     Ok(json!(hash_hex_display(&rec.hash)))
 }
 
@@ -880,9 +882,9 @@ pub fn getblock_tx_json(
                 None => None,
             };
             let Some((fee, prevouts)) = row else {
-                return Ok(tx_to_json(tx, None, net));
+                return Ok(tx_to_json(tx, None, None, net));
             };
-            let mut obj = tx_to_json(tx, Some(json!({ "fee": sat_btc_json(fee) })), net);
+            let mut obj = tx_to_json(tx, None, Some(json!({ "fee": sat_btc_json(fee) })), net);
             if verbosity >= 3 {
                 insert_vin_prevouts(&mut obj, &prevouts);
             }
@@ -1188,8 +1190,9 @@ pub fn disconnected_block_value(
     if let Some(cb) = block.txdata.first() {
         obj["coinbase_tx"] = coinbase_tx_json(cb);
     }
+    // Core verbosity 1 and up carry size/strippedsize/weight on a side branch.
+    insert_block_size_fields(&mut obj, block);
     if verbosity >= 2 {
-        insert_block_size_fields(&mut obj, block);
         let undo = stored_block_fks(ctx, hash);
         obj["tx"] = json!(getblock_tx_json(ctx, block, undo.as_ref(), verbosity)?);
     }
@@ -1209,15 +1212,20 @@ pub fn getblock_unknown_hash(
     if let Some(block) = ctx.chain.as_ref().and_then(|c| c.held_body(&typed)) {
         return disconnected_block_value(ctx, &hash, &block, verbosity);
     }
-    let header_only = ctx.chain.as_ref().is_some_and(|c| c.knows_header(&typed))
-        || ctx.query.get_header_by_hash(&hash).ok().flatten().is_some();
-    if header_only {
+    if knows_header(ctx, &hash) {
         return Err(rpc_error(
             ERR_MISC,
             "Block not available (not fully downloaded)",
         ));
     }
     Err(rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"))
+}
+
+/// A header row, or a side-branch body held in RAM.
+fn knows_header(ctx: &RpcContext, hash: &[u8; 32]) -> bool {
+    let typed = BlockHash::from_byte_array(*hash);
+    ctx.chain.as_ref().is_some_and(|c| c.knows_header(&typed))
+        || ctx.query.get_header_by_hash(hash).ok().flatten().is_some()
 }
 
 pub fn confirmations(ctx: &RpcContext, height: Height) -> u32 {
@@ -1246,7 +1254,14 @@ pub fn getblockfilter(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
         .query
         .basic_filter_for_hash(&hash)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
-        .ok_or_else(|| rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"))?;
+        .ok_or_else(|| {
+            let message = if knows_header(ctx, &hash) {
+                "Filter not found. Block was not connected to active chain."
+            } else {
+                "Block not found"
+            };
+            rpc_error(ERR_INVALID_ADDRESS_OR_KEY, message)
+        })?;
     use bitcoin::hashes::Hash;
     Ok(json!({
         "filter": rbitcoin_primitives::hex_encode(&body),
@@ -1257,7 +1272,7 @@ pub fn getblockfilter(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
 pub fn gettxout(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["txid", "n", "include_mempool"])?;
     let hex = params.req_str(0, "txid")?;
-    let n = params.req_u64(1, "n")? as u32;
+    let n: u32 = params.req_core_int(1, "n")?;
     let include_mempool = params.opt_bool(2, "include_mempool")?.unwrap_or(true);
     let want = parse_hash32_display(hex)?;
     if want == genesis_coinbase_txid(ctx) {
@@ -1297,7 +1312,7 @@ pub fn gettxout(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
         .query
         .get_tx(fk)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
-    // Spender read treats a slot past `output_count` as corrupt. The vout is absent.
+    // A vout past `output_count` is absent; the output read below would fail.
     if n >= rec.output_count {
         return Ok(Value::Null);
     }
@@ -1350,6 +1365,9 @@ pub fn gettxout(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     }))
 }
 
+/// Core's name for the BIP158 basic filter index (`-blockfilterindex`).
+const BASIC_FILTER_INDEX: &str = "basic block filter index";
+
 pub fn getindexinfo(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["index_name"])?;
     let tip = ctx.query.tip_height().map(|h| h.0).unwrap_or(0);
@@ -1357,9 +1375,32 @@ pub fn getindexinfo(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value
         "synced": true,
         "best_block_height": tip,
     });
+    // With --block-filter-index, Core lists the filter index too: synced once the committed
+    // filters reach the tip, at the last filtered height.
+    let filters = if ctx.query.block_filter_enabled() {
+        let hwm = ctx
+            .query
+            .basic_filter_hwm()
+            .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+        Some(json!({
+            "synced": ctx.query.block_filter_lag_heights() == 0,
+            "best_block_height": hwm.unwrap_or(0),
+        }))
+    } else {
+        None
+    };
     match params.get(0, "index_name") {
-        None | Some(Value::Null) => Ok(json!({ "txindex": txindex })),
+        None | Some(Value::Null) => {
+            let mut all = json!({ "txindex": txindex });
+            if let Some(f) = filters {
+                all[BASIC_FILTER_INDEX] = f;
+            }
+            Ok(all)
+        }
         Some(Value::String(s)) if s == "txindex" => Ok(json!({ "txindex": txindex })),
+        Some(Value::String(s)) if s == BASIC_FILTER_INDEX => {
+            Ok(filters.map_or_else(|| json!({}), |f| json!({ BASIC_FILTER_INDEX: f })))
+        }
         Some(Value::String(_)) => Ok(json!({})),
         Some(_) => Err(rpc_error(ERR_INVALID_PARAMS, "index_name must be a string")),
     }
@@ -1474,9 +1515,17 @@ pub fn waitforblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value
 
 pub fn waitforblockheight(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["height", "timeout"])?;
-    let want = params.req_u64(0, "height")? as u32;
+    let want = params.req_core_int(0, "height")?;
     let timeout_ms = wait_timeout_ms(params, 1, "timeout")?;
-    wait_for_tip(ctx, timeout_ms, |_hash, height| height >= want)
+    wait_for_tip(ctx, timeout_ms, |_hash, height| {
+        height_reached(height, want)
+    })
+}
+
+/// Core's `waitforblockheight` loop: a tip at or above `want`, so a
+/// negative height is reached at genesis.
+pub(crate) fn height_reached(tip: u32, want: i32) -> bool {
+    i64::from(tip) >= i64::from(want)
 }
 
 pub fn waitfornewblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {

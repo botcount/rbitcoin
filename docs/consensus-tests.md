@@ -2,7 +2,7 @@
 
 Every consensus rule **we implement** (not delegated wholesale to rust-bitcoin) has an automated test that would fail if the check were removed or inverted.
 
-**Out of scope:** secp256k1, which stays the shared library. Script opcode parity against Bitcoin Core is this corpus (`crates/rbitcoin-consensus/tests/fixtures/script_corpus/`) plus Core's JSON (`script_tests.json`, `tx_valid.json`, `tx_invalid.json`, `sighash.json`), both checked against Core v32.1 `VerifyScript`. Not every historical mainnet retarget. One boundary is pinned: height 32256 compact `0x1d00d86a`, plus the quarter, 4×, and pow-limit clamp literals (`mainnet_retarget_32256_matches_core_compact`, `retarget_clamps_timespan_and_caps_at_pow_limit`).
+**Out of scope:** secp256k1, which stays the shared library. Script opcode parity against Bitcoin Core is this corpus (`crates/rbitcoin-consensus/tests/fixtures/script_corpus/`) plus Core's JSON (`script_tests.json`, `tx_valid.json`, `tx_invalid.json`, `sighash.json`), both checked against the pinned Core `VerifyScript`. Not every historical mainnet retarget. One boundary is pinned: height 32256 compact `0x1d00d86a`, plus the quarter, 4×, and pow-limit clamp literals (`mainnet_retarget_32256_matches_core_compact`, `retarget_clamps_timespan_and_caps_at_pow_limit`).
 
 ## Running
 
@@ -27,7 +27,8 @@ cargo test -p rbitcoin-test --test suite scenarios::consensus_
 
 ## Core consensus corpora (1:1 surface)
 
-Staged each `cargo test` run from the Bitcoin Core **v32.1** submodule
+Staged each `cargo test` run from the Bitcoin Core submodule (master
+**`d206226b`**, after v32.1)
 `third_party/bitcoin/src/test/data/` (MIT). Offline after
 `./scripts/core-functional/init-submodule.sh`. Bump the gitlink pin when
 refreshing; do not check copies into `tests/fixtures/`.
@@ -39,8 +40,9 @@ refreshing; do not check copies into `tests/fixtures/`.
 | `tx_invalid.json` | same | `script::core_tx_vectors::core_tx_invalid_all_rows` | every data row reject |
 | `sighash.json` | same | `script::core_sighash::core_sighash_all_rows` | every data row digest matches Core |
 | `bip341_wallet_vectors.json` | same | `script::core_bip341::core_bip341_wallet_vectors_all_rows` | key-path fully-signed + per-input spends accept; unknown-leaf script-path accepts |
-| `script_corpus/script_tests.json` | `tests/fixtures/script_corpus/` (ours, Core row form) | `script::core_vectors::script_corpus_rows_match_our_interpreter` and `script-oracle` | every row accept/reject matches the file; the oracle is Core v32.1 `VerifyScript` |
+| `script_corpus/script_tests.json` | `tests/fixtures/script_corpus/` (ours, Core row form) | `script::core_vectors::script_corpus_rows_match_our_interpreter` and `script-oracle` | every row accept/reject matches the file; the oracle is the pinned Core `VerifyScript` |
 | mainnet 866342 + prevouts | `tests/fixtures/block_866342/` (Floresta zstd) | `block::block_866342::block_866342_structure_scripts_and_overweight` | structure at height + every non-coinbase `verify_job_all_inputs`; extra-NOP clone is 4_000_001 WU |
+| BIP 54 vectors (`timestamps`, `coinbases`, `txsize`, `sigops`) | `tests/fixtures/bip54/` (bitcoin/bips `bip-0054/test_vectors`; the two large files under zstd) | `block::bip54_vectors::*` | every case accepts or rejects as its `valid` says, with mainnet parameters and `enforce_bip54` set; a reject carries the BIP 54 reason |
 
 ### How the harness works
 
@@ -49,6 +51,9 @@ refreshing; do not check copies into `tests/fixtures/`.
 3. Build Core-style **credit/spend** txs (script_tests) or deserialize fixture txs (tx_*).
 4. Call shipped **`verify_job_all_inputs(ScriptCheckJob)`** (or bare EvalScript+P2SH path when `WITNESS` flag is off — Core treats v0 programs as bare without that flag).
 5. Compare accept/reject to Core’s expected code. Named error codes only require **reject**, not exact code string.
+6. Pass each fixture flag as written. The harness does not turn on DERSIG
+   for LOW_S or STRICTENC; the interpreter requires strict DER under either
+   one, as Core's `CheckSignatureEncoding` does.
 
 ### No allowlist
 
@@ -56,7 +61,8 @@ refreshing; do not check copies into `tests/fixtures/`.
 - There is **no** row skip inventory. A mismatch fails the test; fix the engine or
   the fixture interpretation before commit.
 - **Status:** Core JSON corpora green on the shipped path
-  (`script_tests` 1237/1237 on Core v32.1, `tx_valid` 121/121, `tx_invalid` 93/93,
+  (`script_tests` 1280/1280 on Core master `d206226b`, `tx_valid` 122/122,
+  `tx_invalid` 97/97,
   `sighash` 500/500, `bip341_wallet_vectors` 9/9).
 
 ### rust-bitcoin vs Core fixtures
@@ -74,10 +80,10 @@ The BLVM / Orange Paper register (163 ids) is a separate crosswalk:
 [`blvm-consensus-crosswalk.md`](./blvm-consensus-crosswalk.md). It does
 not own these S/H/C rows.
 
-Hornet’s published 34-rule table is a **gap checklist** against this
-matrix, not a second spec. Full ID-by-ID happy/boundary map (Hornet `main`
-`spec.h` @ `151462fa` vs spec.html):
-[`peer-clients.md`](./peer-clients.md) § Hornet block-validation rules.
+Hornet’s published rule table is a gap checklist against this matrix, not a
+second spec. The ID map is [`peer-clients.md`](./peer-clients.md) § Hornet
+block-validation rules. The page and `spec.h` match at `0e3b0a1b` (35 rules,
+S02 and S03 separate). GitHub `main` `151462fa` still folds S02 into S03.
 Selector: `./scripts/test-hornet-rules.sh` (runs `structure_rule_tests`,
 header version/time, `finality_tests`, `sigop_cost_tests`,
 `consensus_rules`).
@@ -142,14 +148,14 @@ version floors and exact +2h).
 | C22 | Subsidy halving interval from params | 50 BTC until interval | `p1_block_subsidy_halvings`; `rejects_coinbase_excess_value_fast`; journey overlay interval=2: `header_and_spending_boundaries` |
 | C27 | Captured signet/mainnet script-edge wire blocks (not Core JSON) | hash / opcode presence; detached verify | `script_edge_fixtures` |
 | C28 | Coinbase maturity (`COINBASE_MATURITY`) when the coinbase and its spender are in different blocks of one confirm batch | `BadTx("coinbase immature")` at created+99; created+100 accepts | `consensus_rules::coinbase_maturity_holds_inside_one_confirm_batch`; one-block-per-batch: `header_and_spending_boundaries` |
-| C31 | Script flags: P2SH / WITNESS / TAPROOT on every block; Core's mainnet `script_flag_exceptions` replace the set (BIP16 170060 → none, Taproot 692261 → P2SH+WITNESS); DERSIG / CLTV / CSV / NULLDUMMY height-gated. Policy flags stay off. The testnet3 BIP16 exception arrives with #884; once both land, `witness_active = bip16_active` clears WITNESS and TAPROOT for that block too, as in Core | `ScriptVerifyFlags::consensus_at`; script reject below an overlaid segwit height | `script_flags_follow_core_exception_table`; `exception_hashes_change_which_scripts_run` (taproot hashtype `0x00` accepted only on the exception hash; `OP_0` P2SH redeem not executed only on the BIP16 exception); `consensus_rules::witness_program_rules_bind_below_segwit_height` |
+| C31 | Script flags: P2SH / WITNESS / TAPROOT on every block; Core's mainnet `script_flag_exceptions` replace the set (BIP16 170060 → none, Taproot 692261 → P2SH+WITNESS); DERSIG / CLTV / CSV / NULLDUMMY height-gated. Policy flags stay off. `witness_active` follows `bip16_active`, so the BIP16 exception clears WITNESS and TAPROOT for that block too, as in Core | `ScriptVerifyFlags::consensus_at`; script reject below an overlaid segwit height | `script_flags_follow_core_exception_table`; `exception_hashes_change_which_scripts_run` (taproot hashtype `0x00` accepted only on the exception hash; `OP_0` P2SH redeem not executed only on the BIP16 exception); `consensus_rules::witness_program_rules_bind_below_segwit_height` |
 | C32 | P2PKH fast path: scriptSig push > 520 falls back to the interpreter | `PUSH_SIZE` | `p2pkh_signature_push_over_520_rejected_pre_bip66` |
 | C33 | P2WPKH fast path (native + nested): strict DER only with DERSIG; witness element ≤ 520 | `PUSH_SIZE` / DER reject | `p2wpkh_der_follows_bip66_flag_and_push_size` |
 | C34 | Base CHECKMULTISIG FindAndDelete of an empty sig removes every OP_0 opcode before the other sigs hash scriptCode | accept / `SIG_DER` | `legacy_multisig_empty_sig_deletes_op_0_from_script_code` |
 | C35 | P2SH scriptPubKey `HASH160 <20> EQUAL` runs on the scriptSig stack: 1000 items fail `MAX_STACK_SIZE` at the `<20>` push, with or without BIP16 | `stack size` | `p2sh_script_pubkey_push_counts_against_max_stack_size` ([086](./external_findings/086-p2sh-spk-stack-size.md)) |
 | C36 | A tx is final at the connect height | `locktime=100` accepts at height 101; `locktime==height` rejects | `header_and_spending_boundaries` |
 | C37 | BIP30: a txid is not created again while an unspent output of that txid still exists. Exceptions 91842 and 91880. The BIP34 ancestry skip resolves the ancestor once per write and remembers the confirmed header until that block is disconnected. A wrong hash keeps the check on | every connecting block; `is_bip30_repeat_matches_core` | `buried_rules_and_a_lying_header_path`, `bip30_duplicate_coinbase_in_one_batch`, `repeated_coinbase_chain_connects_in_any_batch_split`, `repeated_coinbase_chain_rejects_what_core_rejects`, `bip34_era_repeat_connects_in_any_batch_split`, `bip34_era_repeated_spend_rejects_bip30_in_any_batch_split`, `repeated_coinbase_connects_when_ibd_merges_load_batches`, `respend_of_a_same_block_spend_rejects_in_any_split`, `repeated_tx_spent_in_its_own_block_connects_in_any_split`, `third_copy_of_a_coinbase_connects_in_any_split`, `third_copy_over_an_unspent_copy_rejects_bip30_in_any_split`, `repeated_coinbase_archived_retry_connects_the_valid_prefix`, `bip34_ancestor_in_the_same_write_skips_bip30`, `bip34_ancestor_already_committed_skips_bip30`, `wrong_bip34_ancestor_keeps_bip30_on`, `bip34_ancestor_reorg_drops_the_match` |
-| C38 | An input's prevout exists and is still unspent | height-1 coinbase spend accepts | missing txid → `MissingPrevout`; child-before-parent; a second spend of the same outpoint; two spends in one block. `header_and_spending_boundaries` |
+| C38 | An input's prevout exists and is still unspent, also after a multi-block write rejects and IBD retries one block at a time on its archived bodies | height-1 coinbase spend accepts | missing txid → `MissingPrevout`; child-before-parent; a second spend of the same outpoint; two spends in one block. `header_and_spending_boundaries`; a later block re-spends a same-block spend after the merged write rejects: `consensus_rules::respend_of_a_same_block_spend_rejects_on_single_block_retry`, IBD `merged_respend_of_a_same_block_spend_is_rejected_alone` ([114](./external_findings/114-respend-after-rejected-write.md)); a block that leaves the chain and connects again, with a spend checkpoint while it was active and another before it returns, keeps an output it spent inside itself spent: `reconnected_block_keeps_its_in_block_spend_across_checkpoints` ([116](./external_findings/116-reconnected-in-block-spend.md)) |
 | C40 | A tx's output sum ≤ its input sum | `in==out` accepts | `in+1` rejects. `header_and_spending_boundaries` |
 | C41 | BIP68 relative finality. The coinbase is not an input: version ≥ 2 and a relative lock that would fail on a non-coinbase still connect | `nSequence=10` at height 101 accepts; time-type after MTP | `nSequence=200` at 101 rejects; `bip68_skips_a_coinbase_whose_relative_lock_would_fail`; `finality_tests` 109/110 |
 | C42 | An input binds only to an output from an earlier block or an earlier tx in its own block, also inside one multi-block confirm batch (Core connects one block at a time). A repeated txid binds the newest copy created before the spend, including when the bodies are already archived | `MissingPrevout` (`bad-txns-inputs-missingorspent`) | `consensus_rules::same_batch_spend_of_a_later_block_is_missing`; `plan_batch_spend_between_repeated_txid_binds_the_earlier_copy`; `repeated_coinbase_archived_retry_connects_the_valid_prefix`; IBD isolation `batched_spend_of_a_later_block_is_rejected_alone` ([087](./external_findings/087-forward-spend-in-batch.md)); same block: `header_and_spending_boundaries` ([005](./external_findings/005-non-topological-block-accepted.md)) |
@@ -159,9 +165,9 @@ version floors and exact +2h).
 ## Adding a new rule
 
 1. Add a row to the inventory above (or mark **rust-bitcoin** / **lib** if delegated).
-2. Prefer a pure unit test in `rbitcoin-consensus` when no chain state is needed; otherwise `consensus_rules` or a focused scenario.
+2. Prefer a pure unit test in `rbitcoin-consensus` when no chain state is needed; otherwise `consensus_rules` or a focused scenario. Some journey still hits the rule once with one realistic block. The unit keeps the boundary matrix, including H8's exact `+2h` case on the header unit. Do not move that case onto `header_and_spending_boundaries`.
 3. For Core corpora: every row must pass; never reintroduce allowlist/skip debt.
-4. Assert on the **error signal** string/variant so removing the check fails the test.
+4. Assert the reject code or variant a caller matches, so removing the check fails the test. Do not pin incidental log prose.
 
 Dependency gate: `cargo tree -i bitcoinconsensus` must not resolve
 (product workspace). The isolated [`fuzz/`](../fuzz/) workspace may depend on

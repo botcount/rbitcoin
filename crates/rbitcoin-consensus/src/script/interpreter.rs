@@ -15,6 +15,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bitcoin::hashes::Hash;
 use bitcoin::script::{Instruction, Script};
@@ -68,6 +69,11 @@ pub const MAX_SCRIPT_SIZE_LEGACY: usize = 10_000;
 /// Legacy / witness-v0 non-push opcode budget. **Not** applied in tapscript (BIP342).
 #[doc(hidden)]
 pub const MAX_OPS_LEGACY: usize = 201;
+
+/// Legacy sighash bytes one unconfirmed transaction may hash. Each base
+/// CHECKSIG counts the non-witness size plus that input's scriptCode.
+/// Every input shares the budget. Block connect does not use this cap.
+pub const MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES: u64 = 400_000;
 #[doc(hidden)]
 pub const MAX_PUBKEYS_PER_MULTISIG: i64 = 20;
 
@@ -238,6 +244,12 @@ pub struct EvalContext<'a> {
     pub codeseparator_script_off: Cell<Option<usize>>,
     /// Legacy midstate. Created on first use (WitnessV0 uses `pre`, tapscript `tapscript`).
     pub cache: RefCell<Option<SighashCache<&'a Transaction>>>,
+    /// Bytes of legacy sighash still allowed when this context has no shared
+    /// job budget. `u64::MAX` on the consensus path.
+    pub legacy_sighash_left: AtomicU64,
+    /// The transaction's remaining legacy-sighash budget. Set by
+    /// [`Self::apply_job_flags`] so every input of one job shares it.
+    shared_legacy_sighash: Option<&'a AtomicU64>,
     /// Structure/lookup midstates (WitnessV0 BIP143).
     pub pre: Cow<'a, crate::TxScriptPrecompute>,
     /// BIP342 remaining validation weight (`50 + witness serialized size`).
@@ -354,6 +366,8 @@ impl<'a> EvalContext<'a> {
             codeseparator_pos: Cell::new(0xFFFF_FFFF),
             codeseparator_script_off: Cell::new(None),
             cache: RefCell::new(None),
+            legacy_sighash_left: AtomicU64::new(u64::MAX),
+            shared_legacy_sighash: None,
             pre,
             validation_weight_left: Cell::new(tapscript_init_weight(
                 tx,
@@ -371,7 +385,7 @@ impl<'a> EvalContext<'a> {
     }
 
     /// Copy standardness / fixture flags from a [`crate::block::ScriptCheckJob`].
-    pub fn apply_job_flags(mut self, job: &crate::block::ScriptCheckJob) -> Self {
+    pub fn apply_job_flags(mut self, job: &'a crate::block::ScriptCheckJob) -> Self {
         self.minimal_data = job.minimal_data;
         self.nullfail = job.nullfail;
         self.low_s = job.low_s;
@@ -380,6 +394,16 @@ impl<'a> EvalContext<'a> {
         self.minimal_if = job.minimal_if;
         self.witness_pubkeytype = job.witness_pubkeytype;
         self.const_scriptcode = job.const_scriptcode;
+        if job.const_scriptcode {
+            let slot = &job.legacy_sighash_left;
+            let _ = slot.compare_exchange(
+                u64::MAX,
+                MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            self.shared_legacy_sighash = Some(slot);
+        }
         if job.low_s || job.strictenc {
             self.bip66_active = true;
         }
@@ -435,10 +459,10 @@ pub fn require_clean_true(stack: &[Vec<u8>]) -> Result<(), ConsensusError> {
 /// **Not** cleanstack — BIP62 CLEANSTACK was never activated for non-witness
 /// consensus. Requiring `len==1` falsely rejected valid P2SH (signet 219477).
 pub fn require_true_top(stack: &[Vec<u8>]) -> Result<(), ConsensusError> {
-    if stack.is_empty() || !bitcoin::script::read_scriptbool(stack.last().unwrap()) {
-        return Err(ConsensusError::Script("script false".into()));
+    match stack.last() {
+        Some(top) if bitcoin::script::read_scriptbool(top) => Ok(()),
+        _ => Err(ConsensusError::Script("script false".into())),
     }
-    Ok(())
 }
 
 /// Evaluate scriptSig as push-only onto `stack` (BIP16 P2SH / SIGPUSHONLY).
@@ -741,9 +765,9 @@ pub fn eval_script(
                         stack.swap(n - 3, n - 1);
                     }
                     0x73 => {
-                        require_n(stack, 1)?;
-                        if bitcoin::script::read_scriptbool(stack.last().unwrap()) {
-                            let v = stack.last().unwrap().clone();
+                        let top = stack_top(stack)?;
+                        if bitcoin::script::read_scriptbool(top) {
+                            let v = top.clone();
                             push(stack, altstack.len(), v)?;
                         }
                     }
@@ -755,8 +779,7 @@ pub fn eval_script(
                         pop(stack)?;
                     }
                     0x76 => {
-                        require_n(stack, 1)?;
-                        let v = stack.last().unwrap().clone();
+                        let v = stack_top(stack)?.clone();
                         push(stack, altstack.len(), v)?;
                     }
                     0x77 => {
@@ -806,8 +829,7 @@ pub fn eval_script(
                         stack.swap(n - 3, n - 2);
                     }
                     0x82 => {
-                        require_n(stack, 1)?;
-                        let sz = stack.last().unwrap().len() as i64;
+                        let sz = stack_top(stack)?.len() as i64;
                         push(stack, altstack.len(), scriptnum_encode(sz))?;
                     }
                     0x87 => {
@@ -949,9 +971,8 @@ pub fn eval_script(
                         if !ctx.bip65_active {
                             continue;
                         }
-                        require_n(stack, 1)?;
                         // BIP65 locktime: 5-byte script integer, minimal encoding when required.
-                        let locktime = scriptnum_decode_width(stack.last().unwrap(), 5, rm)?;
+                        let locktime = scriptnum_decode_width(stack_top(stack)?, 5, rm)?;
                         if locktime < 0 {
                             return Err(ConsensusError::Script("CLTV negative".into()));
                         }
@@ -974,12 +995,11 @@ pub fn eval_script(
                         if !ctx.bip112_active {
                             continue;
                         }
-                        require_n(stack, 1)?;
-                        let csv = scriptnum_decode_width(stack.last().unwrap(), 5, rm)?;
+                        let csv = scriptnum_decode_width(stack_top(stack)?, 5, rm)?;
                         if csv < 0 {
                             return Err(ConsensusError::Script("CSV negative".into()));
                         }
-                        if csv as u32 & (1 << 31) != 0 {
+                        if csv as u32 & crate::SEQUENCE_LOCKTIME_DISABLE_FLAG != 0 {
                             // disabled bit → NOP (before version gate)
                             continue;
                         }
@@ -1011,20 +1031,19 @@ pub fn eval_script(
     Ok(true)
 }
 
-/// The type bit does not overlap the low 16, so `|` and `^` are the same mask.
-#[cfg_attr(feature = "mutants", mutants::skip)]
+/// The type bit sits above the low 16, so adding it is the CSV mask.
 #[doc(hidden)]
 pub fn csv_locktime_mask(type_bit: u32) -> u32 {
-    0x0000_ffff | type_bit
+    0x0000_ffff_u32.wrapping_add(type_bit)
 }
 
 #[doc(hidden)]
 pub fn sequence_csv_ok(seq: Sequence, csv: u32) -> bool {
     let seq_n = seq.to_consensus_u32();
-    if seq_n & (1 << 31) != 0 {
-        return false; // SEQUENCE_LOCKTIME_DISABLE_FLAG on input
+    if seq_n & crate::SEQUENCE_LOCKTIME_DISABLE_FLAG != 0 {
+        return false;
     }
-    let type_bit = 1 << 22;
+    let type_bit = crate::SEQUENCE_LOCKTIME_TYPE_FLAG;
     let mask = csv_locktime_mask(type_bit);
     let seq_masked = seq_n & mask;
     let csv_masked = csv & mask;
@@ -1483,8 +1502,12 @@ pub fn ecdsa_sig_matches(
     let Ok(pk) = crypto::parse_pubkey(pubkey) else {
         return Ok(false);
     };
-    let Ok(sighash) = sighash_for_script(ctx, sighash_ty, script_code, ver) else {
-        return Ok(false);
+    // Consensus keeps a sighash failure as a non-matching signature. Admit
+    // turns that into a hard error so the legacy hashed-work cap stops the script.
+    let sighash = match sighash_for_script(ctx, sighash_ty, script_code, ver) {
+        Ok(hash) => hash,
+        Err(e) if ctx.const_scriptcode => return Err(e),
+        Err(_) => return Ok(false),
     };
     Ok(crypto::verify_ecdsa(sighash, &ecdsa_sig, &pk))
 }
@@ -1578,6 +1601,34 @@ pub fn sighash_for_script(
         PreTapscript::Base => {
             // Raw hashtype 0 is not SIGHASH_ALL=1. The caller already dropped
             // a bare OP_CODESEPARATOR.
+            if ctx.const_scriptcode {
+                let slot = ctx
+                    .shared_legacy_sighash
+                    .unwrap_or(&ctx.legacy_sighash_left);
+                // Non-witness size plus this scriptCode. Witness bytes are
+                // not in a legacy sighash. scriptPubKey is, and it is not in
+                // the spending transaction.
+                let cost = u64::try_from(ctx.tx.base_size())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(u64::try_from(script_bytes.len()).unwrap_or(u64::MAX));
+                loop {
+                    let left = slot.load(Ordering::Relaxed);
+                    if cost > left {
+                        return Err(ConsensusError::Script("legacy sighash work".into()));
+                    }
+                    if slot
+                        .compare_exchange_weak(
+                            left,
+                            left - cost,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+            }
             let mut slot = ctx.cache.borrow_mut();
             let cache = slot.get_or_insert_with(|| SighashCache::new(ctx.tx));
             let h = cache
@@ -1618,6 +1669,15 @@ pub fn require_n(stack: &[Vec<u8>], n: usize) -> Result<(), ConsensusError> {
         return Err(ConsensusError::Script("stack empty".into()));
     }
     Ok(())
+}
+
+/// Top element. An empty stack is the same script error as [`require_n`] of one.
+#[doc(hidden)]
+pub fn stack_top(stack: &[Vec<u8>]) -> Result<&Vec<u8>, ConsensusError> {
+    match stack.last() {
+        Some(top) => Ok(top),
+        None => Err(ConsensusError::Script("stack empty".into())),
+    }
 }
 
 #[doc(hidden)]

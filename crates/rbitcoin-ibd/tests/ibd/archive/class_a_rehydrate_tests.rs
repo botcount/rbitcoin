@@ -320,3 +320,114 @@ fn bq_rehydrate_does_not_offer_a_competing_leftover() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A gap height that is only pending is not marked missing.
+#[test]
+fn bq_gap_pending_only_stays_pending() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("bq-gap-pending");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let time = 1_300_000_000u32;
+    let mut prev = gen;
+    let mut hashes = Vec::new();
+    let mut fks = Vec::new();
+    for h in 1u32..=3 {
+        let b = mine(prev, time + h * 600, h);
+        fks.push(hub.ensure_header_fk(&b.header).unwrap());
+        hashes.push(b.block_hash());
+        prev = b.block_hash();
+    }
+
+    let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    for (i, hash) in hashes.iter().enumerate() {
+        st.record_height(*hash, (i as u32) + 1);
+    }
+    st.body.mark_pending(hashes[1]);
+    hub.query
+        .block_queue_enqueue(3, hashes[2].to_byte_array(), fks[2].0, b"wire3")
+        .unwrap();
+    let feed = ConfirmFeed::new();
+    let n = rehydrate_block_queue_into_confirm(&hub, &mut st, &feed).unwrap();
+    assert_eq!(n, 1, "height 3 is the only ready body");
+    assert!(
+        st.body.is_pending(&hashes[1]) && !st.body.is_missing(&hashes[1]),
+        "pending-only gap height stays pending"
+    );
+    assert!(
+        st.body.is_missing(&hashes[0]),
+        "an empty gap height is marked missing"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Store Class A at tip+1 is offered when the known cache does not have it.
+#[test]
+fn class_a_rehydrate_offers_store_without_known_cache() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("ca-store-only");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let b = mine(gen, 1_300_000_600, 1);
+    let hash = b.block_hash();
+    let (rec, txs) =
+        rbitcoin_query::prepare_block_for_archive(&hub.query, &hub.params, &b).unwrap();
+    hub.query.commit_class_a_only(&rec, &txs).unwrap();
+    let fk = hub.ensure_header_fk(&b.header).unwrap();
+    let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    st.record_height(hash, 1);
+    st.header_fks.insert(hash, fk);
+    assert!(!st.body.is_known_archived(&hash));
+    assert!(hub.query.is_block_archived(&hash.to_byte_array()).unwrap());
+    let feed = ConfirmFeed::new();
+    let n = rehydrate_class_a_into_body_queue(&hub, &mut st, &feed, 32).unwrap();
+    assert_eq!(n, 1, "store Class A at tip+1 is offered");
+    assert!(hub.query.block_queue_has_height(1));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A reconstructed header whose nonce no longer matches the indexed hash
+/// is not offered. Merkle still matches the stored transactions.
+#[test]
+fn class_a_rehydrate_rejects_a_hash_mismatch() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("ca-hash-mismatch");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let b = mine(gen, 1_300_000_600, 1);
+    let hash = b.block_hash();
+    let (rec, txs) =
+        rbitcoin_query::prepare_block_for_archive(&hub.query, &hub.params, &b).unwrap();
+    hub.query.commit_class_a_only(&rec, &txs).unwrap();
+    let fk = hub.ensure_header_fk(&b.header).unwrap();
+    let mut stored = hub.query.store.headers.get(fk).unwrap();
+    stored.nonce = stored.nonce.wrapping_add(1);
+    let offset = rbitcoin_store::file::FILE_HEADER_LEN as u64
+        + (fk.0 - 1) * rbitcoin_store::header_table::HEADER_RECORD_LEN as u64;
+    hub.query
+        .store
+        .headers
+        .body
+        .write_at(offset, &stored.encode())
+        .unwrap();
+
+    let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    st.record_height(hash, 1);
+    st.header_fks.insert(hash, fk);
+    let feed = ConfirmFeed::new();
+    let n = rehydrate_class_a_into_body_queue(&hub, &mut st, &feed, 32).unwrap();
+    assert_eq!(
+        n, 0,
+        "a header that does not hash to the index is not offered"
+    );
+    assert!(
+        !hub.query.block_queue_has_height(1),
+        "the mismatched body stays off the queue"
+    );
+    assert!(
+        st.body.is_missing(&hash),
+        "the height is marked missing for re-getdata"
+    );
+    assert!(
+        !hub.query.is_block_archived(&hash.to_byte_array()).unwrap(),
+        "Class A is cleared after the header check fails"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

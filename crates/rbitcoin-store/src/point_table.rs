@@ -52,16 +52,14 @@ pub fn put_spend_on_create_at(
     if create_tx_fk.is_null() || spending_tx_fk.is_null() {
         return Err(StoreError::InvalidFk);
     }
-    let (multi, field, field_vin) = match body_range {
-        Some((off, len)) => txs.get_output_spender_meta_at(off, len, vout)?,
-        None => txs.get_output_spender_meta(create_tx_fk, vout)?,
+    let (body_off, body_len) = match body_range {
+        Some(range) => range,
+        None => txs.spent_range(create_tx_fk)?,
     };
+    let (multi, field, field_vin) = txs.get_output_spender_meta_at(body_off, body_len, vout)?;
 
     let set = |multi: bool, field: Fk, vin: u32| -> Result<(), StoreError> {
-        match body_range {
-            Some((off, len)) => txs.set_output_spender_meta_at(off, len, vout, multi, field, vin),
-            None => txs.set_output_spender_meta(create_tx_fk, vout, multi, field, vin),
-        }
+        txs.store_spend_slot_at(body_off, body_len, vout, multi, field, vin)
     };
 
     if !multi && field.is_null() {
@@ -108,11 +106,21 @@ where
     if create_tx_fk.is_null() {
         return Ok(());
     }
-    let (multi, field, vin) = match txs.get_output_spender_meta(create_tx_fk, vout) {
-        Ok(m) => m,
-        Err(StoreError::NotFound) => return Ok(()),
-        Err(e) => return Err(e),
+    let Some(loc) = txs
+        .create_loc_range_batch(&[create_tx_fk])?
+        .into_iter()
+        .next()
+        .flatten()
+    else {
+        return Ok(());
     };
+    // Callers pass a request's vout. Past `n_out` there is no output, so no
+    // spender; the slot read would report it as corrupt.
+    if vout >= loc.n_out {
+        return Ok(());
+    }
+    let (off, len) = loc.spent;
+    let (multi, field, vin) = txs.get_output_spender_meta_at(off, len, vout)?;
     if field.is_null() {
         return Ok(());
     }

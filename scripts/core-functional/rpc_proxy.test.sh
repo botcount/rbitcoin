@@ -267,7 +267,7 @@ peel_authproxy_args(send_mixed)
 assert send_mixed["params"] == ["dead", 0.1], send_mixed
 
 assert node_rpc_port(18443) == 28443
-assert esplora_port(18443) == 38443
+assert esplora_port(18443) == 61299
 # Consecutive Core rpcports must not share node-RPC / Esplora binds.
 for base in (16000, 18443, 20000, 45535):
     seen = set()
@@ -277,10 +277,25 @@ for base in (16000, 18443, 20000, 45535):
         assert len(ports) == 3, ports
         assert ports.isdisjoint(seen), (pub, ports & seen)
         seen |= ports
-# Wrap stays in range and still misses the public port.
+# node-RPC still wraps under 65535. Esplora stays in 61000-65535.
 assert node_rpc_port(60000) == 50000
-assert esplora_port(50000) == 30000
-assert 1 <= esplora_port(56000) <= 65535
+assert esplora_port(50000) == 61104
+assert esplora_port(56000) == 62568
+# Core's test ports plus rpc+20000 land in 36000-41000. That is inside
+# the default ephemeral range (32768-60999), so a live outbound socket
+# makes esplora bind fail with EADDRINUSE. p2p_compactblocks_blocksonly
+# node 2 on portseed 40 was that failure.
+EPHEMERAL = range(32768, 61000)
+for seed in range(80):
+    off = (12 * seed) % 4987
+    for n in range(12):
+        pub = 16000 + n + off
+        p2p = pub - 5000
+        tor = p2p + 10000
+        node = node_rpc_port(pub)
+        esp = esplora_port(pub)
+        assert esp not in EPHEMERAL, (seed, n, pub, esp)
+        assert len({pub, p2p, tor, node, esp}) == 5, (pub, p2p, tor, node, esp)
 
 assert node_authorization("__cookie__:secret") == "Bearer secret"
 assert node_authorization("secret") == "Bearer secret"

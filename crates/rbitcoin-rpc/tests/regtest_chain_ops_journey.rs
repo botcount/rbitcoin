@@ -310,6 +310,8 @@ fn chain_ops_client_param_edges(ctx: &mut RpcContext) {
     chain_ops_wrong_json_types(ctx);
     chain_ops_regtest_type_errors(ctx);
     chain_ops_generate_count_is_core_int(ctx);
+    chain_ops_index_args_are_core_ints(ctx);
+    chain_ops_spendingprevout_vout_is_core_int(ctx);
     chain_ops_junk_tx_hex(ctx);
     chain_ops_network_identity(ctx);
     ctx.stop.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -515,7 +517,6 @@ fn chain_ops_unknown_named_param(ctx: &RpcContext) {
 fn chain_ops_wrong_json_types(ctx: &RpcContext) {
     for (method, params, needle) in [
         ("help", vec![json!(1)], "command must be a string"),
-        ("getblockhash", vec![json!("0")], "must be an integer"),
         ("getblockheader", vec![json!(1)], "must be a string"),
         ("getblock", vec![json!(true)], "must be a string"),
         ("getrawtransaction", vec![json!([])], "must be a string"),
@@ -544,7 +545,6 @@ fn chain_ops_wrong_json_types(ctx: &RpcContext) {
             "outputs array required",
         ),
         ("waitforblock", vec![json!(1)], "must be a string"),
-        ("waitforblockheight", vec![json!("1")], "must be an integer"),
         ("waitfornewblock", vec![json!("1")], "must be an integer"),
         ("getnetworkhashps", vec![json!("120")], "must be an integer"),
         ("getrawmempool", vec![json!("true")], "must be a bool"),
@@ -634,6 +634,91 @@ fn chain_ops_generate_count_is_core_int(ctx: &RpcContext) {
         );
     }
     assert_eq!(tip_count(ctx), 0);
+}
+
+/// Core type-checks each `gettxspendingprevout` output, then reads `vout`
+/// with `getInt<int>`: a missing or null `vout` and a string are `-3`, a value
+/// outside `int` is `-1`, and a negative one is `-8`.
+fn chain_ops_spendingprevout_vout_is_core_int(ctx: &RpcContext) {
+    let txid = json!("00".repeat(32));
+    let spender_of = |output: Value| dispatch(ctx, "gettxspendingprevout", vec![json!([output])]);
+    let at = |vout: Value| spender_of(json!({ "txid": txid.clone(), "vout": vout }));
+    for vout in [
+        json!(4_294_967_296_u64),
+        json!(u32::MAX),
+        json!(2_147_483_648_u64),
+        json_num("1.5"),
+    ] {
+        let err = at(vout.clone()).unwrap_err();
+        assert_eq!(err["code"], ERR_MISC, "vout={vout}: {err}");
+        assert_eq!(err["message"], "JSON integer out of range", "vout={vout}: {err}");
+    }
+    let err = at(json!(-1)).unwrap_err();
+    assert_eq!(err["code"], ERR_INVALID_PARAMETER, "{err}");
+    assert_eq!(err["message"], "Invalid parameter, vout cannot be negative", "{err}");
+    for output in [json!({ "txid": txid.clone() }), json!({ "txid": txid.clone(), "vout": null })] {
+        let err = spender_of(output).unwrap_err();
+        assert_eq!(err["code"], ERR_TYPE_ERROR, "{err}");
+        assert_eq!(err["message"], "Missing vout", "{err}");
+    }
+    let err = at(json!("0")).unwrap_err();
+    assert_eq!(err["code"], ERR_TYPE_ERROR, "{err}");
+    assert_eq!(
+        err["message"], "JSON value of type string for field vout is not of expected type number",
+        "{err}"
+    );
+    for (vout, want) in [(json_num("-0"), 0), (json!(i32::MAX), i32::MAX)] {
+        let row = at(vout).unwrap();
+        assert_eq!(row, json!([{ "txid": txid.clone(), "vout": want }]));
+    }
+}
+
+/// Core reads `gettxout` `n` with `getInt<uint32_t>`, and `waitforblockheight`
+/// and `getblockhash` `height` with `getInt<int>`. A value outside that type
+/// is `-1` `JSON integer out of range`, not a height cut to 32 bits. A
+/// negative `waitforblockheight` height is already reached; a negative
+/// `getblockhash` height is `-8`.
+fn chain_ops_index_args_are_core_ints(ctx: &RpcContext) {
+    let txid = json!("00".repeat(32));
+    for n in [
+        json!(4_294_967_296_u64),
+        json!(-1),
+        json_num("-0"),
+        json_num("1.5"),
+    ] {
+        let err = dispatch(ctx, "gettxout", vec![txid.clone(), n.clone()]).unwrap_err();
+        assert_eq!(err["code"], ERR_MISC, "gettxout n={n}: {err}");
+        assert_eq!(err["message"], "JSON integer out of range", "gettxout n={n}: {err}");
+    }
+    let last_vout = dispatch(ctx, "gettxout", vec![txid, json!(u32::MAX)]).unwrap();
+    assert!(last_vout.is_null(), "{last_vout}");
+
+    for height in [json!(4_294_967_296_u64), json!(2_147_483_648_u64), json_num("1.5")] {
+        let err = dispatch(ctx, "waitforblockheight", vec![height.clone(), json!(100)]).unwrap_err();
+        assert_eq!(err["code"], ERR_MISC, "height={height}: {err}");
+        assert_eq!(err["message"], "JSON integer out of range", "height={height}: {err}");
+        let err = dispatch(ctx, "getblockhash", vec![height.clone()]).unwrap_err();
+        assert_eq!(err["code"], ERR_MISC, "getblockhash {height}: {err}");
+        assert_eq!(err["message"], "JSON integer out of range", "getblockhash {height}: {err}");
+    }
+    let below_genesis = dispatch(ctx, "waitforblockheight", vec![json!(-1), json!(100)]).unwrap();
+    assert_eq!(below_genesis["height"], 0, "{below_genesis}");
+    let err = dispatch(ctx, "getblockhash", vec![json!(-1)]).unwrap_err();
+    assert_eq!(err["code"], ERR_INVALID_PARAMETER, "{err}");
+    assert_eq!(err["message"], "Block height out of range", "{err}");
+
+    for (method, params) in [
+        ("gettxout", vec![json!("00".repeat(32)), json!("0")]),
+        ("waitforblockheight", vec![json!("1")]),
+        ("getblockhash", vec![json!("0")]),
+    ] {
+        let err = dispatch(ctx, method, params).unwrap_err();
+        assert_eq!(err["code"], ERR_TYPE_ERROR, "{method}: {err}");
+        assert_eq!(
+            err["message"], "JSON value of type string is not of expected type number",
+            "{method}: {err}"
+        );
+    }
 }
 
 /// Version 2, an empty vin, flags 0, locktime 0. Core's witness decode reads
@@ -931,6 +1016,9 @@ fn chain_ops_estimate_fee_edges(ctx: &RpcContext) {
     assert!(r.get("feerate").is_none(), "no estimate has no feerate: {r}");
     assert_eq!(r["errors"][0], "Insufficient data or no feerate found", "{r}");
     assert_eq!(r["blocks"], 2, "{r}");
+    // Core treats target 1 as 2.
+    let one = dispatch(ctx, "estimatesmartfee", vec![json!(1)]).unwrap();
+    assert_eq!(one["blocks"], 2, "{one}");
     for target in [2_u64, 6, 12, 100] {
         let fee = dispatch(ctx, "estimatesmartfee", vec![json!(target)]).unwrap();
         assert!(
@@ -1109,7 +1197,9 @@ fn chain_ops_mempoolinfo_constants(ctx: &RpcContext) {
     let mem = dispatch(ctx, "getmempoolinfo", vec![]).unwrap();
     assert_eq!(mem["permitbaremultisig"], true, "{mem}");
     assert_eq!(mem["fullrbf"], true);
-    assert!(mem["maxdatacarriersize"].is_null());
+    // Core prints a number (default 100000). Libre has no datacarrier cap;
+    // the tx weight bound makes 100000 the largest reachable script.
+    assert_eq!(mem["maxdatacarriersize"], 100_000, "{mem}");
     assert_eq!(mem["limitclustercount"], 64);
     assert_eq!(mem["limitclustersize"], 101_000);
     assert_eq!(mem["loaded"], true);
@@ -2599,8 +2689,9 @@ fn chain_ops_big_sigops_cluster(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
     let h = cbs.take();
     let cb_val = generated_coinbase_value(ctx, h);
     let mut parent = spend_generated_coinbase(ctx, h, 0, ScriptBuf::new()).1;
-    // OP_0 OP_0 OP_CHECKSIG OP_1: one legacy sigop in the scriptSig.
-    parent.input[0].script_sig = ScriptBuf::from_bytes(vec![0x00, 0x00, 0xac, 0x51]);
+    // OP_0 OP_IF OP_CHECKSIG OP_ENDIF OP_1: one legacy sigop, not executed.
+    // Admit rejects a CHECKSIG whose scriptCode loses an OP_0.
+    parent.input[0].script_sig = ScriptBuf::from_bytes(vec![0x00, 0x63, 0xac, 0x68, 0x51]);
     parent.output = (0..50)
         .map(|_| TxOut {
             value: Amount::from_sat(cb_val / 50),
@@ -2614,8 +2705,10 @@ fn chain_ops_big_sigops_cluster(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
         let mut out = vec![
             TxOut {
                 value: Amount::from_sat(1_000),
-                // OP_0 OP_0 OP_0 OP_NOP OP_CHECKMULTISIG OP_1: 20 legacy sigops.
-                script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x00, 0x00, 0x61, 0xae, 0x51]),
+                // Unexecuted CHECKMULTISIG: 20 legacy sigops, scriptCode unchanged.
+                script_pubkey: ScriptBuf::from_bytes(vec![
+                    0x00, 0x63, 0x00, 0x00, 0x00, 0x61, 0xae, 0x68, 0x51,
+                ]),
             };
             20
         ];

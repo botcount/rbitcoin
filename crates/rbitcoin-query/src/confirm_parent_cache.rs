@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 /// Cached header + body fk list for one cache height (avoids header.head/body
 /// and header_txs page faults on confirm resolve).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HeaderPlanCache {
     pub header_fk: Fk,
     pub header_rec: HeaderRecord,
@@ -120,13 +120,10 @@ impl ConfirmParentCache {
         Some((plan.header_fk, plan.header_rec.clone()))
     }
 
-    pub fn get_header_plan(&self, height: u32) -> Option<HeaderPlanCache> {
-        self.inner
-            .lock()
-            .unwrap()
-            .headers
-            .get(&height)
-            .map(|a| (**a).clone())
+    /// The cached plan. The `Arc` is the one in the map, so a time or bits
+    /// read does not copy `tx_fks`.
+    pub fn get_header_plan(&self, height: u32) -> Option<Arc<HeaderPlanCache>> {
+        self.inner.lock().unwrap().headers.get(&height).cloned()
     }
 
     pub fn get_tx_fks_for_hash(&self, hash: &[u8; 32]) -> Option<Vec<Fk>> {

@@ -144,6 +144,17 @@ static FAIL_HWM: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(
 #[cfg(debug_assertions)]
 static FAIL_SYNC: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(Vec::new());
 
+/// `(fd, limit, keep_partial)`: a `fallocate` past `limit` bytes fails with
+/// ENOSPC. With `keep_partial` it first really allocates up to `limit`, the
+/// way a filesystem can keep blocks from a call that then runs out of room.
+#[cfg(debug_assertions)]
+static FAIL_FALLOCATE: std::sync::Mutex<Vec<(IoHandle, u64, bool)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Next N `fallocate` calls on these fds fail with EINTR before the syscall.
+#[cfg(debug_assertions)]
+static EINTR_FALLOCATE: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(Vec::new());
+
 /// Next N preads on these fds fail before any byte is returned.
 #[cfg(debug_assertions)]
 static FAIL_PREAD: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(Vec::new());
@@ -160,6 +171,58 @@ fn disk_full_errno() -> i32 {
     }
 }
 
+/// Arm `handle` so a `fallocate` to more than `limit` bytes returns ENOSPC.
+/// With `keep_partial` the file is first really allocated to `limit`, so the
+/// failed call leaves a longer file behind. Stays armed until the handle or
+/// everything is disarmed.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_fallocate_limit(handle: IoHandle, limit: u64, keep_partial: bool) {
+    let mut slots = FAIL_FALLOCATE.lock().unwrap_or_else(|e| e.into_inner());
+    slots.retain(|(h, _, _)| *h != handle);
+    slots.push((handle, limit, keep_partial));
+}
+
+/// Make the next `n` `fallocate` calls on `handle` return EINTR.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_fallocate_eintr(handle: IoHandle, n: u32) {
+    EINTR_FALLOCATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((handle, n));
+}
+
+/// An armed fault for one `fallocate(handle, len)` call, if any. `real`
+/// performs the genuine syscall for the partial case.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+pub(crate) fn injected_fallocate_fault(
+    handle: IoHandle,
+    len: u64,
+    real: impl FnOnce(u64) -> std::io::Result<()>,
+) -> Option<std::io::Error> {
+    {
+        let mut slots = EINTR_FALLOCATE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = slots.iter_mut().find(|(h, n)| *h == handle && *n > 0) {
+            slot.1 -= 1;
+            return Some(std::io::Error::from_raw_os_error(libc::EINTR));
+        }
+    }
+    let armed = FAIL_FALLOCATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(h, limit, _)| *h == handle && len > *limit)
+        .copied();
+    let (_, limit, keep_partial) = armed?;
+    if keep_partial {
+        if let Err(e) = real(limit) {
+            return Some(e);
+        }
+    }
+    Some(std::io::Error::from_raw_os_error(libc::ENOSPC))
+}
+
 /// Arm `handle` so later pwrites longer than the HWM unit write 8 bytes and
 /// return disk-full. Stays armed until [`disarm_short_pwrite`].
 #[cfg(debug_assertions)]
@@ -171,6 +234,9 @@ pub fn arm_short_pwrite(handle: IoHandle) {
     }
 }
 
+/// Clears the pwrite, HWM, sync and pread arms. It leaves the `fallocate`
+/// arms alone: they belong to tests that disarm their own fd with
+/// [`disarm_pwrite`].
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn disarm_short_pwrite() {
@@ -188,6 +254,14 @@ pub fn disarm_short_pwrite() {
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn disarm_pwrite(handle: IoHandle) {
+    FAIL_FALLOCATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(h, _, _)| *h != handle);
+    EINTR_FALLOCATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(h, _)| *h != handle);
     SHORT_PWRITE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -265,6 +339,43 @@ pub fn arm_fail_preads(handle: IoHandle, n: u32) {
     } else {
         slots.push((handle, n));
     }
+}
+
+/// Hide a page-log slot once this thread has pread a body.
+///
+/// `get_output_spender_metas_at` must read the log before that pread. A fold
+/// can drop the log entry in between, and the pread still holds the old null.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_hide_after_pread() {
+    HIDE_AFTER_PREAD.with(|slot| slot.set(true));
+    PREAD_SEEN.with(|slot| slot.set(false));
+}
+
+/// Clear [`arm_hide_after_pread`] on this thread.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn disarm_hide_after_pread() {
+    HIDE_AFTER_PREAD.with(|slot| slot.set(false));
+    PREAD_SEEN.with(|slot| slot.set(false));
+}
+
+/// A body pread finished on this thread.
+#[cfg(debug_assertions)]
+pub(crate) fn note_test_pread() {
+    PREAD_SEEN.with(|slot| slot.set(true));
+}
+
+/// The log must answer as a miss when a pread already ran under the arm.
+#[cfg(debug_assertions)]
+pub(crate) fn hidden_after_pread() -> bool {
+    HIDE_AFTER_PREAD.with(|hide| hide.get()) && PREAD_SEEN.with(|seen| seen.get())
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static HIDE_AFTER_PREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PREAD_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Drop one fd's sync arm.

@@ -1,8 +1,8 @@
-# Classification for Bitcoin Core v32.1.
+# Classification for the Bitcoin Core test tree at core_commit.
 # status=run only when an unmodified script is green against rbitcoin.
 # Do not use reason=unknown.
 pin = "v32.1"
-core_commit = "f0de87f040621468b956f01f526a43a010310501"
+core_commit = "d206226b4993f0330d809ca81851fb6976574ee7"
 
 [release]
 base_url = "https://bitcoincore.org/bin/bitcoin-core-32.1"
@@ -211,6 +211,12 @@ reason = "core-internal"
 analog = "SIGTERM flush / mid-confirm crash"
 
 [[test]]
+name = "feature_io_errors.py"
+status = "skip"
+reason = "core-internal"
+analog = "none (renames blk00000.dat and asserts txindex read errors)"
+
+[[test]]
 name = "feature_loadblock.py"
 status = "skip"
 reason = "core-internal"
@@ -397,6 +403,11 @@ reason = "no-ipc"
 
 [[test]]
 name = "interface_ipc_cli.py"
+status = "skip"
+reason = "no-ipc"
+
+[[test]]
+name = "interface_ipc_init.py"
 status = "skip"
 reason = "no-ipc"
 
@@ -610,6 +621,10 @@ name = "p2p_block_sync.py"
 status = "run"
 
 [[test]]
+name = "p2p_block_times.py"
+status = "run"
+
+[[test]]
 name = "p2p_blockfilters.py"
 status = "skip"
 reason = "core-log"
@@ -783,6 +798,12 @@ status = "run"
 [[test]]
 name = "p2p_ping.py"
 status = "run"
+
+[[test]]
+name = "p2p_ping_ibd.py"
+status = "skip"
+reason = "core-net-policy"
+analog = "no -maxsendbuffer; the script starts the node with -maxsendbuffer=1"
 
 [[test]]
 name = "p2p_private_broadcast.py"
@@ -1304,6 +1325,11 @@ reason = "no-wallet"
 
 [[test]]
 name = "wallet_listdescriptors.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+name = "wallet_listrawtransactions.py"
 status = "skip"
 reason = "no-wallet"
 

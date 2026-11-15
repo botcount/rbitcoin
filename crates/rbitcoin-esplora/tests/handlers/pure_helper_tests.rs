@@ -1,8 +1,12 @@
-use rbitcoin_esplora::handlers::{block_summary_json, fee_estimates_from, outspend_json};
+use rbitcoin_esplora::handlers::{
+    block_summary_json, fee_estimates_from, outspend_json, skip_rows_after, sort_txs_newest_first,
+    summaries_json, truncate_page,
+};
 use rbitcoin_primitives::Fk;
 use rbitcoin_primitives::Height;
 use rbitcoin_query::testutil::FixtureChain;
 use rbitcoin_query::Query;
+use rbitcoin_query::ScriptHashTxSummary;
 use rbitcoin_query::TxApply;
 use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
 use serde_json::json;
@@ -141,5 +145,71 @@ fn outspend_json_spent_includes_vin() {
     let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
     keys.sort();
     assert_eq!(keys, ["spent", "status", "txid", "vin"], "{v}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn bare_multisig_of_three_bytes_is_multisig() {
+    // `is_bare_multisig`: a script of length 3 ending in CHECKMULTISIG. Classification calls this.
+    let s = bitcoin::Script::from_bytes(&[0x51, 0x51, rbitcoin_primitives::OP_CHECKMULTISIG]);
+    assert!(rbitcoin_esplora::script_fields::is_bare_multisig(s));
+}
+
+#[test]
+fn newest_sort_skip_and_page_cut() {
+    // `sort_txs_newest_first`, `skip_rows_after`, `truncate_page`. `/txs` pages call these.
+    let unconf = json!({"txid": "aa", "status": {"confirmed": false}});
+    let conf = json!({"txid": "bb", "status": {"confirmed": true, "block_height": 1}});
+    for mut rows in [
+        vec![conf.clone(), unconf.clone()],
+        vec![unconf.clone(), conf.clone()],
+    ] {
+        sort_txs_newest_first(&mut rows);
+        assert_eq!(rows[0]["txid"], "aa");
+        assert_eq!(rows[1]["txid"], "bb");
+    }
+    let mut id = [0u8; 32];
+    id[0] = 1;
+    let hex = rbitcoin_esplora::server::block_hash_hex(&id);
+    let rows = vec![
+        json!({"txid": "00"}),
+        json!({"txid": hex}),
+        json!({"txid": "ff"}),
+    ];
+    let rest = skip_rows_after(rows, Some(id)).unwrap();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0]["txid"], "ff");
+    let mut page: Vec<_> = (0..25).map(|i| json!(i)).collect();
+    truncate_page(&mut page, 25);
+    assert_eq!(page.len(), 25);
+    assert_eq!(page[24], json!(24));
+    page.push(json!(25));
+    truncate_page(&mut page, 25);
+    assert_eq!(page.len(), 25);
+    assert_eq!(page[24], json!(24));
+}
+
+#[test]
+fn summary_time_at_height_zero_and_no_position_below() {
+    let (dir, q) = temp_query();
+    let _hash = seed_genesis(&q);
+    let fk = q.tx_fk_by_txid(&[0xcb; 32]).unwrap().unwrap();
+    let items = [
+        ScriptHashTxSummary {
+            txid: [0xcb; 32],
+            value: 1,
+            height: 0,
+            tx_fk: Fk::NULL,
+        },
+        ScriptHashTxSummary {
+            txid: [1; 32],
+            value: 1,
+            height: -1,
+            tx_fk: fk,
+        },
+    ];
+    let v = summaries_json(&q, &items).unwrap();
+    assert_eq!(v[0]["time"], 1, "{v}");
+    assert!(v[1].get("tx_position").is_none(), "{v}");
     let _ = std::fs::remove_dir_all(dir);
 }

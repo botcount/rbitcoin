@@ -23,13 +23,13 @@ See the CI gates section of `docs/releases.md`.
 
 | Command | Does |
 |---------|------|
-| `./scripts/release-cut.sh --minor` | `X.Y.99` → `X.(Y+1).0`; cuts CHANGELOG |
-| `./scripts/release-cut.sh --major` | `X.Y.99` → `(X+1).0.0` |
-| `./scripts/release-cut.sh --patch` | next patch on `vX.Y.x` |
-| `./scripts/release-cut.sh --dev-next` | just-shipped `X.Y.0` → `X.Y.99` |
-| `./scripts/release-gate.sh` | cargo / nix / changelog; ship needs Highlights |
+| `./scripts/release-cut.sh --minor` | `X.Y.99` → `X.(Y+1).0`; cuts CHANGELOG; rewrites workspace versions in every `Cargo.lock` |
+| `./scripts/release-cut.sh --major` | `X.Y.99` → `(X+1).0.0`; same lock rewrite |
+| `./scripts/release-cut.sh --patch` | next patch on `vX.Y.x`; same lock rewrite |
+| `./scripts/release-cut.sh --dev-next` | just-shipped `X.Y.0` → `X.Y.99`; same lock rewrite |
+| `./scripts/release-gate.sh` | cargo / nix / changelog / lock; ship needs Highlights |
 | `./scripts/release-notes.sh` | GitHub Release text |
-| `./scripts/release.sh` | annotated tag on a ship version |
+| `./scripts/release.sh` | annotated tag on a ship version; refuses a stale or missing `Cargo.lock` |
 | `./scripts/release-post.sh` | tag, and for `X.Y.0` create `vX.Y.x` |
 
 Hermetic pins: `./scripts/release.test.sh`. Prefer `--no-push` on this VM,

@@ -2,15 +2,9 @@ use rbitcoin_node::config::NodeConfig;
 use rbitcoin_node::error::NodeError;
 use rbitcoin_node::lock::*;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn tmp() -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("rbitcoin-dirlock-{n}"));
-    let _ = std::fs::remove_dir_all(&p);
+    let p = rbitcoin_store::testutil::fresh_path("dirlock");
     std::fs::create_dir_all(&p).unwrap();
     p
 }
@@ -46,6 +40,21 @@ fn second_lock_on_same_datadir_is_busy() {
         format!("{err}").contains("Cannot obtain a lock on directory"),
         "{err}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A duplicated fd shares the flock. Dropping the guard must release it,
+/// or the next launch in this process reports the datadir as busy.
+#[cfg(unix)]
+#[test]
+fn drop_releases_the_lock_even_if_the_fd_was_duplicated() {
+    let dir = tmp();
+    let cfg = NodeConfig::default().with_datadir(&dir).with_tiny_heads();
+    let held = lock_node_dirs(&cfg).expect("lock");
+    let dup = held._files[0].try_clone().expect("dup");
+    drop(held);
+    lock_node_dirs(&cfg).expect("drop released the flock while the dup is open");
+    drop(dup);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

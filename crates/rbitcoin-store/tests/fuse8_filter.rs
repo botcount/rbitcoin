@@ -1,14 +1,8 @@
 use rbitcoin_store::binary_fuse8::{BinaryFuse8, Fingerprints};
 use rbitcoin_store::error::StoreError;
 use rbitcoin_store::fuse8_filter::*;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 fn tmp() -> std::path::PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("rbitcoin-fuse8-{n}"));
+    let p = rbitcoin_store::testutil::fresh_path("fuse8");
     let _ = std::fs::create_dir_all(&p);
     p
 }
@@ -256,14 +250,8 @@ fn decode_body_rejects_fingerprint_len_below_hash_geometry() {
 
 #[test]
 fn fuse_key_from_mixed_xors_quarters() {
-    let mut m = [0u8; 32];
-    m[0] = 1;
-    m[8] = 2;
-    m[16] = 4;
-    m[24] = 8;
-    let k = fuse_key_from_mixed(&m);
-    assert_eq!(k, 1u64 ^ 2u64 ^ 4u64 ^ 8u64); // LE quarters xor
-                                              // All-zero → zero.
+    let m: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(3).wrapping_add(1));
+    assert_eq!(fuse_key_from_mixed(&m), 2_314_885_668_798_488_672);
     assert_eq!(fuse_key_from_mixed(&[0u8; 32]), 0);
 }
 
@@ -301,4 +289,29 @@ fn open_unknown_version_is_corrupt() {
     .unwrap();
     assert!(open_file(&path).is_err());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v2_geometry_reads_each_fixed_field() {
+    let mut payload = vec![0u8; 28 + 12];
+    payload[0..8].copy_from_slice(&0x0807_0605_0403_0201u64.to_le_bytes());
+    payload[8..12].copy_from_slice(&4u32.to_le_bytes());
+    payload[12..16].copy_from_slice(&3u32.to_le_bytes());
+    payload[16..20].copy_from_slice(&4u32.to_le_bytes());
+    payload[20..28].copy_from_slice(&12u64.to_le_bytes());
+    let geo = match parse_v2_geometry(&payload) {
+        Ok(geo) => geo,
+        Err(err) => panic!("{err}"),
+    };
+    assert_eq!(geo.seed, 0x0807_0605_0403_0201);
+    assert_eq!(geo.segment_length, 4);
+    assert_eq!(geo.segment_length_mask, 3);
+    assert_eq!(geo.segment_count_length, 4);
+    assert_eq!(geo.fp_off, 28);
+    assert_eq!(geo.fp_len, 12);
+    match parse_v2_geometry(&payload[..27]) {
+        Err(StoreError::Corrupt(msg)) => assert!(msg.contains("short"), "{msg}"),
+        Ok(_) => panic!("short payload decoded"),
+        Err(err) => panic!("{err}"),
+    }
 }

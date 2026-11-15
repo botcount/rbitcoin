@@ -3,14 +3,7 @@ use rbitcoin_store::chain::*;
 use rbitcoin_store::error::StoreError;
 
 fn tmp() -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "rbitcoin-chain-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let p = rbitcoin_store::testutil::fresh_path("chain");
     std::fs::create_dir_all(&p).unwrap();
     p
 }

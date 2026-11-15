@@ -190,6 +190,21 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+# --- Core's test framework loads BUILDDIR/test/with_sanitizer_env.py ---
+SAN_CORE="$WORKDIR/core"
+mkdir -p "$SAN_CORE/test/functional"
+cp "$TESTS/feature_help.py" "$TESTS/wallet_basic.py" "$TESTS/p2p_ping.py" "$SAN_CORE/test/functional/"
+printf 'SOURCE_DIR = Path("@PROJECT_SOURCE_DIR@")\n' >"$SAN_CORE/test/with_sanitizer_env.py.in"
+"$RUN" --dry-run --inventory "$INV" --tests-dir "$SAN_CORE/test/functional" \
+  --config-out "$WORKDIR/config-san.ini" feature_help.py >/dev/null 2>&1 || true
+if grep -qx "SOURCE_DIR = Path(\"$SAN_CORE\")" "$SAN_CORE/test/with_sanitizer_env.py" 2>/dev/null; then
+  echo "ok - dry-run renders with_sanitizer_env.py"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - dry-run renders with_sanitizer_env.py"
+  FAIL=$((FAIL + 1))
+fi
+
 # --- dry-run of a run name does not pass skip names to the runner ---
 if printf '%s' "$DRY_OUT" | grep -q 'wallet_basic.py'; then
   echo "not ok - dry-run leaked skip name (got: $DRY_OUT)"

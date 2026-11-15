@@ -13,9 +13,12 @@ test = false
 doctest = false
 
 [features]
-mutants = []
+# Nightly cargo-mutants only. Off for the node build.
+mutants = ["dep:mutants"]
 
 [dependencies]
+# Attribute only. cargo-mutants reads it; it does not change compiled code.
+mutants = { version = "0.0.4", optional = true }
 rbitcoin-primitives = { workspace = true }
 rbitcoin-log = { workspace = true }
 rbitcoin-consensus = { workspace = true }
@@ -34,6 +37,10 @@ libc = "0.2"
 [[test]]
 name = "suite"
 path = "tests/suite.rs"
+
+[[test]]
+name = "confirm_feed_wait"
+path = "tests/confirm_feed_wait.rs"
 
 [lints]
 workspace = true

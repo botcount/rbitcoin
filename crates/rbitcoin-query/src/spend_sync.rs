@@ -8,7 +8,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use rbitcoin_store::{elapsed_after_checkpoint, SPEND_DURABLE_INTERVAL_MS};
+use rbitcoin_store::SPEND_DURABLE_INTERVAL_MS;
+
+/// Park after a failed checkpoint while the edge cap still wants another one.
+/// A full ten-minute park would leave confirm blocked on that cap.
+const SPEND_FAIL_BACKOFF_MS: u64 = 1000;
 
 use crate::Query;
 
@@ -20,6 +24,7 @@ pub struct SpendSync {
 impl SpendSync {
     pub fn spawn(query: Arc<Query>) -> Self {
         let wake = Arc::new((Mutex::new(false), Condvar::new()));
+        query.store().bind_spend_sync_wake(Arc::clone(&wake));
         let flag = Arc::clone(&wake);
         let join = std::thread::Builder::new()
             .name("rbtc-spend-sync".into())
@@ -65,11 +70,13 @@ pub fn run(query: Arc<Query>, wake: Arc<(Mutex<bool>, Condvar)>) {
             let guard = lock.lock().unwrap();
             if *guard {
                 true
+            } else if query.store().spend_checkpoint_early() {
+                false
             } else {
                 let elapsed = since_ok.elapsed().as_millis() as u64;
                 let wait = SPEND_DURABLE_INTERVAL_MS.saturating_sub(elapsed);
                 if wait == 0 {
-                    *guard
+                    false
                 } else {
                     let (guard, _) = cv.wait_timeout(guard, Duration::from_millis(wait)).unwrap();
                     *guard
@@ -77,6 +84,10 @@ pub fn run(query: Arc<Query>, wake: Arc<(Mutex<bool>, Condvar)>) {
             }
         };
         let elapsed = since_ok.elapsed().as_millis() as u64;
+        let due = query.store().spend_checkpoint_early() || elapsed >= SPEND_DURABLE_INTERVAL_MS;
+        if !stop && !due {
+            continue;
+        }
         let published = match checkpoint(&query) {
             Ok(()) => true,
             Err(e) => {
@@ -84,15 +95,21 @@ pub fn run(query: Arc<Query>, wake: Arc<(Mutex<bool>, Condvar)>) {
                 false
             }
         };
-        // A failed publish stays due. Park one interval so the retry cannot spin.
-        if elapsed_after_checkpoint(elapsed, published) == 0 {
+        query.store().relax_spend_pace();
+        if published {
             since_ok = Instant::now();
         } else if !stop {
+            // A failed publish stays due. While the edge cap is armed, wait
+            // one second. Otherwise wait the full interval, even when this
+            // attempt started with a fresh timer.
+            let park = if query.store().spend_checkpoint_early() {
+                SPEND_FAIL_BACKOFF_MS
+            } else {
+                SPEND_DURABLE_INTERVAL_MS
+            };
             let guard = lock.lock().unwrap();
             if !*guard {
-                let _ = cv
-                    .wait_timeout(guard, Duration::from_millis(SPEND_DURABLE_INTERVAL_MS))
-                    .unwrap();
+                let _ = cv.wait_timeout(guard, Duration::from_millis(park)).unwrap();
             }
         }
         if stop {

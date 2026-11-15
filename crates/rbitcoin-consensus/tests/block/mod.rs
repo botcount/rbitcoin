@@ -1,4 +1,5 @@
 mod bip34_tests;
+mod bip54_vectors;
 mod block_866342;
 mod duplicate_input_tests;
 mod fact_reject_tests;

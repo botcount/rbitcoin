@@ -396,7 +396,10 @@ that is not run locally.
 ### Good step
 
 **Contract:** `expected_bits_extending` at retarget height succeeds when
-period-start is only on ConfirmParentCache (not confirmed).
+period-start is only on ConfirmParentCache (not confirmed). A 2016-block
+retarget chain is why this stays a unit. Some connect path still hits a
+retarget once. A slim scenario stays the right shape for publish order
+and confirm wiring.
 
 - **Red:** unit in `confirm_run` driving `expected_bits_extending` with
   plan-only first@2016.

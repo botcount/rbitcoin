@@ -23,7 +23,7 @@ fn hash_at(n: u32) -> BlockHash {
 fn inflight_req_multi_peer_add_remove() {
     let mut r = InflightReq::new(1);
     assert_eq!(r.len(), 1);
-    assert!(r.peers.contains(&1));
+    assert!(r.is_racing(1));
     assert!(r.add_peer(2));
     assert!(!r.add_peer(2)); // already present
     assert_eq!(r.len(), 2);
@@ -51,7 +51,7 @@ fn inflight_req_retired_peer_still_holds_the_hash() {
     assert!(r.add_peer(2));
     r.retire_peer(1);
     assert_eq!(r.len(), 1, "retired peer no longer races");
-    assert!(!r.peers.contains(&1));
+    assert!(!r.is_racing(1));
     assert!(r.holds(1), "retired peer still has the getdata");
     assert!(
         r.owner_asked_at(1).is_some(),
@@ -178,7 +178,7 @@ fn reorg_clears_path_suffix() {
 #[test]
 fn inflight_default_and_known_headers_deep_hygiene_prune() {
     let d = InflightReq::default();
-    assert!(d.peers.is_empty());
+    assert!(d.is_empty());
     // started_at is Instant::now() — just ensure it is in the past/near now.
     assert!(d.started_at.elapsed().as_secs() < 5);
 

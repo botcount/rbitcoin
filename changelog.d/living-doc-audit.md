@@ -1,0 +1,5 @@
+Fixed
+
+- **Living docs follow the code they name.** Initial block download drops an outbound full-relay or block-relay peer whose `headers` chain ends under `--min-chain-work`. A proxied hostname is the session key, `disconnectnode` takes the listed `addr`, and the process holds 1,024 names. Esplora waits for an in-flight slot, and that wait counts toward a 408. The coverage floor is 91% (`LH*100 >= LF*91`). The Hornet ID map stays in `docs/peer-clients.md`. Chain-tip tokens stay in `COMPAT.md`. The pin stays in `docs/concurrency.md`. Flag tables stay in `docs/operator/`. `OPERATOR.md` is the task index. Pages that still named it as the flag or scripthash-cost manual now point at `docs/operator/` or `docs/operator/storage.md`.
+
+- **One measured mainnet catch-up.** rbitcoin 0.9.99 on a ThinkPad X1 Carbon Gen 13 (Intel Core Ultra 7 258V, 32 GiB RAM, Crucial T500 2 TB) reached height 975252 in 9 h 51 min and left IBD after the scripthash seal in 10 h 12 min. The default milestone was 966143. The SV2 page is the landed outcome table. Retired confirm dual-path names are gone from `docs/errata.md`.

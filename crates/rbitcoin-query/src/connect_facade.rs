@@ -10,8 +10,10 @@ use rbitcoin_store::HeaderRecord;
 use std::sync::Arc;
 
 use crate::confirm_run;
+use crate::connect::ConfirmPrepared;
 use crate::convert::{block_to_apply, block_to_apply_with_txids_prev, header_to_record};
 use crate::{Query, TxApply, TxPrecompute, WirePlanNeed};
+use rbitcoin_store::StoreError;
 
 /// Confirm a contiguous tip-extension run of wire blocks (sync all stages).
 ///
@@ -77,6 +79,34 @@ pub fn accept_and_connect_block_preverified(
                 .get_header_by_hash(&hash)
                 .map_err(ConfirmError::from)?
             {
+                if query.pruned_spill_covers(fk).map_err(ConfirmError::from)? {
+                    confirm_run::finish_post_commit(query, height.0, &hash)?;
+                    return Ok(fk);
+                }
+                // Already this tip, but the keep file is gone. The block
+                // hash does not cover witness, so check the commitment
+                // before this block becomes the kept copy.
+                let ctx = ValidationContext::at(params, height, milestone);
+                validate_block_structure_hashed(&block, &ctx)?;
+                query
+                    .note_pruned_archived_seqsigwit(fk, &block)
+                    .map_err(ConfirmError::from)?;
+                let tx_fks = query
+                    .store()
+                    .header_txs
+                    .get_list(fk)
+                    .map_err(ConfirmError::from)?
+                    .ok_or(ConfirmError::Store(StoreError::Corrupt(
+                        "seqsigwit window miss",
+                    )))?;
+                query
+                    .seal_missing_pruned_spills(&[ConfirmPrepared {
+                        height,
+                        header_fk: fk,
+                        tx_fks,
+                        hash,
+                    }])
+                    .map_err(ConfirmError::from)?;
                 confirm_run::finish_post_commit(query, height.0, &hash)?;
                 return Ok(fk);
             }

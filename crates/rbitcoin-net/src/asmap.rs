@@ -55,9 +55,12 @@ impl AsMap {
     }
 
     // An empty file fails sanity, so a loaded map is never empty.
-    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
     }
 
     pub fn interpret_ip16(&self, ip16: &[u8; 16]) -> u32 {

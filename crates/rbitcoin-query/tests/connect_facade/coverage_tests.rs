@@ -17,14 +17,7 @@ use rbitcoin_consensus::{genesis_block, mine_empty_regtest, ConsensusError};
 
 use std::path::PathBuf;
 fn temp_store() -> (PathBuf, Query) {
-    let path = std::env::temp_dir().join(format!(
-        "rbitcoin-consensus-cov-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    let path = rbitcoin_store::testutil::fresh_path("consensus-cov");
     std::fs::create_dir_all(&path).unwrap();
     let q = Query::open_or_create_tiny(&path).expect("open store");
     (path, q)

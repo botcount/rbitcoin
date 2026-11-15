@@ -241,8 +241,6 @@ fn missing_marker_replays_a_spend_below_the_tip_window() {
 /// spend slot that names one is a store fault, not an unspent output.
 #[test]
 fn spender_below_its_create_height_is_corrupt() {
-    use std::io::Read;
-
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-below-create");
     let params = ChainParams::regtest();
     let ms = Milestone::NONE;
@@ -272,21 +270,23 @@ fn spender_below_its_create_height_is_corrupt() {
         let fk = q.tx_fk_by_txid(txid.as_byte_array()).unwrap().unwrap();
         spent_abs(q.store().tx_spent_range(fk).unwrap().0, 0)
     };
-    let (from, to) = (slot_abs(cbs[0]), slot_abs(later_txid));
+    let early_fk = q.tx_fk_by_txid(cbs[0].as_byte_array()).unwrap().unwrap();
+    let (multi, field, vin) = q.store().txs.get_output_spender_meta(early_fk, 0).unwrap();
+    assert!(
+        !field.is_null(),
+        "the early spend is in the page log until a checkpoint folds it"
+    );
+    let flags = if multi {
+        rbitcoin_store::output_flags::MULTI_SPENDER
+    } else {
+        0
+    };
+    let slot = rbitcoin_store::tx_table::encode_spent_slot(flags, field, vin).unwrap();
+    assert_ne!(slot, [0u8; 8]);
+    let to = slot_abs(later_txid);
+    q.store().txs.spent.write_body_pwrite(to, &slot).unwrap();
     let store = q.store().path().to_path_buf();
     drop(q);
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(store.join("spent.body"))
-            .unwrap();
-        let mut slot = [0u8; 8];
-        f.seek(SeekFrom::Start(from)).unwrap();
-        f.read_exact(&mut slot).unwrap();
-        f.seek(SeekFrom::Start(to)).unwrap();
-        f.write_all(&slot).unwrap();
-    }
 
     let q = rbitcoin_query::Query::open_or_create_tiny(&store).unwrap();
     let tip_h = q.tip_height().unwrap();
@@ -610,6 +610,236 @@ fn marker_heights(store: &std::path::Path) -> Option<(u32, u32)> {
     ))
 }
 
+fn pay_many(prev: Txid, n: u32, each: Amount) -> Transaction {
+    let outputs = (0..n)
+        .map(|_| TxOut {
+            value: each,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        })
+        .collect();
+    Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: prev,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: outputs,
+    }
+}
+
+fn spend_vout(prev: Txid, vout: u32, val: Amount) -> Transaction {
+    Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: prev, vout },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: val,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    }
+}
+
+fn read_slot(store: &std::path::Path, abs: u64) -> [u8; 8] {
+    use std::io::Read;
+    let mut f = std::fs::File::open(store.join("spent.body")).unwrap();
+    f.seek(SeekFrom::Start(abs)).unwrap();
+    let mut slot = [0u8; 8];
+    f.read_exact(&mut slot).unwrap();
+    slot
+}
+
+/// Two later blocks spend outputs on a full historical page. Readers see both
+/// spends and the unspent neighbor before any checkpoint, and the page bytes
+/// on `spent.body` stay the pre-spend image until the next checkpoint folds
+/// the generation the first one published.
+#[test]
+fn historical_page_stays_unwritten_until_spend_checkpoint() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-page-log");
+    q.set_spend_index(true);
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+    let b1 = mine(tip, tip_time + 600, 1, Vec::new());
+    let c1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+    connect_until(&q, &params, ms, &mut tip, &mut tip_time, maturity + 2);
+
+    let created = pay_many(c1, 512, Amount::from_sat(1_000));
+    let created_id = created.compute_txid();
+    let create_block = mine(tip, tip_time + 600, maturity + 3, vec![created]);
+    accept_and_connect_block(&q, &params, Height(maturity + 3), &create_block, ms).unwrap();
+    tip = create_block.block_hash();
+    tip_time = create_block.header.time;
+
+    let create_fk = q
+        .tx_fk_by_txid(created_id.as_byte_array())
+        .unwrap()
+        .unwrap();
+    let (off, _) = q.store().tx_spent_range(create_fk).unwrap();
+    let abs0 = spent_abs(off, 0);
+    let abs1 = spent_abs(off, 1);
+    let abs_neighbor = spent_abs(off, 2);
+    assert!(
+        abs0 < 4096 && abs1 < 4096 && abs_neighbor < 4096,
+        "the spent outputs must sit on the first full page, abs {abs0} {abs1}"
+    );
+    let store = q.store().path().to_path_buf();
+    let before0 = read_slot(&store, abs0);
+    let before1 = read_slot(&store, abs1);
+    let before_n = read_slot(&store, abs_neighbor);
+    assert_eq!(before0, [0u8; 8]);
+    assert_eq!(before1, [0u8; 8]);
+
+    let h0 = maturity + 4;
+    let s0 = spend_vout(created_id, 0, Amount::from_sat(900));
+    let b0 = mine(tip, tip_time + 600, h0, vec![s0]);
+    accept_and_connect_block(&q, &params, Height(h0), &b0, ms).unwrap();
+    tip = b0.block_hash();
+    tip_time = b0.header.time;
+    let h1 = h0 + 1;
+    let s1 = spend_vout(created_id, 1, Amount::from_sat(900));
+    let b1s = mine(tip, tip_time + 600, h1, vec![s1]);
+    accept_and_connect_block(&q, &params, Height(h1), &b1s, ms).unwrap();
+    tip = b1s.block_hash();
+    tip_time = b1s.header.time;
+
+    assert!(q.is_outpoint_spent(created_id.as_byte_array(), 0).unwrap());
+    assert!(q.is_outpoint_spent(created_id.as_byte_array(), 1).unwrap());
+    assert!(!q.is_outpoint_spent(created_id.as_byte_array(), 2).unwrap());
+    assert_eq!(
+        read_slot(&store, abs0),
+        before0,
+        "a historical spend must not rewrite spent.body before the checkpoint"
+    );
+    assert_eq!(read_slot(&store, abs1), before1);
+    assert_eq!(read_slot(&store, abs_neighbor), before_n);
+
+    q.store().checkpoint_observed_spend().unwrap();
+    assert_eq!(
+        read_slot(&store, abs0),
+        before0,
+        "the publishing checkpoint leaves the body page for the next one"
+    );
+    assert_eq!(read_slot(&store, abs1), before1);
+    assert!(q.is_outpoint_spent(created_id.as_byte_array(), 0).unwrap());
+    connect_until(&q, &params, ms, &mut tip, &mut tip_time, h1 + 1);
+    let mut header = [0u8; 16];
+    {
+        use std::io::Read;
+        let mut f = std::fs::File::open(store.join("spent.body")).unwrap();
+        f.read_exact(&mut header).unwrap();
+    }
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(store.join("spent.body"))
+            .unwrap();
+        for abs in [abs0, abs1] {
+            f.seek(SeekFrom::Start(abs)).unwrap();
+            f.write_all(&[0u8; 8]).unwrap();
+        }
+    }
+    drop(q);
+    let q = rbitcoin_query::Query::open_or_create_tiny(&store).unwrap();
+    q.set_spend_index(true);
+    assert!(
+        q.is_outpoint_spent(created_id.as_byte_array(), 0).unwrap(),
+        "a zeroed body slot stays spent after reopen while the page log exists"
+    );
+    assert!(q.is_outpoint_spent(created_id.as_byte_array(), 1).unwrap());
+    assert!(!q.is_outpoint_spent(created_id.as_byte_array(), 2).unwrap());
+    q.store().checkpoint_observed_spend().unwrap();
+    {
+        use std::io::Read;
+        let mut f = std::fs::File::open(store.join("spent.body")).unwrap();
+        let mut after = [0u8; 16];
+        f.read_exact(&mut after).unwrap();
+        assert_eq!(
+            after, header,
+            "folding page 0 must not rewrite the spent.body file header"
+        );
+    }
+    assert_ne!(
+        read_slot(&store, abs0),
+        before0,
+        "the next checkpoint folds the cooled page onto spent.body"
+    );
+    assert_ne!(read_slot(&store, abs1), before1);
+    assert_eq!(read_slot(&store, abs_neighbor), before_n);
+    assert!(q.is_outpoint_spent(created_id.as_byte_array(), 0).unwrap());
+    assert!(q.is_outpoint_spent(created_id.as_byte_array(), 1).unwrap());
+    let _ = dir;
+}
+
+/// A spend that does not survive disconnect is not folded onto `spent.body`.
+#[test]
+fn disconnected_historical_spend_is_not_folded() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-page-hold");
+    q.set_spend_index(true);
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+    let b1 = mine(tip, tip_time + 600, 1, Vec::new());
+    let c1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+    connect_until(&q, &params, ms, &mut tip, &mut tip_time, maturity + 2);
+
+    let created = pay_many(c1, 512, Amount::from_sat(1_000));
+    let created_id = created.compute_txid();
+    let create_block = mine(tip, tip_time + 600, maturity + 3, vec![created]);
+    accept_and_connect_block(&q, &params, Height(maturity + 3), &create_block, ms).unwrap();
+    tip = create_block.block_hash();
+    tip_time = create_block.header.time;
+
+    let create_fk = q
+        .tx_fk_by_txid(created_id.as_byte_array())
+        .unwrap()
+        .unwrap();
+    let (off, _) = q.store().tx_spent_range(create_fk).unwrap();
+    let abs0 = spent_abs(off, 0);
+    assert!(abs0 < 4096);
+    let store = q.store().path().to_path_buf();
+    let before = read_slot(&store, abs0);
+
+    let h0 = maturity + 4;
+    let s0 = spend_vout(created_id, 0, Amount::from_sat(900));
+    let b0 = mine(tip, tip_time + 600, h0, vec![s0]);
+    accept_and_connect_block(&q, &params, Height(h0), &b0, ms).unwrap();
+    assert!(q.is_outpoint_spent(created_id.as_byte_array(), 0).unwrap());
+    q.disconnect_tip().unwrap();
+    assert!(!q.is_outpoint_spent(created_id.as_byte_array(), 0).unwrap());
+    q.store().checkpoint_observed_spend().unwrap();
+    assert_eq!(
+        read_slot(&store, abs0),
+        before,
+        "a disconnected historical spend must not be folded onto spent.body"
+    );
+    let _ = dir;
+}
+
 fn connect_until(
     q: &rbitcoin_query::Query,
     params: &ChainParams,
@@ -921,4 +1151,144 @@ fn checkpoint_append_above_snapshot_still_publishes() {
     assert_eq!(durable, 2);
     assert_eq!(q.tip_height(), Some(Height(3)));
     let _ = dir;
+}
+
+#[test]
+fn replay_folds_a_full_open_directory() {
+    let (dir, q) = chain_at_height("spend-replay-cap", 1);
+    let _ = std::fs::remove_file(q.store().path().join(rbitcoin_store::SPEND_DURABLE_NAME));
+    // Null spender field, vin 1. `keep` retains a null field, and the body
+    // byte is not zero, so a fold is visible.
+    let slot = [0u8, 0, 0, 0, 0, 0, 1, 0];
+    let cap = rbitcoin_store::spend_page_log::OPEN_EDGE_CAP;
+    let last_page = 1 + (cap - 1) / 512;
+    let end = (last_page + 1) * 4096;
+    let count = q.store().txs.spent.count();
+    q.store().txs.spent.truncate_body_to(count, end).unwrap();
+    let mut batch = Vec::with_capacity(512);
+    let mut n = 0u64;
+    while n < cap {
+        let page = 1 + n / 512;
+        let rel = n % 512;
+        batch.push((page * 4096 + rel * 8, slot));
+        n += 1;
+        if batch.len() == 512 {
+            q.store().note_open_spend_slots(&batch).unwrap();
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        q.store().note_open_spend_slots(&batch).unwrap();
+    }
+    assert!(q.store().spend_checkpoint_early());
+    rbitcoin_query::replay_spend_annotations(&q).unwrap();
+    let published = q.store().txs.spent.body_published_len();
+    let mut got = [0u8; 8];
+    q.store()
+        .txs
+        .spent
+        .read_prefix_at_published(published, 4096, 8, &mut got)
+        .unwrap();
+    assert_eq!(got, slot);
+    let _ = dir;
+}
+
+/// Connect X, whose second tx spends the first tx's output (an in-block
+/// spend), optionally checkpoint, disconnect X, optionally checkpoint, then
+/// connect the same X again. Returns whether that in-block output reads spent
+/// and the error a block re-spending it gets.
+fn in_block_spend_after_reconnect(
+    label: &str,
+    checkpoint_while_active: bool,
+    checkpoint_after_disconnect: bool,
+) -> (bool, Result<(), ConfirmError>) {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled(label);
+    q.set_spend_index(true);
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+    let b1 = mine(tip, tip_time + 600, 1, Vec::new());
+    let c1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+    connect_until(&q, &params, ms, &mut tip, &mut tip_time, maturity + 2);
+
+    let hx = maturity + 3;
+    let parent = spend_one(c1, Amount::from_sat(49_0000_0000));
+    let pid = parent.compute_txid();
+    let child = spend_one(pid, Amount::from_sat(48_0000_0000));
+    let x = mine(tip, tip_time + 600, hx, vec![parent, child]);
+    accept_and_connect_block(&q, &params, Height(hx), &x, ms).unwrap();
+    assert!(q.is_outpoint_spent(pid.as_byte_array(), 0).unwrap());
+
+    // What a clean shutdown, the open replay, or the 10-minute
+    // `rbtc-spend-sync` tick runs.
+    if checkpoint_while_active {
+        q.store().checkpoint_observed_spend().unwrap();
+    }
+    q.disconnect_tip().unwrap();
+    if checkpoint_after_disconnect {
+        q.store().checkpoint_observed_spend().unwrap();
+    }
+    accept_and_connect_block(&q, &params, Height(hx), &x, ms).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(hx)));
+    let spent = q.is_outpoint_spent(pid.as_byte_array(), 0).unwrap();
+
+    let respend = mine(
+        x.block_hash(),
+        x.header.time + 600,
+        hx + 1,
+        vec![spend_one(pid, Amount::from_sat(47_0000_0000))],
+    );
+    let res = accept_and_connect_block(&q, &params, Height(hx + 1), &respend, ms).map(|_| ());
+    let _ = dir;
+    (spent, res)
+}
+
+/// A reconnect of an archived block has no Class A wave to pre-fill the
+/// same-block spend. A checkpoint while X was active copied that pre-filled
+/// slot into the page log, and the checkpoint after the disconnect zeroed
+/// it. The output must still read spent after X is back.
+#[test]
+fn reconnected_block_keeps_its_in_block_spend_across_checkpoints() {
+    let (spent, res) = in_block_spend_after_reconnect("spend-inblock-reconnect", true, true);
+    assert!(
+        spent,
+        "an output spent inside the reconnected block reads unspent"
+    );
+    let err = res.expect_err("a block re-spending an in-block spent output must be rejected");
+    assert!(
+        matches!(err, ConfirmError::Rules(ConsensusError::PrevoutSpent)),
+        "{err}"
+    );
+}
+
+/// The same sequence with either checkpoint left out keeps the spend.
+fn assert_in_block_spend_kept(label: &str, before: bool, after: bool) {
+    let (spent, res) = in_block_spend_after_reconnect(label, before, after);
+    assert!(spent, "{label}: in-block spend lost");
+    assert!(
+        matches!(res, Err(ConfirmError::Rules(ConsensusError::PrevoutSpent))),
+        "{label}: {res:?}"
+    );
+}
+
+#[test]
+fn reconnected_block_in_block_spend_without_checkpoints() {
+    assert_in_block_spend_kept("spend-inblock-none", false, false);
+}
+
+#[test]
+fn reconnected_block_in_block_spend_checkpoint_while_active() {
+    assert_in_block_spend_kept("spend-inblock-before", true, false);
+}
+
+#[test]
+fn reconnected_block_in_block_spend_checkpoint_after_disconnect() {
+    assert_in_block_spend_kept("spend-inblock-after", false, true);
 }

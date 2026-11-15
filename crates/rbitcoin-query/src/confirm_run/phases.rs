@@ -104,12 +104,9 @@ pub fn retarget_first_time(
     params: &ChainParams,
     height: u32,
 ) -> Result<Option<rbitcoin_consensus::PeriodFirst>, ConfirmError> {
-    let interval = params.difficulty_adjustment_interval();
-    let on_boundary = interval > 0 && height.is_multiple_of(interval);
-    if !on_boundary || params.no_pow_retargeting() {
+    let Some(first_height) = params.period_first_height(height).map(Height) else {
         return Ok(None);
-    }
-    let first_height = Height(height - interval);
+    };
     let first = if let Some((_fk, rec)) = query.header_at_height(first_height)? {
         Some((rec.timestamp, rec.bits))
     } else {
@@ -380,6 +377,32 @@ pub fn structural_run(
     }
     let mut tot = StructuralPhaseNs::default();
     let bip34_ancestor = bip34_ancestor_for_write(query, params, prepared);
+    let (offs, keep) = crate::block_pipeline::write_meta_abs_offs(
+        prepared
+            .iter()
+            .zip(abs_jobs.iter())
+            .map(|(p, jobs)| (p.spends.as_slice(), jobs.as_slice())),
+        class_a_wave,
+    );
+    reuse.scratch.meta_offs = offs;
+    reuse.scratch.meta_keep = keep;
+    reuse.scratch.meta_job_at = 0;
+    if !reuse.scratch.meta_offs.is_empty() {
+        let meta_backend = rbitcoin_store::spend_meta_backend();
+        let t_meta = Instant::now();
+        reuse.scratch.meta_prefetch = query
+            .store()
+            .get_spender_meta_at_abs_batch_backend(&reuse.scratch.meta_offs, meta_backend)
+            .map_err(ConfirmError::from)?;
+        let meta_ns = t_meta.elapsed().as_nanos() as u64;
+        crate::note_confirm(&query.confirm_stats().spend_meta_ns, meta_ns);
+        crate::note_confirm(
+            &query.confirm_stats().spend_meta_n,
+            reuse.scratch.meta_offs.len() as u64,
+        );
+        let _ = meta_backend;
+    }
+    reuse.scratch.meta_at = Some(0);
     for (i, p) in prepared.iter().enumerate() {
         rbitcoin_consensus::note_block_height(p.height.0);
         let ctx = ValidationContext::at(params, p.height, milestone);
@@ -406,6 +429,13 @@ pub fn structural_run(
         tot.spent_pending_ns = tot.spent_pending_ns.saturating_add(ph.spent_pending_ns);
         tot.create_h_ns = tot.create_h_ns.saturating_add(ph.create_h_ns);
         tot.bip68_ns = tot.bip68_ns.saturating_add(ph.bip68_ns);
+    }
+    if reuse.scratch.meta_at != Some(reuse.scratch.meta_offs.len())
+        || reuse.scratch.meta_job_at != reuse.scratch.meta_keep.len()
+    {
+        return Err(ConfirmError::Store(rbitcoin_store::StoreError::Corrupt(
+            "invariant: structural meta prefetch short",
+        )));
     }
     // Window counters (may race with sampler; last-write uses `tot` instead).
     crate::note_confirm(
@@ -490,12 +520,12 @@ pub fn post_commit(
 ) -> Result<u64, ConfirmError> {
     let t_spent = Instant::now();
     if query.spend_index_enabled() && !slots.abs_edges.is_empty() {
+        query.store().wait_spend_edge_room();
         let _utxo_view = query.store().hold_utxo_view();
-        let backend = spend_ann_backend_next();
         let t_ann = Instant::now();
         let cold = query
             .store()
-            .put_spend_batch_by_abs_meta_known(&slots.abs_edges, &slots.known, backend)
+            .put_spend_batch_by_abs_meta_known(&slots.abs_edges, &slots.known)
             .map_err(ConfirmError::from)?;
         if !cold.is_empty() {
             return Err(ConfirmError::Store(StoreError::Corrupt(
@@ -508,7 +538,6 @@ pub fn post_commit(
             &query.confirm_stats().spend_ann_n,
             slots.abs_edges.len() as u64,
         );
-        let _ = backend;
         crate::note_confirm(
             &query.confirm_stats().spend_annotate_ranged,
             slots.abs_edges.len() as u64,

@@ -32,6 +32,7 @@
 use crate::error::StoreError;
 use crate::io_handle::IoHandle;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 /// SQ/CQ depth for bulk batch sessions.
 #[doc(hidden)]
@@ -59,6 +60,9 @@ pub struct WriteOp<'a> {
 pub static URING_MODE: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 on, 2 off
 #[doc(hidden)]
 pub static WORKERS: AtomicUsize = AtomicUsize::new(0);
+/// Engine the [`io_uring_enabled`] probe built.
+#[doc(hidden)]
+pub static PROBED_KIND: OnceLock<crate::uring_session::SessionKind> = OnceLock::new();
 #[doc(hidden)]
 pub static URING_FAIL_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -75,7 +79,11 @@ pub fn io_uring_enabled() -> bool {
                 URING_MODE.store(2, Ordering::Relaxed);
                 return false;
             }
-            let ok = crate::uring_session::UringSession::try_open(32).is_ok();
+            let probe = crate::uring_session::UringSession::try_open(32);
+            if let Ok(session) = &probe {
+                let _ = PROBED_KIND.set(session.kind());
+            }
+            let ok = probe.is_ok();
             URING_MODE.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
             if !ok && !URING_FAIL_LOGGED.swap(true, Ordering::Relaxed) {
                 rbitcoin_log::warn!(
@@ -126,8 +134,13 @@ pub fn parse_io_token() -> Option<IoToken> {
 
 /// Backend [`crate::uring_session::UringSession::try_open`] should open.
 pub fn resolved_session_kind() -> crate::uring_session::SessionKind {
+    session_kind_for(parse_io_token())
+}
+
+#[doc(hidden)]
+pub fn session_kind_for(token: Option<IoToken>) -> crate::uring_session::SessionKind {
     use crate::uring_session::SessionKind;
-    match parse_io_token() {
+    match token {
         Some(IoToken::Pool) => SessionKind::Pool,
         Some(IoToken::Iocp) => SessionKind::Iocp,
         Some(IoToken::Uring) => SessionKind::Uring,
@@ -151,6 +164,16 @@ pub fn default_session_kind() -> crate::uring_session::SessionKind {
     {
         SessionKind::Pool
     }
+}
+
+/// Bulk-IO backend this process uses, for the startup log: the engine the
+/// session probe built, or `pread` when no session opens (asked for, or the
+/// session would not open).
+pub fn backend_name() -> &'static str {
+    if !io_uring_enabled() {
+        return "pread";
+    }
+    PROBED_KIND.get().map_or("pread", |kind| kind.name())
 }
 
 /// Worker count for pread fallback (cached).

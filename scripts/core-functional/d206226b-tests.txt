@@ -1,4 +1,4 @@
-# Bitcoin Core v32.1 test/functional/*.py (284 files)
+# Bitcoin Core d206226b (master after v32.1) test/functional/*.py (289 files)
 combine_logs.py
 create_cache.py
 example_test.py
@@ -36,6 +36,7 @@ feature_help.py
 feature_includeconf.py
 feature_index_prune.py
 feature_init.py
+feature_io_errors.py
 feature_loadblock.py
 feature_logging.py
 feature_maxtipage.py
@@ -72,6 +73,7 @@ interface_gui.py
 interface_http.py
 interface_ipc.py
 interface_ipc_cli.py
+interface_ipc_init.py
 interface_ipc_mining.py
 interface_rest.py
 interface_rpc.py
@@ -114,6 +116,7 @@ p2p_addrfetch.py
 p2p_addrv2_relay.py
 p2p_bip434_feature.py
 p2p_block_sync.py
+p2p_block_times.py
 p2p_blockfilters.py
 p2p_blocksonly.py
 p2p_compactblocks.py
@@ -151,6 +154,7 @@ p2p_orphan_handling.py
 p2p_outbound_eviction.py
 p2p_permissions.py
 p2p_ping.py
+p2p_ping_ibd.py
 p2p_private_broadcast.py
 p2p_private_broadcast_cap.py
 p2p_private_broadcast_completion.py
@@ -254,6 +258,7 @@ wallet_keypool.py
 wallet_keypool_topup.py
 wallet_labels.py
 wallet_listdescriptors.py
+wallet_listrawtransactions.py
 wallet_listreceivedby.py
 wallet_listsinceblock.py
 wallet_listtransactions.py

@@ -166,7 +166,7 @@ impl P2PNode {
         let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
 
         let (listener, local_addr) = if let Some(addr) = listen {
-            let listener = crate::listen::bind_tcp(addr)?;
+            let listener = bind_p2p(addr)?;
             let local_addr = listener.local_addr()?;
             (Some(listener), local_addr)
         } else {
@@ -310,7 +310,7 @@ impl P2PNode {
 
     /// Bind an additional listen socket (Core multi-`-bind`).
     pub async fn add_listen(&mut self, listen: SocketAddr) -> Result<SocketAddr, NetError> {
-        let listener = crate::listen::bind_tcp(listen)?;
+        let listener = bind_p2p(listen)?;
         let local_addr = listener.local_addr()?;
         let accept_task = spawn_inbound_accept(
             listener,
@@ -481,6 +481,15 @@ impl Drop for P2PNode {
     }
 }
 
+/// Only a failed `bind` is [`NetError::Bind`]; Core gives the socket and
+/// `listen` calls their own InitError text.
+fn bind_p2p(addr: SocketAddr) -> Result<tokio::net::TcpListener, NetError> {
+    crate::listen::bind_tcp_step(addr).map_err(|(step, source)| match step {
+        crate::listen::ListenStep::Bind => NetError::Bind { addr, source },
+        _ => NetError::Io(source),
+    })
+}
+
 #[doc(hidden)]
 pub fn push_session_task(bag: &Mutex<Vec<JoinHandle<()>>>, h: JoinHandle<()>) {
     if let Ok(mut g) = bag.lock() {
@@ -521,6 +530,18 @@ pub fn spawn_inbound_accept(
                         drop(stream);
                         continue;
                     }
+                    if !crate::listen::listener_fd_room() {
+                        rbitcoin_log::warn!("p2p: reject inbound {peer_addr} (descriptor reserve)");
+                        drop(stream);
+                        continue;
+                    }
+                    let Some(incomplete) = peers.try_reserve_incomplete(peer_addr.ip()) else {
+                        rbitcoin_log::info!(
+                            "p2p: reject inbound {peer_addr} (incomplete handshakes)"
+                        );
+                        drop(stream);
+                        continue;
+                    };
                     let permit = match inbound_sem.clone().try_acquire_owned() {
                         Ok(p) => p,
                         Err(_) => {
@@ -560,20 +581,20 @@ pub fn spawn_inbound_accept(
                         tokio::sync::oneshot::channel::<tokio::task::AbortHandle>();
                     let h = tokio::spawn(async move {
                         let _session_slot = permit;
-                        let (_ver, reader, writer, tcp_shutdown, sess) =
-                            match inbound_connect_and_handshake(
-                                stream, magic, our, peer_addr, height, &ua, &peers, our,
-                            )
-                            .await
-                            {
-                                Ok(x) => x,
-                                Err(e) => {
-                                    rbitcoin_log::debug!(
-                                        "p2p: inbound handshake {peer_addr} failed: {e}"
-                                    );
-                                    return;
-                                }
-                            };
+                        let handshake = inbound_connect_and_handshake(
+                            stream, magic, our, peer_addr, height, &ua, &peers, our,
+                        )
+                        .await;
+                        drop(incomplete);
+                        let (_ver, reader, writer, tcp_shutdown, sess) = match handshake {
+                            Ok(x) => x,
+                            Err(e) => {
+                                rbitcoin_log::debug!(
+                                    "p2p: inbound handshake {peer_addr} failed: {e}"
+                                );
+                                return;
+                            }
+                        };
                         sess.attach_tcp_shutdown(tcp_shutdown);
                         if !peers.make_room_for_tx_relay_inbound(&sess, max_inbound) {
                             rbitcoin_log::debug!(
@@ -642,18 +663,24 @@ pub struct PreparedOutbound {
 
 /// A transient accept error should not stop the listen loop.
 ///
-/// `ConnectionAborted` is a peer that vanished during accept.
-/// `Interrupted` is a signal. `EMFILE` / `ENFILE` (24 / 23) clear once a
-/// socket is closed. Anything else, including a closed listener, ends accept.
+/// A reset peer, a signal, and a full socket table clear once a descriptor
+/// or buffer frees. A closed listener does not.
 #[doc(hidden)]
 pub fn accept_error_ends_listen(err: &std::io::Error) -> bool {
     if matches!(
         err.kind(),
-        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::Interrupted
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::Interrupted
     ) {
         return false;
     }
-    !matches!(err.raw_os_error(), Some(23 | 24))
+    // ENFILE/EMFILE, EPERM, ENOMEM, ENOBUFS, and the Windows socket-table
+    // and buffer errors. A bad listener fd is not in this set.
+    !matches!(
+        err.raw_os_error(),
+        Some(1 | 12 | 23 | 24 | 105 | 10024 | 10050 | 10055)
+    )
 }
 
 /// How often a down `--connect` / `addnode` target is tried again.
@@ -686,6 +713,9 @@ pub async fn prepare_outbound_session(
     typ: PeerConnType,
     dialer: crate::socks::Dialer,
 ) -> Result<PreparedOutbound, NetError> {
+    if !peer.has_key() {
+        return Err(NetError::Protocol("too many distinct proxied host names"));
+    }
     let tip_at_handshake = hub.tip_hash();
     hub.clock.note_connection_attempt();
     rbitcoin_log::debug!("{}", crate::peers::trying_connection_log(typ, &peer));
@@ -850,6 +880,9 @@ pub async fn run_outbound_session_with_abort(
 
 /// Resolve P2P message magic, including BIP325 custom-Signet derivation.
 pub fn magic_for_params(params: &ChainParams) -> Magic {
+    if params.testnet5 {
+        return Magic::from_bytes(*b"FIVE");
+    }
     match params.signet_challenge.as_ref() {
         Some(challenge) => Magic::from_bytes(signet_magic(challenge.as_script())),
         None => Magic::from(params.network),

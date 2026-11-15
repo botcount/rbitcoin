@@ -582,6 +582,31 @@ fn default_kind_follows_os_when_env_unset() {
     );
 }
 
+/// A session reports the engine it built, not the one asked for. Off Linux
+/// and Windows, and on Windows when IOCP will not open, `Uring` builds the
+/// worker pool.
+#[test]
+fn session_kind_is_the_engine_built() {
+    let pool = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
+    assert_eq!(
+        (pool.kind(), pool.kind().name()),
+        (SessionKind::Pool, "pool")
+    );
+    let Ok(asked_uring) = UringSession::try_open_kind(SessionKind::Uring, 32) else {
+        return;
+    };
+    let built = asked_uring.kind();
+    #[cfg(target_os = "linux")]
+    assert_eq!((built, built.name()), (SessionKind::Uring, "io_uring"));
+    #[cfg(windows)]
+    assert!(
+        matches!(built, SessionKind::Iocp | SessionKind::Pool),
+        "{built:?}"
+    );
+    #[cfg(not(any(target_os = "linux", windows)))]
+    assert_eq!((built, built.name()), (SessionKind::Pool, "pool"));
+}
+
 /// A panic while SQEs are in flight frees the closure's buffers. The kernel
 /// may still complete into them, so the process must abort instead of
 /// unwinding and leaving the TLS session to be reused.
