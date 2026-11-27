@@ -1,16 +1,16 @@
 {
- "sha": "2285527eb7e771a326f9643b139497d543cd4bcb",
+ "sha": "904febfc2c6308b349092d21bffbbdcc4a07a52a",
  "ok": true,
  "failed": [],
  "warn": [],
- "secs": 148,
+ "secs": 123,
  "stages": [
   {
    "name": "fetch",
    "ok": true,
    "secs": 1,
    "lines": [],
-   "note": "2 commit(s) on master~0, 18 files"
+   "note": "2 commit(s) on master~0, 20 files"
   },
   {
    "name": "fmt",
@@ -29,7 +29,7 @@
   {
    "name": "qc scripts",
    "ok": true,
-   "secs": 17,
+   "secs": 18,
    "lines": [],
    "note": ""
   },
@@ -45,25 +45,24 @@
   {
    "name": "clippy -D warnings",
    "ok": true,
-   "secs": 20,
+   "secs": 11,
    "lines": [
-    "    Checking rbitcoin-rpc v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-rpc)",
-    "    Checking rbitcoin-sv2 v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-sv2)",
-    "    Checking rbitcoin-esplora v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-esplora)",
+    "    Checking rbitcoin-ibd v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-ibd)",
+    "    Checking rbitcoin-net v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-net)",
     "    Checking rbitcoin-node v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-node)",
     "    Checking rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
-    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.73s"
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.74s"
    ],
    "note": ""
   },
   {
    "name": "doc",
    "ok": true,
-   "secs": 8,
+   "secs": 4,
    "lines": [
     " Documenting rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
     "    Checking rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
-    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.16s",
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.02s",
     "   Generated /var/tmp/muse-ci/wt/ban-rpcs/target/dev/doc/rbitcoin_bench/index.html and 16 other files"
    ],
    "note": ""
@@ -78,11 +77,11 @@
   {
    "name": "cargo test --workspace",
    "ok": true,
-   "secs": 97,
+   "secs": 85,
    "lines": [
-    "5320 passed, 2 failed, 5 ignored (2 known root-only chmod failures ignored)"
+    "5321 passed, 2 failed, 5 ignored (2 known root-only chmod failures ignored)"
    ],
-   "note": "5320 passed, 2 failed, 5 ignored (2 known root-only chmod failures ignored)"
+   "note": "5321 passed, 2 failed, 5 ignored (2 known root-only chmod failures ignored)"
   }
  ],
  "base": "ebc6e6787c9f790366d5d6e5a292ff718e6bbc8d",
