@@ -1,16 +1,16 @@
 {
- "sha": "08511020cdc72838eb783ef775630731eaced0ad",
+ "sha": "4dcc35b67ea581d07e2ad6ee04e7e017dc54ca99",
  "ok": true,
  "failed": [],
  "warn": [],
- "secs": 141,
+ "secs": 92,
  "stages": [
   {
    "name": "fetch",
    "ok": true,
-   "secs": 0,
+   "secs": 1,
    "lines": [],
-   "note": "6 commit(s) on master~0, 15 files"
+   "note": "2 commit(s) on master~0, 15 files"
   },
   {
    "name": "fmt",
@@ -45,25 +45,18 @@
   {
    "name": "clippy -D warnings",
    "ok": true,
-   "secs": 16,
+   "secs": 0,
    "lines": [
-    "    Checking rbitcoin-rpc v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-rpc)",
-    "    Checking rbitcoin-sv2 v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-sv2)",
-    "    Checking rbitcoin-esplora v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-esplora)",
-    "    Checking rbitcoin-node v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-node)",
-    "    Checking rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
-    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.18s"
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.20s"
    ],
    "note": ""
   },
   {
    "name": "doc",
    "ok": true,
-   "secs": 8,
+   "secs": 0,
    "lines": [
-    "    Checking rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
-    " Documenting rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
-    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.96s",
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.16s",
     "   Generated /var/tmp/muse-ci/wt/ban-rpcs/target/dev/doc/rbitcoin_bench/index.html and 16 other files"
    ],
    "note": ""
@@ -78,7 +71,7 @@
   {
    "name": "cargo test --workspace",
    "ok": true,
-   "secs": 94,
+   "secs": 68,
    "lines": [
     "5316 passed, 2 failed, 5 ignored (2 known root-only chmod failures ignored)"
    ],
