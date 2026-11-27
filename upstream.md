@@ -1,38 +1,34 @@
-# Upstream PR #2167 @ 4dcc35b67
+# Upstream PR #2167 @ 2285527eb
 Checks: 24/24 done, 0 failed
 
 
 ## New review comments (address each; reply only through code/PR text, not as comments unless told)
-- [coderabbitai[bot] CHANGES_REQUESTED] **Actionable comments posted: 4**
+- [coderabbitai[bot] CHANGES_REQUESTED] **Actionable comments posted: 2**
 
 ---
 
 - [ ]  Ask CodeRabbit to fix comments on this review
 
 **Included review availability:** This review used your included allowance. Your plan provides up to 10 included reviews per hour; 9 remain after this review.
-- [coderabbitai[bot] crates/rbitcoin-net/src/ban.rs:173] ** Minor** · **Functional Correctness** · **Quick win**
+- [coderabbitai[bot] crates/rbitcoin-ibd/src/ibd/peer_io.rs:1265] ** Major** · **Security & Privacy** · ** Detected with Advanced Tier** · **Heavy lift**
 
-**Normalize IPv4-mapped IPv6 targets before storing them.**
+**Authorization Bypass**
 
-`parse_ban_target("::ffff:192.0.2.1")` produces a `V6` target. However, `matches_ip` converts that same address to `V4`, so the ban never matches. Inbound admission also canonicalizes mapped addresses to IPv4.
+**Reachability:** External  
+**Exploitability:** Moderate  
+**CWE:** [CWE-863](https://cwe.mitre.org/data/definitions/863.html) — Incorrect Authorization
 
-Normalize mapped targets and their prefix consistently, or reject unsupported mapped subnet forms. Keep native IPv6 targets unchanged.
-- [coderabbitai[bot] crates/rbitcoin-net/src/ban.rs:305] ** Major** · **Data Integrity & Integration** · **Heavy lift**
+[View Security blast radius](https://app.coderabbit.ai/change-stack/rbitcoin-org/rbitcoin/pull/2167/blast-radius?scope=ghh_OusAJGA4HG8ljoOV0wJvVx8NmnZIjc2DdjmxOu0xZWA&toCommitId=2285527eb7e771a326f9643b139497d543cd4bcb&reviewRunId=c6ca5dbe-9280-4165-807a-13494cfa5e1a&securityFinding=b632130ee3108eb4953a223b)
 
-**Return persistence failures to ban-management callers.**
+**A manual ban does not disconnect IBD peer sessions that are already connected.**
 
-If writing `banlist.json` fails, `add`, `remove`, and `clear` still report success through the RPC handlers. A restart then restores the previous disk state.
+`ban_add` disconnects only the sessions in `PeerHub.live` that match the new ban. IBD catch-up sessions are not in that table. The only IBD check of the ban list runs once, inside `spawn_peer`, before the connection opens. A peer that 
+- [coderabbitai[bot] crates/rbitcoin-net/tests/service.rs:1445] ** Trivial** · **Maintainability & Code Quality** · **Quick win**
 
-A failed `clear` also cannot be retried: memory is already empty, so the next `clear` skips saving even after storage recovers. Preserve a retryable dirty state or roll back the mutation, and propagate a typed persistence error to the RPC caller.
-- [coderabbitai[bot] crates/rbitcoin-net/src/service.rs:754] ** Minor** · **Functional Correctness** · **Quick win**
+**Use the shipped Tiny query fixture.**
 
-**Close the race between an outbound dial and a manual ban.**
+This setup duplicates temporary-directory ownership. Cleanup at Line 1498 runs only when the test completes normally. Use `rbitcoin_query::testutil::tiny_query_labeled` and retain its directory guard for the test lifetime.
 
-A ban added while an outbound dial is connecting does not stop that dial. The check at `service.rs:752` runs before the connect. `ban_add` disconnects only rows already in `live_peers()`, and no row exists until `register_connecting_net` runs after the connect. The handshake does not consult bans, and `register_handshaken_net` publishes the session without a ban check. The session therefore stays connected after `setban` reports success. The window lasts for the connect timeout. A session published under this race stays until another disconnect, such as `disconnectnode`.
+Based on learnings, “Do not roll your own `std::env::temp_dir()` + `create_dir_all` for a Tiny store/query.”
 
-Publication of an outbound session must re-check the ban after the connect completes and before the session becomes visible. A session whose target matches a ban added during the dial must not be publi
-- [coderabbitai[bot] crates/rbitcoin-node/src/run.rs:794] ** Major** · **Functional Correctness** · **Quick win**
-
-**Apply manual bans to IBD outbound dials in `spawn_peer`.**
-
-IBD catch-up dials bypass the manual ban list. `spawn_peer` checks only `net_discouraged` and `trust_allows_net`, then calls `connect_net`. A peer banned with `setban` can still receive a new IBD session. This happens during any catch-up dial, including after a restart when the ban file is loaded. The generic connect path in `service.rs` already refuses banned targets. Add the same check before the dial.
+_Source: Learnings_
