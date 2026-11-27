@@ -1,0 +1,101 @@
+{
+ "sha": "fa10a4a9812a5ae9e878de614f42262c92d90206",
+ "ok": false,
+ "failed": [
+  "qc scripts"
+ ],
+ "warn": [
+  "changelog",
+  "crap (cc)"
+ ],
+ "secs": 202,
+ "stages": [
+  {
+   "name": "fetch",
+   "ok": true,
+   "secs": 1,
+   "lines": [],
+   "note": "1 commit(s) on master~0, 7 files"
+  },
+  {
+   "name": "fmt",
+   "ok": true,
+   "secs": 4,
+   "lines": [],
+   "note": ""
+  },
+  {
+   "name": "metadata --locked",
+   "ok": true,
+   "secs": 0,
+   "lines": [],
+   "note": ""
+  },
+  {
+   "name": "qc scripts",
+   "ok": false,
+   "secs": 17,
+   "lines": [
+    "[unused-pub] crates/rbitcoin-net/src/ban.rs:15: `pub const DEFAULT_BAN_SECS` is named nowhere else. Delete it, or drop `pub` if an attribute is its only user (CONTRIBUTING.m"
+   ],
+   "note": ""
+  },
+  {
+   "name": "changelog",
+   "ok": null,
+   "secs": 0,
+   "lines": [
+    "no changelog.d/*.md entry (CONTRIBUTING: one file per pull)"
+   ],
+   "note": ""
+  },
+  {
+   "name": "clippy -D warnings",
+   "ok": true,
+   "secs": 29,
+   "lines": [
+    "    Checking rbitcoin-sv2 v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-sv2)",
+    "    Checking rbitcoin-rpc v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-rpc)",
+    "    Checking rbitcoin-esplora v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-esplora)",
+    "    Checking rbitcoin-node v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-node)",
+    "    Checking rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 28.45s"
+   ],
+   "note": ""
+  },
+  {
+   "name": "doc",
+   "ok": true,
+   "secs": 13,
+   "lines": [
+    "    Checking rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
+    " Documenting rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.69s",
+    "   Generated /var/tmp/muse-ci/wt/ban-rpcs/target/dev/doc/rbitcoin_bench/index.html and 16 other files"
+   ],
+   "note": ""
+  },
+  {
+   "name": "crap (cc)",
+   "ok": null,
+   "secs": 0,
+   "lines": [
+    "    }",
+    "  ]",
+    "}"
+   ],
+   "note": "unparsed"
+  },
+  {
+   "name": "cargo test --workspace",
+   "ok": true,
+   "secs": 130,
+   "lines": [
+    "5312 passed, 2 failed, 5 ignored (2 known root-only chmod failures ignored)"
+   ],
+   "note": "5312 passed, 2 failed, 5 ignored (2 known root-only chmod failures ignored)"
+  }
+ ],
+ "base": "ebc6e6787c9f790366d5d6e5a292ff718e6bbc8d",
+ "behind": 0
+}
