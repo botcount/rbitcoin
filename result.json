@@ -1,9 +1,9 @@
 {
- "sha": "0bb3a0dded6da3bc2f4fb6443e7b79abe039202d",
+ "sha": "8127c9ea4f0dc10f8069204636d77e7d388f1bff",
  "ok": true,
  "failed": [],
  "warn": [],
- "secs": 118,
+ "secs": 102,
  "stages": [
   {
    "name": "fetch",
@@ -45,23 +45,20 @@
   {
    "name": "clippy -D warnings",
    "ok": true,
-   "secs": 11,
+   "secs": 5,
    "lines": [
     "    Checking rbitcoin-ibd v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-ibd)",
-    "    Checking rbitcoin-node v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-node)",
-    "    Checking rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
-    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.48s"
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.08s"
    ],
    "note": ""
   },
   {
    "name": "doc",
    "ok": true,
-   "secs": 4,
+   "secs": 1,
    "lines": [
-    " Documenting rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
-    "    Checking rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
-    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.90s",
+    " Documenting rbitcoin-ibd v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-ibd)",
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.13s",
     "   Generated /var/tmp/muse-ci/wt/ban-rpcs/target/dev/doc/rbitcoin_bench/index.html and 16 other files"
    ],
    "note": ""
@@ -76,7 +73,7 @@
   {
    "name": "cargo test --workspace",
    "ok": true,
-   "secs": 81,
+   "secs": 74,
    "lines": [
     "5321 passed, 2 failed, 5 ignored (2 known root-only chmod failures ignored)"
    ],
