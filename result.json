@@ -1,16 +1,18 @@
 {
- "sha": "2ab737029e078f0f3e8a00188352332942a23140",
- "ok": true,
- "failed": [],
+ "sha": "a2634774f27acd387ab4e43b7c536d96cb6d0640",
+ "ok": false,
+ "failed": [
+  "qc scripts"
+ ],
  "warn": [],
- "secs": 120,
+ "secs": 141,
  "stages": [
   {
    "name": "fetch",
    "ok": true,
    "secs": 0,
    "lines": [],
-   "note": "4 commit(s) on master~0, 15 files"
+   "note": "5 commit(s) on master~0, 15 files"
   },
   {
    "name": "fmt",
@@ -28,9 +30,11 @@
   },
   {
    "name": "qc scripts",
-   "ok": true,
+   "ok": false,
    "secs": 17,
-   "lines": [],
+   "lines": [
+    "[ast-grep]     \u2502         ^^^^^^^^^^^^ |     \u2502 |     = Every file flush goes through one helper (crates/rbitcoin-store/src/durability.rs). An async file flushes through it after into_std(). | Error: 1 error(s) found in code. | Help: Scan succeeded and found error level diagnostics in the codebase."
+   ],
    "note": ""
   },
   {
@@ -45,25 +49,25 @@
   {
    "name": "clippy -D warnings",
    "ok": true,
-   "secs": 10,
+   "secs": 17,
    "lines": [
-    "    Checking rbitcoin-cli v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-cli)",
+    "    Checking rbitcoin-sv2 v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-sv2)",
     "    Checking rbitcoin-rpc v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-rpc)",
-    "    Checking rbitcoin-net v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-net)",
+    "    Checking rbitcoin-esplora v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-esplora)",
     "    Checking rbitcoin-node v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-node)",
     "    Checking rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
-    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.35s"
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.70s"
    ],
    "note": ""
   },
   {
    "name": "doc",
    "ok": true,
-   "secs": 4,
+   "secs": 8,
    "lines": [
-    " Documenting rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
     "    Checking rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
-    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.73s",
+    " Documenting rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.95s",
     "   Generated /var/tmp/muse-ci/wt/ban-rpcs/target/dev/doc/rbitcoin_bench/index.html and 16 other files"
    ],
    "note": ""
@@ -78,7 +82,7 @@
   {
    "name": "cargo test --workspace",
    "ok": true,
-   "secs": 84,
+   "secs": 94,
    "lines": [
     "5316 passed, 2 failed, 5 ignored (2 known root-only chmod failures ignored)"
    ],
