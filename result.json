@@ -1,9 +1,7 @@
 {
- "sha": "a2634774f27acd387ab4e43b7c536d96cb6d0640",
- "ok": false,
- "failed": [
-  "qc scripts"
- ],
+ "sha": "08511020cdc72838eb783ef775630731eaced0ad",
+ "ok": true,
+ "failed": [],
  "warn": [],
  "secs": 141,
  "stages": [
@@ -12,7 +10,7 @@
    "ok": true,
    "secs": 0,
    "lines": [],
-   "note": "5 commit(s) on master~0, 15 files"
+   "note": "6 commit(s) on master~0, 15 files"
   },
   {
    "name": "fmt",
@@ -30,11 +28,9 @@
   },
   {
    "name": "qc scripts",
-   "ok": false,
+   "ok": true,
    "secs": 17,
-   "lines": [
-    "[ast-grep]     \u2502         ^^^^^^^^^^^^ |     \u2502 |     = Every file flush goes through one helper (crates/rbitcoin-store/src/durability.rs). An async file flushes through it after into_std(). | Error: 1 error(s) found in code. | Help: Scan succeeded and found error level diagnostics in the codebase."
-   ],
+   "lines": [],
    "note": ""
   },
   {
@@ -49,14 +45,14 @@
   {
    "name": "clippy -D warnings",
    "ok": true,
-   "secs": 17,
+   "secs": 16,
    "lines": [
-    "    Checking rbitcoin-sv2 v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-sv2)",
     "    Checking rbitcoin-rpc v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-rpc)",
+    "    Checking rbitcoin-sv2 v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-sv2)",
     "    Checking rbitcoin-esplora v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-esplora)",
     "    Checking rbitcoin-node v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-node)",
     "    Checking rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
-    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.70s"
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.18s"
    ],
    "note": ""
   },
@@ -67,7 +63,7 @@
    "lines": [
     "    Checking rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
     " Documenting rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
-    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.95s",
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.96s",
     "   Generated /var/tmp/muse-ci/wt/ban-rpcs/target/dev/doc/rbitcoin_bench/index.html and 16 other files"
    ],
    "note": ""
