@@ -1,16 +1,16 @@
 {
- "sha": "4dcc35b67ea581d07e2ad6ee04e7e017dc54ca99",
+ "sha": "2285527eb7e771a326f9643b139497d543cd4bcb",
  "ok": true,
  "failed": [],
  "warn": [],
- "secs": 92,
+ "secs": 148,
  "stages": [
   {
    "name": "fetch",
    "ok": true,
    "secs": 1,
    "lines": [],
-   "note": "2 commit(s) on master~0, 15 files"
+   "note": "2 commit(s) on master~0, 18 files"
   },
   {
    "name": "fmt",
@@ -45,18 +45,25 @@
   {
    "name": "clippy -D warnings",
    "ok": true,
-   "secs": 0,
+   "secs": 20,
    "lines": [
-    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.20s"
+    "    Checking rbitcoin-rpc v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-rpc)",
+    "    Checking rbitcoin-sv2 v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-sv2)",
+    "    Checking rbitcoin-esplora v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-esplora)",
+    "    Checking rbitcoin-node v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-node)",
+    "    Checking rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.73s"
    ],
    "note": ""
   },
   {
    "name": "doc",
    "ok": true,
-   "secs": 0,
+   "secs": 8,
    "lines": [
-    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.16s",
+    " Documenting rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
+    "    Checking rbitcoin-test v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-test)",
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.16s",
     "   Generated /var/tmp/muse-ci/wt/ban-rpcs/target/dev/doc/rbitcoin_bench/index.html and 16 other files"
    ],
    "note": ""
@@ -71,11 +78,11 @@
   {
    "name": "cargo test --workspace",
    "ok": true,
-   "secs": 68,
+   "secs": 97,
    "lines": [
-    "5316 passed, 2 failed, 5 ignored (2 known root-only chmod failures ignored)"
+    "5320 passed, 2 failed, 5 ignored (2 known root-only chmod failures ignored)"
    ],
-   "note": "5316 passed, 2 failed, 5 ignored (2 known root-only chmod failures ignored)"
+   "note": "5320 passed, 2 failed, 5 ignored (2 known root-only chmod failures ignored)"
   }
  ],
  "base": "ebc6e6787c9f790366d5d6e5a292ff718e6bbc8d",
