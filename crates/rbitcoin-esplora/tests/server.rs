@@ -496,6 +496,62 @@ async fn listener_cap_esplora_idle_tcp_is_closed() {
     handle.shutdown().await;
 }
 
+/// With `--esplora-accept-multiplier 1` the accepted socket cap is the
+/// in-flight cap itself, not eight times it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listener_cap_follows_the_accept_multiplier() {
+    let (_dir, q) = temp_query("esplora-accept-multiplier");
+    let (h0, cb0) = coinbase(0, Fk::NULL, None);
+    q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    cfg.limits.max_connections = 2;
+    cfg.limits.idle_timeout = Duration::from_millis(300);
+    cfg.accept_multiplier = 1;
+    let cap = rbitcoin_esplora::server::esplora_accept_cap(2, cfg.accept_multiplier);
+    assert_eq!(cap, 2);
+    let handle = run_esplora(cfg, Arc::new(q), None).await.expect("listen");
+    let addr = handle.local_addr;
+    let mut opened = Vec::new();
+    for _ in 0..(cap + 16) {
+        opened.push(TcpStream::connect(addr).await.expect("connect"));
+    }
+    let still = accepted_within(opened, cap).await;
+    assert!(
+        !still.is_empty() && still.len() <= cap,
+        "esplora held {} idle TCP connections; cap is {cap}",
+        still.len()
+    );
+    drop(still);
+    handle.shutdown().await;
+}
+
+/// A request body that does not arrive within
+/// `--esplora-body-read-timeout` is answered 408, before it takes a
+/// listener slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_body_is_408_at_the_body_read_timeout() {
+    let (_dir, q) = temp_query("esplora-body-timeout");
+    let (h0, cb0) = coinbase(0, Fk::NULL, None);
+    q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    cfg.limits.idle_timeout = Duration::from_secs(10);
+    cfg.body_read_timeout = Duration::from_millis(300);
+    let handle = run_esplora(cfg, Arc::new(q), None).await.expect("listen");
+    let mut stream = TcpStream::connect(handle.local_addr)
+        .await
+        .expect("connect");
+    stream
+        .write_all(b"POST /tx HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nabc")
+        .await
+        .expect("write");
+    let mut buf = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf)).await;
+    assert!(read.is_ok(), "no answer within 5s for a stalled body");
+    let text = String::from_utf8_lossy(&buf);
+    assert!(text.contains("408"), "a stalled body is 408: {text}");
+    handle.shutdown().await;
+}
+
 /// Shutdown closes an accepted idle socket. The header timer is not what
 /// closes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
