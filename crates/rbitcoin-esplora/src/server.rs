@@ -520,7 +520,9 @@ pub struct EsploraConfig {
     pub min_drain_rate: u64,
     /// A request body must arrive within this time
     /// (`--esplora-body-read-timeout`). Default
-    /// [`ESPLORA_BODY_READ_TIMEOUT`].
+    /// [`ESPLORA_BODY_READ_TIMEOUT`]. The request timeout (the listener
+    /// idle timeout, floored at 1 s) wraps the body read, so it caps this
+    /// value: the smaller of the two is the real deadline.
     pub body_read_timeout: Duration,
     /// Accepted sockets per request in flight
     /// (`--esplora-accept-multiplier`, >= 1). Default

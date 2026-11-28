@@ -75,9 +75,67 @@ fn outspends_heavy_turn_follows_heavy_sh_creates() {
         .expect("entries above the threshold take the turn");
     assert!(
         handlers::outspends_heavy_turn(&q, 6).is_err(),
-        "a second reply above the threshold waits for the held turn"
+        "a second reply above the threshold is refused while the turn is held"
     );
     drop(turn);
+}
+
+/// The route applies the same threshold to a `?start_index=` page: with
+/// `--heavy-sh-creates` below the page size, a page over the threshold
+/// waits for the heavy turn like an unpaged reply, and only a page
+/// within the threshold is built without it.
+#[tokio::test]
+async fn outspends_page_over_the_threshold_waits_for_the_heavy_turn() {
+    use bitcoin::hashes::Hash as _;
+    let (dir, q) = temp_query("outspends-page-turn");
+    let mut txid = [0x42u8; 32];
+    txid[31] = 0x5a;
+    let wide = TxApply {
+        tx: TxRecord {
+            txid,
+            version: 2,
+            locktime: 0,
+            input_count: 1,
+            output_count: 20,
+        },
+        inputs: vec![InputRecord::coinbase(u32::MAX, vec![1], vec![])],
+        outputs: (0..20)
+            .map(|_| OutputRecord::unspent(1_000, vec![0x51]))
+            .collect(),
+    };
+    let txs = vec![rbitcoin_query::testutil::fixture_pay(0, &[0x51]), wide];
+    let h0 = rbitcoin_query::testutil::fixture_header(0, 0, Fk::NULL, None, &txs);
+    q.connect_block(Height(0), &h0, &txs).unwrap();
+    q.set_heavy_sh_creates(5);
+    let q = Arc::new(q);
+    let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    let handle = run_esplora(cfg, Arc::clone(&q), None)
+        .await
+        .expect("listen");
+    let txid_hex = display_txid(bitcoin::Txid::from_byte_array(txid));
+    let page = |start: u32| format!("/tx/{txid_hex}/outspends?start_index={start}");
+
+    let turn = q.take_heavy_turn().expect("the turn is free");
+    let addr = handle.local_addr;
+    let page0 = page(0);
+    let mut over = tokio::spawn(async move { http_get(addr, &page0).await });
+    let waited = tokio::time::timeout(Duration::from_secs(2), &mut over).await;
+    assert!(
+        waited.is_err(),
+        "a 20-entry page over a threshold of 5 answered while the turn was held"
+    );
+    let (st, body) = http_get(handle.local_addr, &page(16)).await;
+    assert_eq!(st, 200, "a 4-entry page stays under the threshold: {body}");
+    let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(rows.as_array().map(|a| a.len()), Some(4), "{body}");
+    drop(turn);
+
+    let (st, body) = over.await.expect("page task");
+    assert_eq!(st, 200, "the page is built once the turn frees: {body}");
+    let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(rows.as_array().map(|a| a.len()), Some(20), "{body}");
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A client that stops reading a response cannot hold the connection. The
@@ -549,6 +607,40 @@ async fn slow_body_is_408_at_the_body_read_timeout() {
     assert!(read.is_ok(), "no answer within 5s for a stalled body");
     let text = String::from_utf8_lossy(&buf);
     assert!(text.contains("408"), "a stalled body is 408: {text}");
+    handle.shutdown().await;
+}
+
+/// A `--esplora-body-read-timeout` above the request timeout does not
+/// extend a body read past it: the request timeout (the listener idle
+/// timeout) wraps the body gate, so it is the real upper bound and the
+/// answer is still 408, at the request timeout rather than the flag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn body_read_timeout_is_capped_by_the_request_timeout() {
+    let (_dir, q) = temp_query("esplora-body-timeout-cap");
+    let (h0, cb0) = coinbase(0, Fk::NULL, None);
+    q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    cfg.limits.idle_timeout = Duration::from_secs(2);
+    cfg.body_read_timeout = Duration::from_secs(3600);
+    let handle = run_esplora(cfg, Arc::new(q), None).await.expect("listen");
+    let mut stream = TcpStream::connect(handle.local_addr)
+        .await
+        .expect("connect");
+    stream
+        .write_all(b"POST /tx HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nabc")
+        .await
+        .expect("write");
+    let started = Instant::now();
+    let mut buf = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(15), stream.read_to_end(&mut buf)).await;
+    assert!(read.is_ok(), "no answer within 15s for a stalled body");
+    let text = String::from_utf8_lossy(&buf);
+    assert!(text.contains("408"), "a stalled body is 408: {text}");
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "answered in {:?}, before either deadline",
+        started.elapsed()
+    );
     handle.shutdown().await;
 }
 

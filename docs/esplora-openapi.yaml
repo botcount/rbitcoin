@@ -455,9 +455,9 @@ paths:
       summary: Spend status of every output
       description: |
         Same `?asof=` semantics as `/tx/{txid}/outspend/{vout}`. Without
-        `start_index`, every output, as Esplora answers. A reply over 10,000
-        entries waits for the node's single heavy turn, so one such reply is
-        built at a time.
+        `start_index`, every output, as Esplora answers. A reply over
+        `--heavy-sh-creates` entries takes the node's single heavy turn, so
+        one such reply is built at a time.
       parameters:
         - { $ref: "#/components/parameters/Txid" }
         - { $ref: "#/components/parameters/AsOf" }
@@ -466,7 +466,8 @@ paths:
           required: false
           description: |
             Dialect. First vout of the page; the page is vouts `start_index` up to
-            `start_index + 10000`, built without the heavy turn. Past the last output is 404 (0 on a tx with no
+            `start_index + 10000`. A page over the node's `--heavy-sh-creates` entries takes the heavy turn like an
+            unpaged reply; only a page within it is built without the turn. Past the last output is 404 (0 on a tx with no
             outputs is `[]`). A non-integer is 400.
           schema: { type: integer, minimum: 0 }
       responses:
