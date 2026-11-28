@@ -76,7 +76,7 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   and broadcast hex length (`ServeLimits`). Electrum rejects a connection
   past the cap at accept, and retries a transient accept error instead of
   dropping the listener. Esplora caps requests in flight
-  (`--esplora-max-inflight`) and accepted TCP at 8× that cap. A further
+  (`--esplora-max-inflight`) and accepted TCP at `--esplora-accept-multiplier` (default 8) times that cap. A further
   TCP connection is closed.
   A connection that never sends headers is closed at the idle timeout. A
   response write that makes no progress is cancelled at the request timeout,

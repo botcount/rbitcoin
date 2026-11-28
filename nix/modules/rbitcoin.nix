@@ -391,6 +391,10 @@ let
   ++ optional (rpcListening && cfg.rpc.tokenFile != null) cfg.rpc.tokenFile
   ++ optional (rpcListening && cfg.rpc.workQueue != null) "--rpc-work-queue"
   ++ optional (rpcListening && cfg.rpc.workQueue != null) (toString cfg.rpc.workQueue)
+  ++ optional (rpcListening && cfg.rpc.minDrainRate != null) "--rpc-min-drain-rate"
+  ++ optional (rpcListening && cfg.rpc.minDrainRate != null) (toString cfg.rpc.minDrainRate)
+  ++ optional (rpcListening && cfg.rpc.restReplyBytes != null) "--rest-reply-bytes"
+  ++ optional (rpcListening && cfg.rpc.restReplyBytes != null) (toString cfg.rpc.restReplyBytes)
   ++ optional cfg.electrum.enable "--electrum-listen"
   ++ optional cfg.electrum.enable (socket cfg.electrum.address cfg.electrum.port)
   ++ optional (cfg.electrum.enable && cfg.electrum.maxSubs != null) "--electrum-max-subs"
@@ -420,6 +424,14 @@ let
   ++ optional (cfg.esplora.enable && cfg.esplora.minDrainRate != null) "--esplora-min-drain-rate"
   ++ optional (cfg.esplora.enable && cfg.esplora.minDrainRate != null) (
     toString cfg.esplora.minDrainRate
+  )
+  ++ optional (cfg.esplora.enable && cfg.esplora.acceptMultiplier != null) "--esplora-accept-multiplier"
+  ++ optional (cfg.esplora.enable && cfg.esplora.acceptMultiplier != null) (
+    toString cfg.esplora.acceptMultiplier
+  )
+  ++ optional (cfg.esplora.enable && cfg.esplora.bodyReadTimeout != null) "--esplora-body-read-timeout"
+  ++ optional (cfg.esplora.enable && cfg.esplora.bodyReadTimeout != null) (
+    toString cfg.esplora.bodyReadTimeout
   )
   ++ optional cfg.health.enable "--health-listen"
   ++ optional cfg.health.enable (socket cfg.health.address cfg.health.port)
@@ -1315,6 +1327,29 @@ in
           Omitted from the unit argv when null.
         '';
       };
+
+      minDrainRate = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        example = 8192;
+        description = ''
+          Pass `--rpc-min-drain-rate`: the minimum average rate an RPC/REST
+          response write must sustain, in bytes per second. Null keeps the
+          node default (16384). Lower it for slow tunnels reading large
+          replies. Requires `enable`, `unixSocket`, or `socketPath`.
+        '';
+      };
+
+      restReplyBytes = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        example = 134217728;
+        description = ''
+          Pass `--rest-reply-bytes`: built REST reply bytes waiting to be
+          written across every listener. Null keeps the node default
+          (67108864). Requires `enable`, `unixSocket`, or `socketPath`.
+        '';
+      };
     };
 
     electrum = {
@@ -1471,6 +1506,28 @@ in
           that plus bytes-written/rate, so a client that accepts a trickle is
           closed. Lower it for slow clients on large histories; raise it on a busy
           public listener.
+        '';
+      };
+
+      acceptMultiplier = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        example = 16;
+        description = ''
+          Accepted Esplora sockets per request in flight
+          (--esplora-accept-multiplier). Null keeps the node default (8).
+          A socket past that cap is closed with no HTTP reply.
+        '';
+      };
+
+      bodyReadTimeout = mkOption {
+        type = types.nullOr (types.ints.between 1 86400);
+        default = null;
+        example = 120;
+        description = ''
+          Seconds a request body may take to arrive for Esplora
+          (--esplora-body-read-timeout). Null keeps the node default (30).
+          The body is read before the request takes a listener slot.
         '';
       };
     };
