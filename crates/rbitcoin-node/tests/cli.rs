@@ -679,6 +679,132 @@ fn esplora_min_drain_rate_cli_conf_and_bounds() {
 }
 
 #[test]
+fn rpc_min_drain_rate_cli_conf_and_bounds() {
+    assert_eq!(
+        ready_config(["rbitcoin-node"]).rpc.min_drain_rate,
+        rbitcoin_rpc::server::RPC_MIN_DRAIN_RATE
+    );
+    assert_eq!(
+        ready_config(["rbitcoin-node", "--rpc-min-drain-rate", "4096"])
+            .rpc
+            .min_drain_rate,
+        4096
+    );
+    assert_eq!(
+        ready_config(["rbitcoin-node", "--rpc-min-drain-rate=65536"])
+            .rpc
+            .min_drain_rate,
+        65536
+    );
+    let mut c = NodeConfig::default();
+    let zero = c.apply_kv("rpc_min_drain_rate", "0").unwrap_err();
+    assert!(format!("{zero}").contains(">= 1"), "{zero}");
+    let bad = c.apply_kv("rpc_min_drain_rate", "nope").unwrap_err();
+    assert!(format!("{bad}").contains("rpc_min_drain_rate"), "{bad}");
+    assert_eq!(
+        c.rpc.min_drain_rate,
+        rbitcoin_rpc::server::RPC_MIN_DRAIN_RATE,
+        "a refused value leaves the default"
+    );
+}
+
+#[test]
+fn rest_reply_bytes_cli_conf_and_bounds() {
+    assert_eq!(
+        ready_config(["rbitcoin-node"]).rpc.rest_reply_bytes,
+        rbitcoin_rpc::server::REST_REPLY_BYTES
+    );
+    assert_eq!(
+        ready_config(["rbitcoin-node", "--rest-reply-bytes", "1048576"])
+            .rpc
+            .rest_reply_bytes,
+        1_048_576
+    );
+    assert_eq!(
+        ready_config(["rbitcoin-node", "--rest-reply-bytes=134217728"])
+            .rpc
+            .rest_reply_bytes,
+        134_217_728
+    );
+    let mut c = NodeConfig::default();
+    let zero = c.apply_kv("rest_reply_bytes", "0").unwrap_err();
+    assert!(format!("{zero}").contains(">= 1"), "{zero}");
+    let bad = c.apply_kv("rest_reply_bytes", "nope").unwrap_err();
+    assert!(format!("{bad}").contains("rest_reply_bytes"), "{bad}");
+    let max = tokio::sync::Semaphore::MAX_PERMITS;
+    let over = c
+        .apply_kv("rest_reply_bytes", &(max + 1).to_string())
+        .unwrap_err();
+    assert!(format!("{over}").contains("<="), "{over}");
+    assert_eq!(
+        c.rpc.rest_reply_bytes,
+        rbitcoin_rpc::server::REST_REPLY_BYTES,
+        "a refused value leaves the default"
+    );
+}
+
+#[test]
+fn esplora_body_read_timeout_cli_conf_and_bounds() {
+    use std::time::Duration;
+    assert_eq!(
+        ready_config(["rbitcoin-node"]).esplora_body_read_timeout,
+        rbitcoin_esplora::server::ESPLORA_BODY_READ_TIMEOUT
+    );
+    assert_eq!(
+        ready_config(["rbitcoin-node", "--esplora-body-read-timeout", "90"])
+            .esplora_body_read_timeout,
+        Duration::from_secs(90)
+    );
+    assert_eq!(
+        ready_config(["rbitcoin-node", "--esplora-body-read-timeout=5"]).esplora_body_read_timeout,
+        Duration::from_secs(5)
+    );
+    let mut c = NodeConfig::default();
+    for bad in ["0", "86401", "nope"] {
+        let err = c.apply_kv("esplora_body_read_timeout", bad).unwrap_err();
+        assert!(
+            format!("{err}").contains("esplora_body_read_timeout"),
+            "{bad}: {err}"
+        );
+    }
+    assert_eq!(
+        c.esplora_body_read_timeout,
+        rbitcoin_esplora::server::ESPLORA_BODY_READ_TIMEOUT,
+        "a refused value leaves the default"
+    );
+}
+
+#[test]
+fn esplora_accept_multiplier_cli_conf_and_bounds() {
+    assert_eq!(
+        ready_config(["rbitcoin-node"]).esplora_accept_multiplier,
+        rbitcoin_esplora::DEFAULT_ACCEPT_MULTIPLIER
+    );
+    assert_eq!(
+        ready_config(["rbitcoin-node", "--esplora-accept-multiplier", "2"])
+            .esplora_accept_multiplier,
+        2
+    );
+    assert_eq!(
+        ready_config(["rbitcoin-node", "--esplora-accept-multiplier=16"]).esplora_accept_multiplier,
+        16
+    );
+    let mut c = NodeConfig::default();
+    let zero = c.apply_kv("esplora_accept_multiplier", "0").unwrap_err();
+    assert!(format!("{zero}").contains(">= 1"), "{zero}");
+    let bad = c.apply_kv("esplora_accept_multiplier", "nope").unwrap_err();
+    assert!(
+        format!("{bad}").contains("esplora_accept_multiplier"),
+        "{bad}"
+    );
+    assert_eq!(
+        c.esplora_accept_multiplier,
+        rbitcoin_esplora::DEFAULT_ACCEPT_MULTIPLIER,
+        "a refused value leaves the default"
+    );
+}
+
+#[test]
 fn sv2_tp_idle_timeout_argv_default_off() {
     use std::time::Duration;
     assert_eq!(

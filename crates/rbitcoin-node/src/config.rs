@@ -312,6 +312,14 @@ pub struct RpcOpts {
     pub wait_tip_idle: bool,
     /// `getnetworkinfo.version`. Default 190000. Bark captaind needs 310000.
     pub client_version: u64,
+    /// Slowest drain rate an RPC/REST response may average, in bytes per
+    /// second (`--rpc-min-drain-rate`, >= 1). Default
+    /// [`rbitcoin_rpc::server::RPC_MIN_DRAIN_RATE`].
+    pub min_drain_rate: u64,
+    /// Built REST reply bytes still waiting to be written across every
+    /// listener (`--rest-reply-bytes`, >= 1). Default
+    /// [`rbitcoin_rpc::server::REST_REPLY_BYTES`].
+    pub rest_reply_bytes: usize,
 }
 
 impl Default for RpcOpts {
@@ -329,6 +337,8 @@ impl Default for RpcOpts {
             package_dialect: false,
             wait_tip_idle: false,
             client_version: rbitcoin_rpc::methods::RPC_COMPAT_VERSION,
+            min_drain_rate: rbitcoin_rpc::server::RPC_MIN_DRAIN_RATE,
+            rest_reply_bytes: rbitcoin_rpc::server::REST_REPLY_BYTES,
         }
     }
 }
@@ -498,6 +508,14 @@ pub struct NodeConfig {
     /// the request-timeout grace (>= 1). Default
     /// [`rbitcoin_esplora::DEFAULT_MIN_DRAIN_RATE`].
     pub esplora_min_drain_rate: u64,
+    /// A request body must arrive within this time
+    /// (`--esplora-body-read-timeout`, 1 to 86400 s). Default
+    /// [`rbitcoin_esplora::server::ESPLORA_BODY_READ_TIMEOUT`].
+    pub esplora_body_read_timeout: Duration,
+    /// Accepted Esplora sockets per request in flight
+    /// (`--esplora-accept-multiplier`, >= 1). Default
+    /// [`rbitcoin_esplora::DEFAULT_ACCEPT_MULTIPLIER`].
+    pub esplora_accept_multiplier: usize,
     /// `--store-read-budget`. `None` is omitted. `Some(0)` uses the formula.
     /// `Some(n)` with `n >= 1` is that many API store reads.
     pub store_read_budget: Option<usize>,
@@ -669,6 +687,8 @@ impl Default for NodeConfig {
             ),
             esplora_max_inflight: rbitcoin_electrum::DEFAULT_MAX_CONNECTIONS,
             esplora_min_drain_rate: rbitcoin_esplora::DEFAULT_MIN_DRAIN_RATE,
+            esplora_body_read_timeout: rbitcoin_esplora::server::ESPLORA_BODY_READ_TIMEOUT,
+            esplora_accept_multiplier: rbitcoin_esplora::DEFAULT_ACCEPT_MULTIPLIER,
             store_read_budget: None,
             esplora_block_template: false,
             metrics: false,
@@ -1737,6 +1757,30 @@ impl NodeConfig {
                 }
                 self.esplora_min_drain_rate = n;
             }
+            "esplora_body_read_timeout" => {
+                let max = rbitcoin_esplora::server::MAX_BODY_READ_TIMEOUT_SECS;
+                let secs = val
+                    .parse()
+                    .ok()
+                    .filter(|s: &u64| (1..=max).contains(s))
+                    .ok_or_else(|| {
+                        NodeError::Config(format!(
+                            "conf esplora_body_read_timeout: want seconds 1 to {max}"
+                        ))
+                    })?;
+                self.esplora_body_read_timeout = Duration::from_secs(secs);
+            }
+            "esplora_accept_multiplier" => {
+                let n: usize = val.parse().map_err(|e| {
+                    NodeError::Config(format!("conf esplora_accept_multiplier: {e}"))
+                })?;
+                if n == 0 {
+                    return Err(NodeError::Config(
+                        "conf esplora_accept_multiplier must be >= 1".into(),
+                    ));
+                }
+                self.esplora_accept_multiplier = n;
+            }
             "esplora_block_template" => {
                 self.esplora_block_template = conf_bool("esplora_block_template", val)?
             }
@@ -2072,6 +2116,29 @@ impl NodeConfig {
                 } else {
                     n
                 });
+            }
+            "rpc_min_drain_rate" => {
+                let n: u64 = val
+                    .parse()
+                    .map_err(|e| NodeError::Config(format!("conf rpc_min_drain_rate: {e}")))?;
+                if n == 0 {
+                    return Err(NodeError::Config(
+                        "conf rpc_min_drain_rate must be >= 1".into(),
+                    ));
+                }
+                self.rpc.min_drain_rate = n;
+            }
+            "rest_reply_bytes" => {
+                let n: usize = val
+                    .parse()
+                    .map_err(|e| NodeError::Config(format!("conf rest_reply_bytes: {e}")))?;
+                if n == 0 || n > tokio::sync::Semaphore::MAX_PERMITS {
+                    return Err(NodeError::Config(format!(
+                        "conf rest_reply_bytes must be >= 1 and <= {}",
+                        tokio::sync::Semaphore::MAX_PERMITS
+                    )));
+                }
+                self.rpc.rest_reply_bytes = n;
             }
             "rpc_client_version" => {
                 self.rpc.client_version = rbitcoin_rpc::methods::parse_rpc_client_version(val)

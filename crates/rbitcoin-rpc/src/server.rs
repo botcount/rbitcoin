@@ -77,6 +77,7 @@ pub async fn serve_rpc<L>(
     sem: Arc<Semaphore>,
     shutdown: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::watch::Sender<()>,
+    min_drain_rate: u64,
 ) where
     L: axum::serve::Listener,
     L::Addr: std::fmt::Debug,
@@ -103,7 +104,11 @@ pub async fn serve_rpc<L>(
                     io,
                     app.clone(),
                     RPC_WRITE_TIMEOUT,
-                    RPC_MIN_DRAIN_RATE,
+                    if min_drain_rate == 0 {
+                        RPC_MIN_DRAIN_RATE
+                    } else {
+                        min_drain_rate
+                    },
                     shutdown_tx.subscribe(),
                 );
                 tokio::spawn(async move {
@@ -198,6 +203,12 @@ pub struct RpcConfig {
     pub package_dialect: bool,
     /// See [`crate::methods::RpcContext::client_version`].
     pub client_version: u64,
+    /// Slowest drain rate a response may average, in bytes per second
+    /// (`--rpc-min-drain-rate`). `0` is [`RPC_MIN_DRAIN_RATE`].
+    pub min_drain_rate: u64,
+    /// Built REST reply bytes still waiting to be written, across every
+    /// listener (`--rest-reply-bytes`). `0` is [`REST_REPLY_BYTES`].
+    pub rest_reply_bytes: usize,
 }
 
 /// Live RPC server handle.
@@ -237,7 +248,7 @@ pub struct AppState {
     pub work_queue: Arc<tokio::sync::Semaphore>,
     /// Separate from [`Self::work_queue`]. REST must not take an RPC slot.
     pub rest_queue: Arc<tokio::sync::Semaphore>,
-    /// Built REST reply bytes not yet written. [`REST_REPLY_BYTES`] in a server.
+    /// Built REST reply bytes not yet written. [`REST_REPLY_BYTES`] in a server, or the configured `--rest-reply-bytes`.
     pub rest_reply_bytes: ReplyBytes,
     pub rest: bool,
     pub require_auth: bool,
@@ -359,7 +370,11 @@ pub async fn run_rpc(
     let n = work_queue_permits(config.work_queue);
     let work_queue = Arc::new(tokio::sync::Semaphore::new(n));
     let rest_queue = Arc::new(tokio::sync::Semaphore::new(DEFAULT_RPC_WORK_QUEUE));
-    let rest_reply_bytes = ReplyBytes::new(REST_REPLY_BYTES);
+    let rest_reply_bytes = ReplyBytes::new(if config.rest_reply_bytes == 0 {
+        REST_REPLY_BYTES
+    } else {
+        config.rest_reply_bytes
+    });
     let shutdown = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, _) = tokio::sync::watch::channel(());
     let mut tasks = Vec::new();
@@ -402,6 +417,7 @@ pub async fn run_rpc(
             accept_sem,
             shutdown_w,
             shutdown_tx.clone(),
+            config.min_drain_rate,
         )));
         info!(
             "rpc: HTTP JSON-RPC on {bound} (bearer token {})",
@@ -460,6 +476,7 @@ pub async fn run_rpc(
             accept_sem,
             shutdown_w,
             shutdown_tx.clone(),
+            config.min_drain_rate,
         )));
         info!("rpc: unix JSON-RPC on {}", sock.display());
         Some(sock.clone())

@@ -2418,6 +2418,8 @@ async fn start_esplora_applies_max_inflight() {
         None,
         1,
         rbitcoin_esplora::DEFAULT_MIN_DRAIN_RATE,
+        rbitcoin_esplora::server::ESPLORA_BODY_READ_TIMEOUT,
+        rbitcoin_esplora::DEFAULT_ACCEPT_MULTIPLIER,
         &shutdown,
         Arc::clone(&hub),
         &mp,

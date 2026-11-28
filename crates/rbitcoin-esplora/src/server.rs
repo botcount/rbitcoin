@@ -498,6 +498,10 @@ impl EsploraListen {
 /// serve. [`EsploraConfig::min_drain_rate`] replaces it.
 pub const DEFAULT_MIN_DRAIN_RATE: u64 = 16 * 1024;
 
+/// Accepted sockets per request in flight (`--esplora-accept-multiplier`).
+/// [`EsploraConfig::accept_multiplier`] replaces it.
+pub const DEFAULT_ACCEPT_MULTIPLIER: usize = 8;
+
 /// Esplora HTTP server config (listen + shared DoS floor).
 #[derive(Clone, Debug)]
 pub struct EsploraConfig {
@@ -514,6 +518,14 @@ pub struct EsploraConfig {
     /// grace (>= 1). Below it the connection is closed. Default
     /// [`DEFAULT_MIN_DRAIN_RATE`].
     pub min_drain_rate: u64,
+    /// A request body must arrive within this time
+    /// (`--esplora-body-read-timeout`). Default
+    /// [`ESPLORA_BODY_READ_TIMEOUT`].
+    pub body_read_timeout: Duration,
+    /// Accepted sockets per request in flight
+    /// (`--esplora-accept-multiplier`, >= 1). Default
+    /// [`DEFAULT_ACCEPT_MULTIPLIER`].
+    pub accept_multiplier: usize,
 }
 
 impl EsploraConfig {
@@ -534,6 +546,8 @@ impl EsploraConfig {
             block_template: None,
             blindbit_max_inflight,
             min_drain_rate: DEFAULT_MIN_DRAIN_RATE,
+            body_read_timeout: ESPLORA_BODY_READ_TIMEOUT,
+            accept_multiplier: DEFAULT_ACCEPT_MULTIPLIER,
         }
     }
 }
@@ -679,6 +693,9 @@ async fn admit_connection(
 /// request takes a listener slot, as the RPC server reads its bodies.
 pub const ESPLORA_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Widest `--esplora-body-read-timeout`, in seconds.
+pub const MAX_BODY_READ_TIMEOUT_SECS: u64 = 86_400;
+
 /// Upload permits for [`read_body_first`], held from the body read until the
 /// request is answered. As many as listener slots, so bodies read or
 /// waiting for a slot stay under `max_conn * max_body` bytes.
@@ -687,6 +704,7 @@ pub const ESPLORA_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct BodyGate {
     sem: Arc<Semaphore>,
     max_body: usize,
+    timeout: Duration,
     #[cfg(debug_assertions)]
     permits: usize,
 }
@@ -701,7 +719,7 @@ impl BodyGate {
 }
 
 /// Read a request body before [`admit_connection`], under an upload permit
-/// and [`ESPLORA_BODY_READ_TIMEOUT`]. A slow upload then holds an upload
+/// and the gate's body read timeout. A slow upload then holds an upload
 /// permit, not a listener slot, so it cannot keep bodiless requests out.
 async fn read_body_first(State(gate): State<BodyGate>, req: Request, next: Next) -> Response {
     let hint = hyper::body::Body::size_hint(req.body());
@@ -717,14 +735,11 @@ async fn read_body_first(State(gate): State<BodyGate>, req: Request, next: Next)
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let (parts, body) = req.into_parts();
-    let bytes =
-        match tokio::time::timeout(ESPLORA_BODY_READ_TIMEOUT, read_limited(body, gate.max_body))
-            .await
-        {
-            Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
-            Ok(Err(status)) => return status.into_response(),
-            Ok(Ok(bytes)) => bytes,
-        };
+    let bytes = match tokio::time::timeout(gate.timeout, read_limited(body, gate.max_body)).await {
+        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+        Ok(Err(status)) => return status.into_response(),
+        Ok(Ok(bytes)) => bytes,
+    };
     // Held until the request is answered, so bodies waiting for a slot
     // stay under `max_conn * max_body`.
     let resp = next
@@ -1285,10 +1300,10 @@ where
 
 /// Accepted sockets include requests waiting on the in-flight gate, so this
 /// is above `--esplora-max-inflight`. A connection past it is closed.
-pub fn esplora_accept_cap(max_inflight: usize) -> usize {
+pub fn esplora_accept_cap(max_inflight: usize, accept_multiplier: usize) -> usize {
     max_inflight
         .max(1)
-        .saturating_mul(8)
+        .saturating_mul(accept_multiplier.max(1))
         .min(Semaphore::MAX_PERMITS)
 }
 
@@ -1546,6 +1561,7 @@ pub async fn run_esplora(
     let body_gate = BodyGate {
         sem: Arc::new(Semaphore::new(max_conn)),
         max_body,
+        timeout: config.body_read_timeout,
         #[cfg(debug_assertions)]
         permits: max_conn,
     };
@@ -1602,7 +1618,7 @@ pub async fn run_esplora(
             let task = spawn_capped(
                 listener,
                 app,
-                esplora_accept_cap(max_conn),
+                esplora_accept_cap(max_conn, config.accept_multiplier),
                 idle,
                 timeout,
                 config.min_drain_rate,
@@ -1628,7 +1644,7 @@ pub async fn run_esplora(
             let task = spawn_capped(
                 listener,
                 app,
-                esplora_accept_cap(max_conn),
+                esplora_accept_cap(max_conn, config.accept_multiplier),
                 idle,
                 timeout,
                 config.min_drain_rate,

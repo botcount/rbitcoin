@@ -23,5 +23,5 @@ pub mod tx_json;
 
 pub use server::{
     perf_totals, run_esplora, sample_reset_perf, BlockTemplateFn, EsploraConfig, EsploraHandle,
-    EsploraListen, DEFAULT_MIN_DRAIN_RATE,
+    EsploraListen, DEFAULT_ACCEPT_MULTIPLIER, DEFAULT_MIN_DRAIN_RATE,
 };

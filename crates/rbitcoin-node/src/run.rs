@@ -277,6 +277,8 @@ pub async fn start_rpc_listener(
         blocksonly: config.mempool.blocksonly,
         package_dialect: config.rpc.package_dialect,
         client_version: config.rpc.client_version,
+        min_drain_rate: config.rpc.min_drain_rate,
+        rest_reply_bytes: config.rpc.rest_reply_bytes,
     };
     let op_true_signet = config.network == Network::Signet
         && config
@@ -1424,6 +1426,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 .then_some(config.mempool.blocksonly),
             config.esplora_max_inflight,
             config.esplora_min_drain_rate,
+            config.esplora_body_read_timeout,
+            config.esplora_accept_multiplier,
             &shutdown,
             Arc::clone(&node.hub),
             &mempool,
@@ -1609,6 +1613,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                                 .then_some(config.mempool.blocksonly),
                             config.esplora_max_inflight,
                             config.esplora_min_drain_rate,
+                            config.esplora_body_read_timeout,
+                            config.esplora_accept_multiplier,
                             &shutdown,
                             Arc::clone(&node.hub),
                             &mempool,
@@ -3121,6 +3127,10 @@ pub async fn start_esplora_if_ready(
     max_inflight: usize,
     // Response write floor (`--esplora-min-drain-rate`).
     min_drain_rate: u64,
+    // Request body arrival deadline (`--esplora-body-read-timeout`).
+    body_read_timeout: Duration,
+    // Accepted sockets per request in flight (`--esplora-accept-multiplier`).
+    accept_multiplier: usize,
     shutdown: &Shutdown,
     hub: Arc<ChainHub>,
     mempool: &std::sync::Arc<MempoolHub>,
@@ -3136,6 +3146,8 @@ pub async fn start_esplora_if_ready(
     let mut ecfg = EsploraConfig::with_listen(listen, btc_net);
     ecfg.limits.max_connections = max_inflight;
     ecfg.min_drain_rate = min_drain_rate;
+    ecfg.body_read_timeout = body_read_timeout;
+    ecfg.accept_multiplier = accept_multiplier;
     if let Some(blocksonly) = block_template {
         let q = Arc::clone(&hub.query);
         let mp = Arc::clone(mempool);

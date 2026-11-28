@@ -796,20 +796,20 @@ pub async fn tx_outspend(
     .await
 }
 
-/// Entries in one `?start_index=` page of `GET /tx/:txid/outspends`. An
-/// outspends reply with more entries, unpaged or bulk, is built under the
-/// node's single heavy turn ([`outspends_heavy_turn`]).
+/// Entries in one `?start_index=` page of `GET /tx/:txid/outspends`.
 pub const MAX_TX_OUTSPENDS_PAGE: u32 = 10_000;
 
 /// The node's single heavy turn when an outspends reply has more than
-/// [`MAX_TX_OUTSPENDS_PAGE`] entries, so only one such reply is built at a
+/// `--heavy-sh-creates` entries, so only one such reply is built at a
 /// time. Taken before any spender is read and held for the whole build.
+/// `0` for that flag turns the turn off for outspends too.
 #[doc(hidden)]
 pub fn outspends_heavy_turn(
     query: &Query,
     entries: u64,
 ) -> Result<Option<rbitcoin_query::scripthash::JoinAdmit>, rbitcoin_query::QueryError> {
-    if entries <= u64::from(MAX_TX_OUTSPENDS_PAGE) {
+    let heavy = query.heavy_sh_creates();
+    if heavy == 0 || entries <= u64::from(heavy) {
         return Ok(None);
     }
     query.take_heavy_turn().map(Some)

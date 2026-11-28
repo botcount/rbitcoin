@@ -36,12 +36,48 @@ use rbitcoin_query::testutil::FixtureChain;
 #[test]
 fn esplora_accept_cap_stays_inside_the_semaphore() {
     let max = tokio::sync::Semaphore::MAX_PERMITS;
-    assert_eq!(esplora_accept_cap(4), 32);
+    assert_eq!(esplora_accept_cap(4, DEFAULT_ACCEPT_MULTIPLIER), 32);
+    assert_eq!(esplora_accept_cap(4, 1), 4);
+    assert_eq!(esplora_accept_cap(4, 2), 8);
     assert!(
-        esplora_accept_cap(max) <= max,
+        esplora_accept_cap(max, DEFAULT_ACCEPT_MULTIPLIER) <= max,
         "accept cap {} exceeds the semaphore",
-        esplora_accept_cap(max)
+        esplora_accept_cap(max, DEFAULT_ACCEPT_MULTIPLIER)
     );
+}
+
+#[test]
+fn esplora_config_defaults_carry_the_body_read_timeout() {
+    let cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
+    assert_eq!(cfg.body_read_timeout, ESPLORA_BODY_READ_TIMEOUT);
+    assert_eq!(cfg.accept_multiplier, DEFAULT_ACCEPT_MULTIPLIER);
+}
+
+/// The outspends heavy turn follows `--heavy-sh-creates` on the query: off
+/// (`0`) never takes it, and the threshold is that count, not a fixed page.
+#[test]
+fn outspends_heavy_turn_follows_heavy_sh_creates() {
+    let (_dir, q) = temp_query("outspends-heavy-follows-flag");
+    q.set_heavy_sh_creates(0);
+    assert!(
+        handlers::outspends_heavy_turn(&q, 20_000)
+            .unwrap()
+            .is_none(),
+        "heavy off takes no turn at any entry count"
+    );
+    q.set_heavy_sh_creates(5);
+    assert!(
+        handlers::outspends_heavy_turn(&q, 5).unwrap().is_none(),
+        "entries at the threshold stay light"
+    );
+    let turn = handlers::outspends_heavy_turn(&q, 6)
+        .unwrap()
+        .expect("entries above the threshold take the turn");
+    assert!(
+        handlers::outspends_heavy_turn(&q, 6).is_err(),
+        "a second reply above the threshold waits for the held turn"
+    );
+    drop(turn);
 }
 
 /// A client that stops reading a response cannot hold the connection. The
@@ -427,7 +463,7 @@ async fn listener_cap_esplora_idle_tcp_is_closed() {
     let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
     cfg.limits.max_connections = 4;
     cfg.limits.idle_timeout = Duration::from_millis(300);
-    let cap = rbitcoin_esplora::server::esplora_accept_cap(4);
+    let cap = rbitcoin_esplora::server::esplora_accept_cap(4, DEFAULT_ACCEPT_MULTIPLIER);
     let handle = run_esplora(cfg, Arc::new(q), None).await.expect("listen");
     let addr = handle.local_addr;
 
@@ -470,7 +506,7 @@ async fn listener_cap_esplora_shutdown_closes_idle_tcp() {
     let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
     cfg.limits.max_connections = 1;
     cfg.limits.idle_timeout = Duration::from_secs(30);
-    let cap = rbitcoin_esplora::server::esplora_accept_cap(1);
+    let cap = rbitcoin_esplora::server::esplora_accept_cap(1, DEFAULT_ACCEPT_MULTIPLIER);
     let handle = run_esplora(cfg, Arc::new(q), None).await.expect("listen");
     let addr = handle.local_addr;
 

@@ -45,6 +45,8 @@ fn regtest_rpc(dir: &std::path::Path) -> RpcConfig {
         blocksonly: false,
         package_dialect: false,
         client_version: 190_000,
+        min_drain_rate: 0,
+        rest_reply_bytes: 0,
     }
 }
 
@@ -3778,6 +3780,7 @@ async fn accept_loop_leaves_when_shutdown_is_signaled() {
             Arc::new(Semaphore::new(4)),
             flag,
             tx_task,
+            0,
         )
         .await;
     });
@@ -3819,6 +3822,7 @@ async fn accepts_past_the_cap_log_fewer_reject_lines_than_connections() {
             Arc::new(Semaphore::new(0)),
             flag,
             tx_task,
+            0,
         )
         .await;
     });
