@@ -1,35 +1,35 @@
 {
- "sha": "c19fe8f1ca33d46923a4ccd5ef3401d29d157fe9",
+ "sha": "29ca315afee01e5abc36ec388d43888ed1333c3f",
  "ok": true,
  "failed": [],
  "warn": [],
- "secs": 1124,
+ "secs": 156,
  "stages": [
   {
    "name": "fetch",
    "ok": true,
-   "secs": 638,
+   "secs": 3,
    "lines": [],
-   "note": "3 commit(s) on master~0, 18 files"
+   "note": "5 commit(s) on master~0, 19 files"
   },
   {
    "name": "fmt",
    "ok": true,
-   "secs": 45,
+   "secs": 5,
    "lines": [],
    "note": ""
   },
   {
    "name": "metadata --locked",
    "ok": true,
-   "secs": 204,
+   "secs": 0,
    "lines": [],
    "note": ""
   },
   {
    "name": "qc scripts",
    "ok": true,
-   "secs": 80,
+   "secs": 21,
    "lines": [],
    "note": ""
   },
@@ -45,20 +45,24 @@
   {
    "name": "clippy -D warnings",
    "ok": true,
-   "secs": 4,
+   "secs": 14,
    "lines": [
     "    Checking rbitcoin-esplora v0.9.99 (/var/cache/private/muse-build/src/i2089/crates/rbitcoin-esplora)",
-    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.44s"
+    "    Checking rbitcoin-rpc v0.9.99 (/var/cache/private/muse-build/src/i2089/crates/rbitcoin-rpc)",
+    "    Checking rbitcoin-node v0.9.99 (/var/cache/private/muse-build/src/i2089/crates/rbitcoin-node)",
+    "    Checking rbitcoin-test v0.9.99 (/var/cache/private/muse-build/src/i2089/crates/rbitcoin-test)",
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.20s"
    ],
    "note": ""
   },
   {
    "name": "doc",
    "ok": true,
-   "secs": 1,
+   "secs": 6,
    "lines": [
-    " Documenting rbitcoin-esplora v0.9.99 (/var/cache/private/muse-build/src/i2089/crates/rbitcoin-esplora)",
-    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.21s",
+    " Documenting rbitcoin-test v0.9.99 (/var/cache/private/muse-build/src/i2089/crates/rbitcoin-test)",
+    "    Checking rbitcoin-test v0.9.99 (/var/cache/private/muse-build/src/i2089/crates/rbitcoin-test)",
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.69s",
     "   Generated /var/cache/muse-build/target/i2089/doc/rbitcoin_bench/index.html and 16 other files"
    ],
    "note": ""
@@ -66,18 +70,18 @@
   {
    "name": "crap (cc of new/grown fns)",
    "ok": true,
-   "secs": 0,
+   "secs": 1,
    "lines": [],
    "note": ""
   },
   {
    "name": "cargo test --workspace",
    "ok": true,
-   "secs": 80,
+   "secs": 105,
    "lines": [
-    "5315 passed, 2 failed, 5 ignored (1 need sudo/root, cannot run in the sandbox: outbound_full_relay_refills_to_max_outbound; upstream CI runs them)"
+    "5319 passed, 2 failed, 5 ignored (1 need sudo/root, cannot run in the sandbox: outbound_full_relay_refills_to_max_outbound; upstream CI runs them)"
    ],
-   "note": "5315 passed, 2 failed, 5 ignored (1 need sudo/root, cannot run in the sandbox: outbound_full_relay_refills_to_max_outbound; upstream CI runs them)"
+   "note": "5319 passed, 2 failed, 5 ignored (1 need sudo/root, cannot run in the sandbox: outbound_full_relay_refills_to_max_outbound; upstream CI runs them)"
   }
  ],
  "base": "ebc6e6787c9f790366d5d6e5a292ff718e6bbc8d",
