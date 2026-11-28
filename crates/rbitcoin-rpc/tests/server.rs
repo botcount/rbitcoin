@@ -45,8 +45,8 @@ fn regtest_rpc(dir: &std::path::Path) -> RpcConfig {
         blocksonly: false,
         package_dialect: false,
         client_version: 190_000,
-        min_drain_rate: 0,
-        rest_reply_bytes: 0,
+        min_drain_rate: RPC_MIN_DRAIN_RATE,
+        rest_reply_bytes: REST_REPLY_BYTES,
     }
 }
 
@@ -282,6 +282,118 @@ async fn rest_is_404_without_the_flag() {
     rest.read_to_end(&mut buf).await.unwrap();
     let text = String::from_utf8_lossy(&buf);
     assert!(text.contains("404"), "REST is off unless --rest: {text}");
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A tiny query whose height-0 block is 1,000 fixture pays on a 4 KiB
+/// script each, so its REST hex reply is about 8 MiB.
+fn fat_block_query(label: &str) -> (rbitcoin_store::testutil::TempDir, Arc<Query>) {
+    use rbitcoin_query::testutil::FixtureChain as _;
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled(label);
+    let script = vec![0x51; 4096];
+    let txs: Vec<_> = (0..1_000u32)
+        .map(|i| rbitcoin_query::testutil::fixture_pay(i, &script))
+        .collect();
+    let h0 =
+        rbitcoin_query::testutil::fixture_header(0, 0, rbitcoin_primitives::Fk::NULL, None, &txs);
+    q.connect_block(rbitcoin_primitives::Height(0), &h0, &txs)
+        .unwrap();
+    (dir, Arc::new(q))
+}
+
+/// Read one response head (through the blank line) off `stream` in small
+/// reads, so a large body stays unwritten on the server.
+async fn read_head(stream: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt as _;
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).await.unwrap();
+        head.push(byte[0]);
+    }
+    String::from_utf8_lossy(&head).into_owned()
+}
+
+/// The REST reply budget is the one in `RpcConfig`: a reply larger than it
+/// still goes out alone, but while that reply is unwritten the budget is
+/// spent and a second REST request is refused 503 before anything is
+/// built. With the 64 MiB default the same reply would leave room, so the
+/// refusal only happens if `run_rpc` used the configured value.
+#[tokio::test]
+async fn rest_reply_budget_comes_from_the_config() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (dir, q) = fat_block_query("rpc-rest-budget-config");
+    let mut cfg = regtest_rpc(dir.path());
+    cfg.rest = true;
+    cfg.rest_reply_bytes = 1 << 20;
+    let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();
+    let addr = tcp_addr(&handle);
+    let (status, body) = post_raw(
+        addr,
+        &handle.auth,
+        br#"{"jsonrpc":"1.0","id":1,"method":"getblockhash","params":[0]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body:?}");
+    let hash = body.expect("blockhash reply")["result"]
+        .as_str()
+        .expect("block hash")
+        .to_owned();
+
+    // One fat reply, read only up to its head: the write stalls with the
+    // whole 1 MiB budget held by its unwritten bytes.
+    let mut fat = tokio::net::TcpStream::connect(addr).await.unwrap();
+    fat.write_all(
+        format!("GET /rest/block/{hash}.hex HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let head = read_head(&mut fat).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    // A second REST request is refused while the budget is spent.
+    let refused = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let mut probe = tokio::net::TcpStream::connect(addr).await.unwrap();
+            probe
+                .write_all(
+                    b"GET /rest/chaininfo.json HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            probe.read_to_end(&mut buf).await.unwrap();
+            let text = String::from_utf8_lossy(&buf);
+            if text.starts_with("HTTP/1.1 503") {
+                assert!(text.contains("Work queue depth exceeded"), "{text}");
+                return;
+            }
+            assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(refused.is_ok(), "the spent budget never refused a request");
+
+    // Draining the fat reply frees the budget for the next request.
+    let mut rest = Vec::new();
+    fat.read_to_end(&mut rest).await.unwrap();
+    assert!(
+        rest.len() > 4 * 1024 * 1024,
+        "the fat reply was cut at {} bytes",
+        rest.len()
+    );
+    let mut probe = tokio::net::TcpStream::connect(addr).await.unwrap();
+    probe
+        .write_all(b"GET /rest/chaininfo.json HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    probe.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf);
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
     handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1514,6 +1626,99 @@ async fn unread_rpc_reply_hits_the_write_deadline() {
         total > 0 && total < BODY,
         "the trickled reply was not cut mid-way: {total} bytes"
     );
+}
+
+/// The drain rate `serve_rpc` enforces is the one its caller passes: with
+/// a huge rate a trickling reader's accumulated stall passes the bare
+/// write timeout and the connection is cut, while a rate of 1 byte/s
+/// stretches the allowance by the bytes already written and the same
+/// trickle is still connected. The clock is paused, so the 30 s write
+/// timeout costs no wall time; every wait below is a tokio timer.
+#[tokio::test(start_paused = true)]
+async fn serve_rpc_cuts_by_the_callers_drain_rate() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const BODY: usize = 16 * 1024 * 1024;
+
+    async fn start(rate: u64) -> (SocketAddr, Arc<AtomicBool>, tokio::sync::watch::Sender<()>) {
+        let app = axum::Router::new().route("/", axum::routing::get(|| async { vec![0u8; BODY] }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (stop_tx, _) = tokio::sync::watch::channel(());
+        tokio::spawn(serve_rpc(
+            listener,
+            app,
+            Arc::new(Semaphore::new(RPC_MAX_CONNECTIONS)),
+            Arc::clone(&shutdown),
+            stop_tx.clone(),
+            rate,
+        ));
+        (addr, shutdown, stop_tx)
+    }
+
+    // Reads up to `chunk` bytes, then waits 20 s before reading again,
+    // until the server closes the connection. Reports (bytes read,
+    // closed). The slow reader's chunk is tiny, so it cannot finish the
+    // body however far the paused clock runs while the test waits.
+    fn trickle(addr: SocketAddr, chunk: usize) -> tokio::task::JoinHandle<(usize, bool)> {
+        tokio::spawn(async move {
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: rpc\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut total = 0usize;
+            let mut buf = vec![0u8; chunk];
+            loop {
+                match client.read(&mut buf).await {
+                    Ok(0) => return (total, true),
+                    Ok(n) => total += n,
+                    Err(_) => return (total, true),
+                }
+                if total >= BODY {
+                    return (total, false);
+                }
+                tokio::time::sleep(Duration::from_secs(20)).await;
+            }
+        })
+    }
+
+    let (fast_addr, fast_shutdown, fast_stop) = start(1 << 30).await;
+    let (slow_addr, slow_shutdown, slow_stop) = start(1).await;
+    let fast = trickle(fast_addr, 1 << 18);
+    let slow = trickle(slow_addr, 1 << 12);
+    // Advance in steps: a sleep registered mid-step only becomes due in a
+    // later one, and each step's yields let the woken tasks run.
+    for _ in 0..80 {
+        tokio::time::advance(Duration::from_secs(15)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        if fast.is_finished() {
+            break;
+        }
+    }
+
+    assert!(
+        fast.is_finished(),
+        "a huge drain rate never cut the trickled reply"
+    );
+    let (fast_total, fast_closed) = fast.await.expect("fast reader task");
+    assert!(
+        fast_closed && fast_total < BODY,
+        "fast reader: {fast_total}"
+    );
+
+    assert!(
+        !slow.is_finished(),
+        "a 1 byte/s drain rate cut the trickled reply"
+    );
+    slow.abort();
+    fast_shutdown.store(true, Ordering::SeqCst);
+    slow_shutdown.store(true, Ordering::SeqCst);
+    let _ = fast_stop.send(());
+    let _ = slow_stop.send(());
 }
 
 #[tokio::test]

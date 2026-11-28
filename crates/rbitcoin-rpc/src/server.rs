@@ -104,11 +104,7 @@ pub async fn serve_rpc<L>(
                     io,
                     app.clone(),
                     RPC_WRITE_TIMEOUT,
-                    if min_drain_rate == 0 {
-                        RPC_MIN_DRAIN_RATE
-                    } else {
-                        min_drain_rate
-                    },
+                    min_drain_rate,
                     shutdown_tx.subscribe(),
                 );
                 tokio::spawn(async move {
@@ -204,10 +200,12 @@ pub struct RpcConfig {
     /// See [`crate::methods::RpcContext::client_version`].
     pub client_version: u64,
     /// Slowest drain rate a response may average, in bytes per second
-    /// (`--rpc-min-drain-rate`). `0` is [`RPC_MIN_DRAIN_RATE`].
+    /// (`--rpc-min-drain-rate`). The node config defaults it to
+    /// [`RPC_MIN_DRAIN_RATE`] and rejects 0.
     pub min_drain_rate: u64,
     /// Built REST reply bytes still waiting to be written, across every
-    /// listener (`--rest-reply-bytes`). `0` is [`REST_REPLY_BYTES`].
+    /// listener (`--rest-reply-bytes`). The node config defaults it to
+    /// [`REST_REPLY_BYTES`] and rejects 0.
     pub rest_reply_bytes: usize,
 }
 
@@ -370,11 +368,7 @@ pub async fn run_rpc(
     let n = work_queue_permits(config.work_queue);
     let work_queue = Arc::new(tokio::sync::Semaphore::new(n));
     let rest_queue = Arc::new(tokio::sync::Semaphore::new(DEFAULT_RPC_WORK_QUEUE));
-    let rest_reply_bytes = ReplyBytes::new(if config.rest_reply_bytes == 0 {
-        REST_REPLY_BYTES
-    } else {
-        config.rest_reply_bytes
-    });
+    let rest_reply_bytes = ReplyBytes::new(config.rest_reply_bytes);
     let shutdown = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, _) = tokio::sync::watch::channel(());
     let mut tasks = Vec::new();
