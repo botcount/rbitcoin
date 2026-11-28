@@ -1,21 +1,21 @@
 {
- "sha": "8127c9ea4f0dc10f8069204636d77e7d388f1bff",
+ "sha": "f4b6f3b0a1575c3d279128798506cb0a76c281e6",
  "ok": true,
  "failed": [],
  "warn": [],
- "secs": 102,
+ "secs": 1531,
  "stages": [
   {
    "name": "fetch",
    "ok": true,
-   "secs": 0,
+   "secs": 65,
    "lines": [],
-   "note": "2 commit(s) on master~0, 20 files"
+   "note": "2 commit(s) on master~0, 22 files"
   },
   {
    "name": "fmt",
    "ok": true,
-   "secs": 4,
+   "secs": 6,
    "lines": [],
    "note": ""
   },
@@ -29,7 +29,7 @@
   {
    "name": "qc scripts",
    "ok": true,
-   "secs": 17,
+   "secs": 35,
    "lines": [],
    "note": ""
   },
@@ -45,41 +45,47 @@
   {
    "name": "clippy -D warnings",
    "ok": true,
-   "secs": 5,
+   "secs": 122,
    "lines": [
-    "    Checking rbitcoin-ibd v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-ibd)",
-    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.08s"
+    "    Checking rbitcoin-rpc v0.9.99 (/var/cache/private/muse-build/src/ban-rpcs/crates/rbitcoin-rpc)",
+    "    Checking rbitcoin-sv2 v0.9.99 (/var/cache/private/muse-build/src/ban-rpcs/crates/rbitcoin-sv2)",
+    "    Checking rbitcoin-esplora v0.9.99 (/var/cache/private/muse-build/src/ban-rpcs/crates/rbitcoin-esplora)",
+    "    Checking rbitcoin-node v0.9.99 (/var/cache/private/muse-build/src/ban-rpcs/crates/rbitcoin-node)",
+    "    Checking rbitcoin-test v0.9.99 (/var/cache/private/muse-build/src/ban-rpcs/crates/rbitcoin-test)",
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 00s"
    ],
    "note": ""
   },
   {
    "name": "doc",
    "ok": true,
-   "secs": 1,
+   "secs": 713,
    "lines": [
-    " Documenting rbitcoin-ibd v0.9.99 (/var/tmp/muse-ci/wt/ban-rpcs/crates/rbitcoin-ibd)",
-    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.13s",
-    "   Generated /var/tmp/muse-ci/wt/ban-rpcs/target/dev/doc/rbitcoin_bench/index.html and 16 other files"
+    " Documenting rbitcoin-mempool v0.9.99 (/var/cache/private/muse-build/src/ban-rpcs/crates/rbitcoin-mempool)",
+    " Documenting rbitcoin-bench v0.9.99 (/var/cache/private/muse-build/src/ban-rpcs/crates/rbitcoin-bench)",
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11m 52s",
+    "   Generated /var/cache/muse-build/target/ban-rpcs/doc/rbitcoin_bench/index.html and 16 other files"
    ],
    "note": ""
   },
   {
    "name": "crap (cc of new/grown fns)",
    "ok": true,
-   "secs": 0,
+   "secs": 1,
    "lines": [],
    "note": ""
   },
   {
    "name": "cargo test --workspace",
    "ok": true,
-   "secs": 74,
+   "secs": 392,
    "lines": [
-    "5321 passed, 2 failed, 5 ignored (2 known root-only chmod failures ignored)"
+    "5325 passed, 2 failed, 5 ignored (1 need sudo/root, cannot run in the sandbox: outbound_full_relay_refills_to_max_outbound; upstream CI runs them)"
    ],
-   "note": "5321 passed, 2 failed, 5 ignored (2 known root-only chmod failures ignored)"
+   "note": "5325 passed, 2 failed, 5 ignored (1 need sudo/root, cannot run in the sandbox: outbound_full_relay_refills_to_max_outbound; upstream CI runs them)"
   }
  ],
  "base": "ebc6e6787c9f790366d5d6e5a292ff718e6bbc8d",
- "behind": 0
+ "behind": 0,
+ "sandbox": true
 }
