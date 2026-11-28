@@ -103,6 +103,8 @@ const CONVERT_PARAMS: &[(&str, usize, &str, ParamFormat)] = &[
         "maxburnamount",
         ParamFormat::JsonOrString,
     ),
+    ("setban", 2, "bantime", ParamFormat::Json),
+    ("setban", 3, "absolute", ParamFormat::Json),
     ("setmocktime", 0, "timestamp", ParamFormat::Json),
     ("stop", 0, "wait", ParamFormat::Json),
     ("submitpackage", 0, "package", ParamFormat::Json),

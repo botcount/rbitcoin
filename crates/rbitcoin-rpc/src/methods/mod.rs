@@ -68,6 +68,9 @@ pub fn rpc_call_reads_store(method: &str) -> bool {
             | "getnettotals"
             | "getpeerinfo"
             | "ping"
+            | "setban"
+            | "listbanned"
+            | "clearbanned"
             | "outboundpass"
     )
 }
@@ -451,6 +454,10 @@ pub const ERR_VERIFY_ERROR: i64 = -25;
 pub const ERR_CLIENT_NODE_NOT_CONNECTED: i64 = -29;
 /// Core `RPC_INVALID_PARAMETER` (unknown named param, mocktime range, …).
 pub const ERR_INVALID_PARAMETER: i64 = -8;
+/// `setban add` of a target that is already banned.
+pub const ERR_ALREADY_BANNED: i64 = -23;
+/// `setban remove` of a target that is not in the ban list.
+pub const ERR_NOT_BANNED: i64 = -30;
 /// Core `RPC_VERIFY_REJECTED` (sendrawtransaction / testmempoolaccept).
 pub const ERR_VERIFY_REJECTED: i64 = -26;
 /// Core `RPC_VERIFY_ALREADY_IN_UTXO_SET`.
@@ -776,6 +783,15 @@ pub fn dispatch_inner(ctx: &RpcContext, method: &str, params: RpcParams) -> Resu
             addnode(ctx, hub, &params)
         }
         "disconnectnode" => disconnectnode(ctx, &params),
+        "setban" => setban(ctx, &params),
+        "listbanned" => {
+            params.reject_unknown(&[])?;
+            Ok(listbanned(ctx))
+        }
+        "clearbanned" => {
+            params.reject_unknown(&[])?;
+            clearbanned(ctx)
+        }
         "addconnection" => addconnection(ctx, &params),
         "addpeeraddress" => addpeeraddress(ctx, &params),
         "getnodeaddresses" => getnodeaddresses(ctx, &params),
@@ -937,6 +953,9 @@ pub const METHOD_LIST: &[&str] = &[
     "ping",
     "addnode",
     "disconnectnode",
+    "setban",
+    "listbanned",
+    "clearbanned",
     "addconnection",
     "addpeeraddress",
     "getnodeaddresses",
@@ -1127,6 +1146,28 @@ pub const NAMED_HELP: &[(&str, &str)] = &[
         "getpeerinfo\n\
          Returns data about each connected network node as a json array of objects.\n\
          Valid networks: (ipv4, ipv6, onion, i2p, cjdns, not_publicly_routable)",
+    ),
+    (
+        "setban",
+        "setban subnet command ( bantime absolute )\n\
+         Ban or unban an IPv4/IPv6 address or subnet, or an onion / I2P identity.\n\
+         command is \"add\" or \"remove\". bantime is seconds from now (default\n\
+         86400; 0 is the default), or a unix time when absolute is true. Adding\n\
+         a ban disconnects matching sessions and refuses new ones until it\n\
+         expires or is removed. A prefix wider than /8 (IPv4) or /16 (IPv6)\n\
+         is refused. Manual bans persist in {datadir}/banlist.json.",
+    ),
+    (
+        "listbanned",
+        "listbanned\n\
+         List the manual bans: address, ban_created, banned_until,\n\
+         ban_duration, and time_remaining for each entry. Automatic\n\
+         discouragement for misbehavior is not listed.",
+    ),
+    (
+        "clearbanned",
+        "clearbanned\n\
+         Drop every manual ban. Automatic discouragement is not affected.",
     ),
     (
         "getorphantxs",

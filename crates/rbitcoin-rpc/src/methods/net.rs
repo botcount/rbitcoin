@@ -234,6 +234,111 @@ pub fn disconnectnode(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
     Err(rpc_error(ERR_INVALID_PARAMS, "address or nodeid required"))
 }
 
+/// Expiry for a `setban add`: `bantime` seconds from `now`, a unix time
+/// when `absolute` is set, and Core's 24-hour default for an omitted or
+/// zero relative `bantime`.
+fn ban_until(now: u64, bantime: Option<i64>, absolute: bool) -> Result<u64, Value> {
+    let Some(t) = bantime else {
+        return Ok(now.saturating_add(rbitcoin_net::ban::DEFAULT_BAN_SECS));
+    };
+    if t < 0 {
+        return Err(rpc_error(ERR_INVALID_PARAMETER, "Invalid bantime"));
+    }
+    let t = t as u64;
+    if absolute {
+        if t <= now {
+            return Err(rpc_error(
+                ERR_INVALID_PARAMETER,
+                "Error: Absolute timestamp is in the past",
+            ));
+        }
+        return Ok(t);
+    }
+    if t == 0 {
+        return Ok(now.saturating_add(rbitcoin_net::ban::DEFAULT_BAN_SECS));
+    }
+    Ok(now.saturating_add(t))
+}
+
+/// Map a ban-list update failure to its RPC error: a duplicate `add` is
+/// Core's -23; a ban file write failure is a plain misc error, and the
+/// in-memory list is unchanged so the caller can retry.
+fn ban_update_error(e: rbitcoin_net::ban::BanUpdateError) -> Value {
+    match e {
+        rbitcoin_net::ban::BanUpdateError::AlreadyBanned(_) => {
+            rpc_error(ERR_ALREADY_BANNED, "Error: IP/Subnet already banned")
+        }
+        rbitcoin_net::ban::BanUpdateError::Persist(e) => {
+            rpc_error(ERR_MISC, format!("Error: Failed to write ban list: {e}"))
+        }
+    }
+}
+
+pub fn setban(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["subnet", "command", "bantime", "absolute"])?;
+    let hub = require_peers(ctx)?;
+    let subnet = params.req_str(0, "subnet")?;
+    let command = params.req_str(1, "command")?;
+    let target = rbitcoin_net::parse_ban_target(subnet).map_err(|e| match e {
+        rbitcoin_net::BanParseError::TooBroad => rpc_error(
+            ERR_INVALID_PARAMETER,
+            format!("Subnet is too broad: {subnet}"),
+        ),
+        rbitcoin_net::BanParseError::Invalid => rpc_error(
+            ERR_INVALID_PARAMETER,
+            format!("Invalid IP/Subnet: {subnet}"),
+        ),
+    })?;
+    match command {
+        "add" => {
+            let bantime = params.opt_i64(2, "bantime")?;
+            let absolute = params.opt_bool(3, "absolute")?.unwrap_or(false);
+            let until = ban_until(hub.now_secs(), bantime, absolute)?;
+            hub.ban_add(target, until).map_err(ban_update_error)?;
+            Ok(Value::Null)
+        }
+        "remove" => {
+            hub.ban_remove(target)
+                .map_err(ban_update_error)?
+                .ok_or_else(|| {
+                    rpc_error(
+                        ERR_NOT_BANNED,
+                        "Error: Unban failed. IP/Subnet not in the ban list",
+                    )
+                })?;
+            Ok(Value::Null)
+        }
+        _ => Err(rpc_error(ERR_INVALID_PARAMETER, "Invalid command")),
+    }
+}
+
+pub fn listbanned(ctx: &RpcContext) -> Value {
+    let Some(hub) = ctx.peers.as_ref() else {
+        return json!([]);
+    };
+    let now = hub.now_secs();
+    let rows: Vec<Value> = hub
+        .ban_list()
+        .into_iter()
+        .map(|e| {
+            json!({
+                "address": e.target.to_string(),
+                "ban_created": e.created,
+                "banned_until": e.banned_until,
+                "ban_duration": e.banned_until.saturating_sub(e.created),
+                "time_remaining": e.banned_until.saturating_sub(now),
+            })
+        })
+        .collect();
+    json!(rows)
+}
+
+pub fn clearbanned(ctx: &RpcContext) -> Result<Value, Value> {
+    let hub = require_peers(ctx)?;
+    hub.ban_clear().map_err(ban_update_error)?;
+    Ok(Value::Null)
+}
+
 pub fn addconnection(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["address", "connection_type", "v2transport"])?;
     let hub = require_peers(ctx)?;

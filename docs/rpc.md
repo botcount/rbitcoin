@@ -174,6 +174,7 @@ still wait for durable SH when shindex is on.
 | `getnodeaddresses` | Sample from addrman (`count=0` → all). Optional `network` filter. `time` is the row's learned time (five days back when it has none), not the request time. |
 | `addpeeraddress` | Hidden Core name. Inserts `{address,port}` into addrman RAM (does not rewrite `peers` per call), stamped at the node clock's call time. |
 | `addnode` / `disconnectnode` / `addconnection` | All networks. Hostnames resolve at dial (network default P2P port if omitted). `addnode add` and `--connect` retry until a live session. `addnode onetry` dials once and errors if DNS fails. A blank `addnode` node is `-8` for every command. `disconnectnode` takes a `nodeid` or the `addr` string `getpeerinfo` lists, including a proxied hostname (`disconnectnode`). A string that does not parse is matched against that `addr` ignoring ASCII case. With `--trust-peer`, `addnode` / `addconnection` of any other address fails and names the trusted peer |
+| `setban` / `listbanned` / `clearbanned` | All networks. Manual bans only; automatic discouragement for misbehavior is a separate in-memory set that these methods neither list nor clear. `setban <subnet> <add\|remove> (bantime) (absolute)`: the target is an IPv4/IPv6 address or CIDR subnet, or an onion (`.onion`) / I2P (`.b32.i2p`) identity, which is banned as an identity on any port. `bantime` is seconds from now (default 86400, and 0 is the default), or a unix time when `absolute` is true. Adding a ban disconnects matching live sessions (manual `addnode` / `--connect` / `--trust-peer` sessions included), refuses banned sources at inbound accept, and refuses banned targets before an outbound dial, until the ban expires or is removed. A prefix wider than /8 (IPv4) or /16 (IPv6) is refused. Errors are Core-shaped: an unparseable or too-broad target and a bad command or bantime are `-8`, `add` of an already-banned target is `-23`, and `remove` of a target that is not banned is `-30`. `listbanned` rows are `address`, `ban_created`, `banned_until`, `ban_duration`, and `time_remaining`. `clearbanned` drops every manual ban. Manual bans persist in `{datadir}/banlist.json` (Core's `banned_nets` shape, rewritten on each change) and are reloaded at startup; expired entries are dropped. Unlike discouragement, which never records loopback, a manual ban matches loopback too, as in Core, so an operator can ban a local peer |
 | `getmempoolinfo` / `getrawmempool` / `getmempoolentry` | MempoolHub. `getrawmempool` lists a maintained pool, including while peer relay is off, and lists under `-blocksonly`. An empty pool is listed before maintenance. A nonempty pool before maintenance returns `-10` because confirmed transactions may still be in it. `getrawmempool false true` returns Core's `mempool_sequence`: the number the pool gives its next change. It starts at 1 when the node starts and advances on every add and every removal, a mined block included. The txids and the sequence come from one read of the pool. Transactions loaded from disk at start take no number. The reasons for recent removals are on Esplora `GET /mempool/removed`. `generate` on `-blocksonly` mines that pool; before maintenance it mines the coinbase only. `maxmempool` is the virtual-size byte cap (`--mempool-size-mb` weight budget / 4), the same unit as `bytes`. The `rbitcoin_mempool_max_weight` metric stays weight. `fullrbf` is `true` (Libre always replaces). `maxdatacarriersize` is the number 100000, Core 32.1's default cap. Libre does not enforce a datacarrier cap, and that default does not bind a standard-weight transaction either. Core prints 0 only for `-datacarrier=0`. `limitclustercount` / `limitclustersize` are the live cluster caps (count and vbytes). Fee amounts are 8-decimal BTC. `ancestorcount` / `descendantcount` (and size/fee sums) walk the cluster graph. `vsize_adjusted` and deprecated `vsize` are sigop-adjusted virtual sizes; `vsize_bip141` is `ceil(weight / 4)`. `ancestorsize`, `descendantsize` and `chunkweight` are sigop-adjusted (Core `GetAdjustedWeight`, `--bytes-per-sigop`); `weight` is raw. Verbose `fees.{base,modified,ancestor,descendant,chunk}` and `chunkweight` include `prioritisetransaction` deltas; top-level `ancestorfees` / `descendantfees` stay base satoshis. `unbroadcastcount` / `unbroadcast` track `sendrawtransaction` txs until a peer getdata's them. Entries carry Core's `bip125-replaceable`: `true` when the tx or an in-mempool ancestor has an input sequence at or below `0xfffffffd`. Full RBF replaces an opt-out tx anyway. `orphanage.{size,bytes}` is the parked missing-parent side pool (vsize). `permitbaremultisig` is always `true` (Libre has no Core `IsStandard` bare-multisig gate; `--permitbaremultisig` is not a node flag). |
 | `getorphantxs` | Hidden operator dump. Verbosity 0 txids, 1 details + `from` peer ids, 2 + hex. Details include `vsize_bip141` and its deprecated alias `vsize`; no adjusted size is available for orphans. Not listed by `help` / `getrpcinfo`. Counts-only `getmempoolinfo.orphanage` is not a substitute. |
 | `getrawtransaction` | Class A + mempool. Optional `blockhash` returns the tx only when that block contains it: verbose results set `in_active_chain` (`true` on the active chain, `false` when the stored block still holds the tx). An unpruned block that does not contain it, including a mempool tx, is `-5` `No such transaction found in the provided block. Use gettransaction for wallet transactions.`; a pruned block is `-1` `Block not available` before membership is checked. An unknown block hash is `-5` `Block hash not found` and does not fall back to a txid hit. With no `blockhash`, `in_active_chain` is absent and mempool or confirmed lookup still succeeds. Verbose objects share `tx_to_json` with `decoderawtransaction` / `getblock` verbosity 2 (`scriptSig`, `scriptPubKey.type`, `scriptPubKey.desc`). A mempool verbose result adds `vsize_adjusted` from mempool policy; `vsize` stays BIP141. Confirmed and archive-only results omit `vsize_adjusted`. A verbose result for an active block carries `confirmations`, `blockhash`, `blocktime`, and `time`. The same call for an inactive block keeps `blockhash`, sets `confirmations` to `0`, and omits `time` and `blocktime`. Integer verbosity `2` on a confirmed non-coinbase adds a BTC `fee` and `vin[].prevout` (`generated`, `height`, `value`, `scriptPubKey` with `asm`, `hex`, `type`, and `desc`). Verbosity `1` / `true` omits `fee` and `prevout`. A coinbase at verbosity `2` omits `fee` and has no prevout on the coinbase input. A mempool tx at verbosity `2` omits both. With `blockhash` naming a disconnected block, a parent from that block's stale branch keeps its height. Stored prevouts that do not read are Core's `-32603` undo error. An unknown txid is `-5` `No such mempool or blockchain transaction. Use gettransaction for wallet transactions.` Without a `blockhash`, a txid below `pruneheight` is `-5` `No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.` (Core's no-txindex answer, not `-8`). The genesis coinbase txid is `-5` `The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved` (Core); REST `/rest/tx/` answers `404` `<txid> not found` for it, as Core (its txindex skips height 0). REST `/rest/tx/<txid>.json` answers `404` `<txid> not found` for a pruned tx, and `.hex`/`.bin` answer `404` with Core's no-txindex text. |
@@ -204,6 +205,45 @@ still wait for durable SH when shindex is on.
 | `setmocktime` | **Regtest only.** `0` = wall clock. Generate timestamps and future-header checks use `NodeClock` (not a process `time()` hook). |
 | `mockscheduler` | **Regtest / harness.** Advance the scheduler by `delta_seconds`; rebroadcast unbroadcast txs. |
 | `invalidateblock` / `reconsiderblock` / `preciousblock` | All networks. Disconnect/re-accept via `ChainHub`; precious prefers equal-work siblings. `invalidateblock` of a block that is not on the active chain marks it invalid and keeps its body. `reconsiderblock` clears that mark. A heavier child of the block can then become the tip. When a block of the next fork fails connect, `invalidateblock` marks it invalid, tries the next fork, and returns null, as Core. |
+
+## Manual bans (`setban` / `listbanned` / `clearbanned`)
+
+`setban <subnet> <add|remove> (bantime) (absolute)` bans an IPv4/IPv6
+address or CIDR subnet, or an onion (`.onion`) / I2P (`.b32.i2p`) identity,
+which is banned as an identity on any port. A prefix wider than /8 (IPv4)
+or /16 (IPv6) is refused.
+
+- **Persistence.** Manual bans live in `{datadir}/banlist.json`, in Core's
+  `banned_nets` shape. The file is rewritten on every change (a synced
+  temporary file renamed over the old one, so a crash cannot leave an
+  empty list behind) and reloaded at startup; entries whose time has run
+  out are dropped on load.
+- **Expiry.** `bantime` is seconds from now; omitted or 0 means the
+  default 86400 (24 hours). With `absolute` true, `bantime` is a unix
+  time instead, and one in the past is refused with `-8` ("Error:
+  Absolute timestamp is in the past") rather than stored already expired.
+- **Enforcement and precedence.** Adding a ban disconnects every live
+  session it matches, including a catch-up (IBD) session, which the sync
+  loop drops on its next pass. A banned source is refused at inbound accept and a
+  banned target is refused before an outbound dial, until the ban expires
+  or is removed. A ban takes precedence over `addnode`, `--connect`, and
+  `--trust-peer`: a banned peer is disconnected and refused even if it
+  was added by hand or is trusted.
+- **Loopback.** A manual ban matches loopback: `setban` can ban
+  `127.0.0.1` or `::1`. This is Core parity (Core's own ban tests ban
+  `127.0.0.0/24`) and differs from automatic discouragement, which never
+  records a loopback peer.
+- **Overlay identities.** An onion/I2P ban is enforced before an outbound
+  dial to that identity and against live outbound sessions to it. An
+  inbound connection from a Tor/I2P peer arrives through the local proxy
+  and is seen as a loopback connection, so an overlay ban cannot match it
+  at accept; banning the proxy's loopback address instead would ban every
+  overlay peer at once.
+- **Clearing.** `setban <subnet> remove` lifts one ban (`-30` when the
+  target is not banned); `clearbanned` drops every manual ban and
+  persists the empty list. `listbanned` lists manual bans only. Automatic
+  discouragement for misbehavior is a separate in-memory set: these
+  methods neither list nor clear it, and it is gone at restart.
 
 ## Permanent gaps (will not match Core)
 

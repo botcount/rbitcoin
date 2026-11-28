@@ -7248,6 +7248,135 @@ fn addnode_rejects_a_blank_node() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn setban_listbanned_clearbanned_round_trip() {
+    use rbitcoin_net::PeerHub;
+    let (mut ctx, dir) = ctx_empty();
+    let no_hub = dispatch(&ctx, "setban", vec![json!("10.0.0.1"), json!("add")]).unwrap_err();
+    assert_eq!(no_hub["code"], ERR_MISC, "{no_hub}");
+    let hub = PeerHub::new();
+    hub.set_mock_now(1_700_000_000);
+    ctx.peers = Some(std::sync::Arc::clone(&hub));
+    for (subnet, cmd) in [("junk", "add"), ("0.0.0.0/0", "add"), ("10.0.0.1", "bogus")] {
+        let e = dispatch(&ctx, "setban", vec![json!(subnet), json!(cmd)]).unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_PARAMETER, "{subnet} {cmd}: {e}");
+    }
+    let e = dispatch(
+        &ctx,
+        "setban",
+        vec![json!("10.0.0.1"), json!("add"), json!(-5)],
+    )
+    .unwrap_err();
+    assert_eq!(e["code"], ERR_INVALID_PARAMETER, "negative bantime: {e}");
+    dispatch(
+        &ctx,
+        "setban",
+        vec![json!("10.3.0.0/16"), json!("add"), json!(600)],
+    )
+    .unwrap();
+    let rows = dispatch(&ctx, "listbanned", vec![]).unwrap();
+    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+    assert_eq!(rows[0]["address"], json!("10.3.0.0/16"));
+    assert_eq!(rows[0]["ban_created"], json!(1_700_000_000));
+    assert_eq!(rows[0]["banned_until"], json!(1_700_000_600));
+    assert_eq!(rows[0]["ban_duration"], json!(600));
+    assert_eq!(rows[0]["time_remaining"], json!(600));
+    let dup = dispatch(&ctx, "setban", vec![json!("10.3.0.0/16"), json!("add")]).unwrap_err();
+    assert_eq!(dup["code"], ERR_ALREADY_BANNED, "{dup}");
+    dispatch(
+        &ctx,
+        "setban",
+        vec![
+            json!("192.0.2.9"),
+            json!("add"),
+            json!(1_700_100_000),
+            json!(true),
+        ],
+    )
+    .unwrap();
+    let rows = dispatch(&ctx, "listbanned", vec![]).unwrap();
+    assert_eq!(rows.as_array().map(Vec::len), Some(2), "{rows}");
+    assert_eq!(rows[1]["address"], json!("192.0.2.9/32"));
+    assert_eq!(rows[1]["banned_until"], json!(1_700_100_000));
+    let past = dispatch(
+        &ctx,
+        "setban",
+        vec![
+            json!("203.0.113.7"),
+            json!("add"),
+            json!(1_600_000_000),
+            json!(true),
+        ],
+    )
+    .unwrap_err();
+    assert_eq!(past["code"], ERR_INVALID_PARAMETER, "{past}");
+    assert!(
+        past["message"]
+            .as_str()
+            .unwrap()
+            .contains("Absolute timestamp is in the past"),
+        "{past}"
+    );
+    let rows = dispatch(&ctx, "listbanned", vec![]).unwrap();
+    assert_eq!(
+        rows.as_array().map(Vec::len),
+        Some(2),
+        "a past absolute ban is not stored: {rows}"
+    );
+    let unknown =
+        dispatch(&ctx, "setban", vec![json!("203.0.113.1"), json!("remove")]).unwrap_err();
+    assert_eq!(unknown["code"], ERR_NOT_BANNED, "{unknown}");
+    dispatch(&ctx, "setban", vec![json!("10.3.0.0/16"), json!("remove")]).unwrap();
+    let mut named = serde_json::Map::new();
+    named.insert("subnet".into(), json!("198.51.100.23"));
+    named.insert("command".into(), json!("add"));
+    named.insert("bantime".into(), json!(60));
+    dispatch(&ctx, "setban", RpcParams::named(named)).unwrap();
+    let rows = dispatch(&ctx, "listbanned", vec![]).unwrap();
+    assert_eq!(rows.as_array().map(Vec::len), Some(2), "{rows}");
+    dispatch(&ctx, "clearbanned", vec![]).unwrap();
+    assert_eq!(dispatch(&ctx, "listbanned", vec![]).unwrap(), json!([]));
+    let help = dispatch(&ctx, "help", vec![]).unwrap();
+    assert!(help.as_str().unwrap().contains("setban"), "{help}");
+    let one = dispatch(&ctx, "help", vec![json!("setban")]).unwrap();
+    assert!(one.as_str().unwrap().contains("bantime"), "{one}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn setban_reports_ban_file_write_failure() {
+    use rbitcoin_net::PeerHub;
+    let (mut ctx, dir) = ctx_empty();
+    let hub = PeerHub::new();
+    hub.set_mock_now(1_700_000_000);
+    hub.set_ban_file(dir.path().join("banlist.json"));
+    ctx.peers = Some(std::sync::Arc::clone(&hub));
+    dispatch(&ctx, "setban", vec![json!("10.0.0.1"), json!("add")]).unwrap();
+    // A directory where the temp file must be created fails every write,
+    // for root and non-root alike.
+    std::fs::create_dir(dir.path().join("banlist.json.new")).unwrap();
+    let e = dispatch(&ctx, "setban", vec![json!("10.0.0.2"), json!("add")]).unwrap_err();
+    assert_eq!(e["code"], ERR_MISC, "failed add reports the write: {e}");
+    let rows = dispatch(&ctx, "listbanned", vec![]).unwrap();
+    assert_eq!(
+        rows.as_array().map(Vec::len),
+        Some(1),
+        "the failed add is not stored: {rows}"
+    );
+    let e = dispatch(&ctx, "clearbanned", vec![]).unwrap_err();
+    assert_eq!(e["code"], ERR_MISC, "failed clear reports the write: {e}");
+    let rows = dispatch(&ctx, "listbanned", vec![]).unwrap();
+    assert_eq!(
+        rows.as_array().map(Vec::len),
+        Some(1),
+        "the failed clear keeps the bans: {rows}"
+    );
+    std::fs::remove_dir(dir.path().join("banlist.json.new")).unwrap();
+    dispatch(&ctx, "clearbanned", vec![]).unwrap();
+    assert_eq!(dispatch(&ctx, "listbanned", vec![]).unwrap(), json!([]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A handshaken peer keeps its row until its session returns, but
 /// getpeerinfo hides it once it is leaving. `disconnectnode` misses it too.
 #[test]
@@ -10447,6 +10576,7 @@ fn spend_coinbase_two_outputs(ctx: &RpcContext, height: u32, value: u64) -> (Str
 }
 
 include!("../regtest_chain_ops_journey.rs");
+include!("../ban_journey.rs");
 
 mod chain;
 mod decode;

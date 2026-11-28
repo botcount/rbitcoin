@@ -155,6 +155,23 @@ fn param_tokens_json_or_string() {
 }
 
 #[test]
+fn setban_bantime_and_absolute_convert() {
+    assert_eq!(
+        param_value("setban", 0, "10.0.0.1").unwrap(),
+        serde_json::json!("10.0.0.1")
+    );
+    assert_eq!(
+        param_value("setban", 2, "3600").unwrap(),
+        serde_json::json!(3600)
+    );
+    assert_eq!(
+        param_value("setban", 3, "true").unwrap(),
+        serde_json::json!(true)
+    );
+    assert!(param_value("setban", 2, "abc").is_err());
+}
+
+#[test]
 fn logging_include_and_exclude_are_json_arrays() {
     assert_eq!(
         param_value("logging", 0, r#"["mempool","p2p"]"#).unwrap(),
