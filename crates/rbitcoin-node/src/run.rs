@@ -790,6 +790,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     // Accepted inbound is grouped by asmap and told whether this node prunes,
     // so both are set before the listeners open below.
     let asmap = load_asmap(config.datadir.path(), config.asmap.as_deref());
+    node.peers
+        .set_ban_file(config.datadir.path().join("banlist.json"));
     node.peers.set_pruned(config.prune_seqsigwit);
     node.peers.set_asmap(asmap.clone());
     node.peers

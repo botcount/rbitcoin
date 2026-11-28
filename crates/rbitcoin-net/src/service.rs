@@ -545,6 +545,11 @@ pub fn spawn_inbound_accept(
                         drop(stream);
                         continue;
                     }
+                    if peers.ip_banned(peer_addr.ip()) {
+                        rbitcoin_log::info!("p2p: reject banned inbound {peer_addr}");
+                        drop(stream);
+                        continue;
+                    }
                     if !crate::listen::listener_fd_room() {
                         rbitcoin_log::warn_repeated(
                             rbitcoin_log::RepeatedInfo::DescriptorReserve,
@@ -744,6 +749,9 @@ pub async fn prepare_outbound_session(
     if peers.net_discouraged(peer_net) {
         return Err(NetError::Protocol("discouraged"));
     }
+    if peers.net_banned(peer_net) {
+        return Err(NetError::Protocol("banned"));
+    }
     let connect = async {
         match &peer {
             DialTarget::Socket(_) => dialer.connect_net(peer_net).await,
@@ -787,7 +795,10 @@ pub async fn prepare_outbound_session(
             return Err(e);
         }
     };
-    let sess = peers.register_handshaken_net(
+    // A ban added while this dial was connecting or handshaking must not
+    // leave a live session behind: publication checks the ban list
+    // under the ban lock and refuses a banned endpoint.
+    let Some(sess) = peers.register_handshaken_net(
         &provisional,
         crate::peers::PeerEndpoint {
             addr: peer_hint,
@@ -797,7 +808,10 @@ pub async fn prepare_outbound_session(
         &ver,
         typ,
         wire,
-    );
+    ) else {
+        peers.unregister(provisional_id);
+        return Err(NetError::Protocol("banned"));
+    };
     sess.attach_tcp_shutdown(tcp_shutdown);
     if let Some(mp) = hub.mempool() {
         sess.set_inv_gen_floor(mp.next_accept_gen());
@@ -862,6 +876,9 @@ pub async fn run_outbound_session(
         let peer_net = crate::NetAddr::Ip(peer_addr);
         if peers.net_discouraged(peer_net) {
             return Err(NetError::Protocol("discouraged"));
+        }
+        if peers.net_banned(peer_net) {
+            return Err(NetError::Protocol("banned"));
         }
         let stream = dialer.connect_net(peer_net).await?;
         let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);

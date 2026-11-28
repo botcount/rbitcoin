@@ -1184,6 +1184,56 @@ async fn ibd_dial_refuses_a_discouraged_net() {
     );
 }
 
+/// Manual bans apply to IBD dials too, not just the generic connect path.
+#[tokio::test]
+async fn ibd_dial_refuses_a_banned_net() {
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_mock_now(1_700_000_000);
+    let name = format!(
+        "{}.onion",
+        rbitcoin_net::netaddr::encode_onion_name(&[5; 32])
+    );
+    peers
+        .ban_add(
+            rbitcoin_net::parse_ban_target(&name).unwrap(),
+            1_700_100_000,
+        )
+        .unwrap();
+    let other_port = rbitcoin_net::NetAddr::Onion {
+        pk: [5; 32],
+        port: 9735,
+    };
+    let (body_tx, _body_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::unbounded_channel();
+    let sinks = PeerEventSinks {
+        body: body_tx,
+        ctrl: ctrl_tx,
+    };
+    let result = tokio::time::timeout(
+        Duration::from_millis(200),
+        rbitcoin_ibd::ibd::peer_io::spawn_peer(
+            1,
+            other_port,
+            Magic::REGTEST,
+            addr(1),
+            Some(0),
+            sinks,
+            rbitcoin_net::socks::Dialer::Direct,
+            Some(peers),
+            rbitcoin_net::peers::PeerConnType::OutboundFullRelay,
+        ),
+    )
+    .await;
+    let err = match result.expect("a refused IBD dial returns before the connect") {
+        Err(e) => e,
+        Ok(_) => panic!("IBD dial connected to a banned onion"),
+    };
+    assert!(
+        matches!(err, NetError::Protocol("banned")),
+        "IBD dialed a banned onion on another port, got {err}"
+    );
+}
+
 #[test]
 fn alive_dial_addrs_skips_dead() {
     let a = addr(1);
@@ -2293,4 +2343,48 @@ fn kick_cooldown_escalates_on_repeat_strikes() {
         t0 + STALL_ADDR_COOLDOWN_3 + Duration::from_secs(1),
     );
     assert!(!cooldown.contains_key(&a));
+}
+
+/// A manual ban must disconnect a live IBD session, not only refuse
+/// new dials: the sweep drops exactly the slots the ban names and
+/// releases their block requests, like a disconnect, so the hashes
+/// reopen for densify instead of staying in `inflight`.
+#[test]
+fn drop_banned_slots_removes_only_banned() {
+    let hub = PeerHub::new();
+    hub.set_mock_now(1_700_000_000);
+    let target = rbitcoin_net::ban::parse_ban_target(&addr(1).ip().to_string()).unwrap();
+    hub.ban_add(target, 1_700_100_000).unwrap();
+    let mut banned = dummy_slot(1, addr(1), true);
+    let sole = BlockHash::from_byte_array([7u8; 32]);
+    banned.in_flight.insert(sole);
+    let mut st = rbitcoin_ibd::ibd::state::IbdWorkState::new(
+        vec![banned, dummy_slot(2, addr(2), true)],
+        None,
+        None,
+    );
+    st.inflight
+        .insert(sole, rbitcoin_ibd::ibd::state::InflightReq::new(1));
+    st.body.mark_pending(sole);
+    st.record_height(sole, 5);
+    st.densify_scan_lo = 9;
+    st.densify_ready_through = 9;
+    st.perms = Some(hub);
+    drop_banned_slots(&mut st);
+    assert_eq!(st.slots.len(), 1);
+    assert_eq!(st.slots[0].net, rbitcoin_net::NetAddr::from_socket(addr(2)));
+    assert!(
+        st.inflight.is_empty(),
+        "the banned peer's request is released"
+    );
+    assert!(st.body.is_missing(&sole));
+    assert_eq!(
+        st.densify_scan_lo, 5,
+        "the freed height reopens for densify"
+    );
+    assert_eq!(st.densify_ready_through, 5);
+    // No hub wired: the sweep is a no-op.
+    st.perms = None;
+    drop_banned_slots(&mut st);
+    assert_eq!(st.slots.len(), 1);
 }

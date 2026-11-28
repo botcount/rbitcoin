@@ -812,6 +812,12 @@ impl LivePeer {
         self.send_queue.wake();
     }
 
+    /// A disconnect was requested (ban, stall kick, operator): the
+    /// session task winds down and unregisters itself.
+    pub fn disconnect_requested(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
     /// Wake a session that is blocked in a read or a send pause. The session
     /// task is left running so it can apply frames already taken off the socket.
     pub fn wake_for_disconnect(&self) {
@@ -2298,6 +2304,9 @@ pub struct PeerHub {
     inbound_open: tokio::sync::watch::Sender<bool>,
     /// Misbehavior keys → unix second the refusal ends. In memory only.
     pub discouraged_addrs: Mutex<HashMap<DiscourageKey, u64>>,
+    /// Manual bans (`setban`): targets → expiry, persisted when the node
+    /// wired a ban file with [`Self::set_ban_file`].
+    pub bans: Mutex<crate::ban::BanList>,
     /// Netgroup → unix second a slot-loss refusal ends.
     pub discouraged_groups: Mutex<HashMap<u64, u64>>,
     /// This process's secret SipHash key for keyed netgroups (Core
@@ -2554,6 +2563,7 @@ impl PeerHub {
             overlay_loopback_forward: AtomicBool::new(false),
             inbound_open: tokio::sync::watch::channel(true).0,
             discouraged_addrs: Mutex::new(HashMap::new()),
+            bans: Mutex::new(crate::ban::BanList::default()),
             discouraged_groups: Mutex::new(HashMap::new()),
             netgroup_key: std::hash::RandomState::new(),
             rate_strikes: Mutex::new(HashMap::new()),
@@ -3567,6 +3577,95 @@ impl PeerHub {
             .is_some()
     }
 
+    /// Wire the manual ban list to `path` (the datadir's `banlist.json`)
+    /// and load the entries stored there. Without this the list is
+    /// in-memory only, as in tests.
+    pub fn set_ban_file(&self, path: std::path::PathBuf) {
+        let now = self.now_secs();
+        self.bans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_file(path, now);
+    }
+
+    /// Add a manual ban ending at `banned_until` (unix seconds) and
+    /// disconnect every live session it matches. A ban file write failure
+    /// leaves the list unchanged and is reported to the caller.
+    pub fn ban_add(
+        &self,
+        target: crate::ban::BanTarget,
+        banned_until: u64,
+    ) -> Result<crate::ban::BanEntry, crate::ban::BanUpdateError> {
+        let now = self.now_secs();
+        // The add and the live scan are one step under the ban lock:
+        // publication takes the same lock (register_handshaken_net), so
+        // a session being published while this runs is either refused
+        // there or already in the table here and disconnected below.
+        let (entry, ids) = {
+            let mut bans = self.bans.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = bans.add(target, now, banned_until)?;
+            let ids: Vec<u64> = self
+                .live_peers()
+                .into_iter()
+                .filter(|p| target.matches_net(p.net))
+                .map(|p| p.id)
+                .collect();
+            (entry, ids)
+        };
+        for id in ids {
+            self.disconnect_id(id);
+        }
+        Ok(entry)
+    }
+
+    /// Lift one manual ban. `None` when the target is not banned.
+    pub fn ban_remove(
+        &self,
+        target: crate::ban::BanTarget,
+    ) -> Result<Option<crate::ban::BanEntry>, crate::ban::BanUpdateError> {
+        let now = self.now_secs();
+        self.bans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(target, now)
+    }
+
+    /// Drop every manual ban. Returns how many entries were stored.
+    pub fn ban_clear(&self) -> Result<usize, crate::ban::BanUpdateError> {
+        let now = self.now_secs();
+        self.bans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear(now)
+    }
+
+    /// Current manual bans, oldest first, with expired entries swept.
+    pub fn ban_list(&self) -> Vec<crate::ban::BanEntry> {
+        let now = self.now_secs();
+        self.bans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .list(now)
+    }
+
+    /// A manual ban names this peer identity (subnet or overlay).
+    pub fn net_banned(&self, net: crate::NetAddr) -> bool {
+        let now = self.now_secs();
+        self.bans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_banned_net(net, now)
+    }
+
+    /// A manual ban names this inbound source address.
+    pub fn ip_banned(&self, ip: IpAddr) -> bool {
+        let now = self.now_secs();
+        self.bans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_banned_ip(ip, now)
+    }
+
     pub fn now_secs(&self) -> u64 {
         let mock = self.mock_now.load(Ordering::Acquire);
         if mock != 0 {
@@ -3779,6 +3878,12 @@ impl PeerHub {
     /// same id. It keeps `from`'s `conntime`, negotiated flags and socket
     /// counters, and is complete before it is in the table, so no reader
     /// sees it half set.
+    ///
+    /// `None` when a manual ban names the endpoint: the ban check and
+    /// the row swap are one step under the ban lock, and `ban_add`
+    /// scans the live table under the same lock, so a ban added at any
+    /// moment either refuses this publication or sees the published
+    /// row and disconnects it. The caller drops the connecting row.
     pub fn register_handshaken_net(
         self: &Arc<Self>,
         from: &LivePeer,
@@ -3786,7 +3891,12 @@ impl PeerHub {
         ver: &VersionMessage,
         conn_type: PeerConnType,
         wire: crate::v2::WireBytes,
-    ) -> Arc<LivePeer> {
+    ) -> Option<Arc<LivePeer>> {
+        let now = self.now_secs();
+        let mut bans = self.bans.lock().unwrap_or_else(|e| e.into_inner());
+        if bans.is_banned_net(endpoint.net, now) {
+            return None;
+        }
         let peer = self.new_live(from.id, endpoint, ver, from.inbound, conn_type);
         peer.conntime
             .store(from.conntime.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -3811,7 +3921,7 @@ impl PeerHub {
         peer.attach_wire(wire);
         peer.mark_handshake_complete();
         self.unregister(from.id);
-        self.insert_live(peer)
+        Some(self.insert_live(peer))
     }
 
     fn new_live(

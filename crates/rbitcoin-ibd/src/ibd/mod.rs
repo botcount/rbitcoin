@@ -71,8 +71,8 @@ pub use assign::{assign_work_ordered, AssignDepth};
 use cadence::IbdLoopCadence;
 use dial::{
     admit_cooldown_fallback, alive_dial_addrs, apply_dial_result, dial_batch, dial_blocked_addrs,
-    disconnect_relative_slow_block_peers, disconnect_stalled_block_peers, expire_addr_cooldown,
-    redial_want, release_peer_block_work,
+    disconnect_relative_slow_block_peers, disconnect_stalled_block_peers, drop_banned_slots,
+    expire_addr_cooldown, redial_want, release_peer_block_work,
 };
 pub use events::drain_ready_peer_and_body_events;
 #[cfg(debug_assertions)]
@@ -1103,6 +1103,7 @@ pub async fn ibd_cancellable(
                 cadence.mark_peer_slow(now);
             }
             st.slots.retain(|s| s.alive);
+            drop_banned_slots(st);
             if redial_handle
                 .as_ref()
                 .map(|h| h.is_finished())
@@ -1324,6 +1325,10 @@ pub async fn ibd_cancellable(
 
                 last_status = Instant::now();
             }
+
+            // A manual ban lands on IBD sessions too: hub sessions are
+            // disconnected by `ban_add`, IBD slots by this sweep.
+            drop_banned_slots(st);
 
             // Exit when the connected best chain has no remainder. Empty-EOF
             // (`headers_done`) means we do not chase advertised height (less-work

@@ -79,10 +79,10 @@ fn pio_pin_dropping_io_tasks_aborts_both_halves() {
                 let _hold = read_tx;
                 std::future::pending::<()>().await;
             }),
-            writer: tokio::spawn(async move {
+            writer: Some(tokio::spawn(async move {
                 let _hold = write_tx;
                 std::future::pending::<()>().await;
-            }),
+            })),
         };
         drop(tasks);
         tokio::task::yield_now().await;
@@ -1435,4 +1435,40 @@ fn pong_written_while_a_ping_lands_is_not_lost() {
     }
     reader.join().unwrap();
     assert_eq!(lost, 0, "{lost} of {ROUNDS} pings were never answered");
+}
+
+/// Aborting the parent while it is suspended after the reader spawn
+/// but before the writer exists still aborts the reader: the guard is
+/// created with the reader, before the yield. A detached reader would
+/// leave its oneshot open.
+#[test]
+fn pio_pin_abort_before_writer_spawn_aborts_reader() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (read_tx, mut read_rx) = tokio::sync::oneshot::channel::<()>();
+        let parent = tokio::spawn(async move {
+            let mut guard = PeerIoTasks {
+                reader: tokio::spawn(async move {
+                    let _hold = read_tx;
+                    std::future::pending::<()>().await;
+                }),
+                writer: None,
+            };
+            tokio::task::yield_now().await;
+            // The abort lands here, before the writer is spawned.
+            std::future::pending::<()>().await;
+            guard.writer = Some(tokio::spawn(async {}));
+            let _ = &mut guard;
+        });
+        tokio::task::yield_now().await;
+        parent.abort();
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            read_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+    });
 }

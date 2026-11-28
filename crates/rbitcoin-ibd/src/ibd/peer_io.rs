@@ -1235,13 +1235,17 @@ pub async fn write_ibd_peer(
 #[doc(hidden)]
 pub struct PeerIoTasks {
     pub reader: tokio::task::JoinHandle<()>,
-    pub writer: tokio::task::JoinHandle<()>,
+    /// Set once the writer spawns; the guard is created with the
+    /// reader alone so an abort before that still aborts the reader.
+    pub writer: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for PeerIoTasks {
     fn drop(&mut self) {
         self.reader.abort();
-        self.writer.abort();
+        if let Some(w) = self.writer.as_ref() {
+            w.abort();
+        }
     }
 }
 
@@ -1259,6 +1263,9 @@ pub async fn spawn_peer(
 ) -> Result<PeerSlot, NetError> {
     if perms.as_ref().is_some_and(|p| p.net_discouraged(addr)) {
         return Err(NetError::Protocol("discouraged"));
+    }
+    if perms.as_ref().is_some_and(|p| p.net_banned(addr)) {
+        return Err(NetError::Protocol("banned"));
     }
     if let Some(p) = perms.as_ref() {
         if let Err(msg) = p.trust_allows_net(addr) {
@@ -1335,6 +1342,14 @@ pub async fn spawn_peer(
             pong_r,
         ));
 
+        // Guard the reader before the yield: aborting this task while
+        // it is suspended there must abort the reader too, not detach
+        // it with the socket still open.
+        let mut guard = PeerIoTasks {
+            reader: reader_task,
+            writer: None,
+        };
+
         // Let the reader poll once before we accept write work (getheaders).
         tokio::task::yield_now().await;
 
@@ -1342,14 +1357,12 @@ pub async fn spawn_peer(
         let writer_task = tokio::spawn(write_ibd_peer(
             id, cmd_rx, out_rx, writer, sinks_w, wire_w, pong,
         ));
+        guard.writer = Some(writer_task);
 
-        let mut guard = PeerIoTasks {
-            reader: reader_task,
-            writer: writer_task,
-        };
+        let writer = guard.writer.as_mut().expect("writer spawned above");
         tokio::select! {
             _ = &mut guard.reader => {}
-            _ = &mut guard.writer => {}
+            _ = writer => {}
         }
     });
 

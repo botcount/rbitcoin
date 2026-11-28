@@ -632,6 +632,30 @@ pub fn alive_dial_addrs(
         .collect()
 }
 
+/// Drop slots a manual ban now names; dropping a slot shuts its
+/// session down. Each banned slot's block requests are released
+/// first, the same as a disconnect, so its hashes reopen for densify
+/// instead of staying in `inflight` under a dead peer id. `ban_add`
+/// disconnects PeerHub sessions itself, but IBD slots live outside
+/// the hub, so the sync loop sweeps them with this on its cadence.
+pub fn drop_banned_slots(st: &mut super::state::IbdWorkState) {
+    let Some(p) = st.perms.as_ref() else { return };
+    let banned: Vec<usize> = st
+        .slots
+        .iter()
+        .filter(|s| s.alive && p.net_banned(s.net))
+        .map(|s| s.id)
+        .collect();
+    if banned.is_empty() {
+        return;
+    }
+    for peer in &banned {
+        let freed = release_peer_block_work(&mut st.slots, &mut st.inflight, &mut st.body, *peer);
+        st.reopen_for_densify(&freed);
+    }
+    st.slots.retain(|s| !banned.contains(&s.id));
+}
+
 pub fn expire_addr_cooldown(
     cooldown: &mut HashMap<NetAddr, Instant>,
     strikes: &mut HashMap<NetAddr, u8>,

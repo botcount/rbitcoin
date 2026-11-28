@@ -22,6 +22,7 @@ static ENABLE_LANE_TEST_GATE: extern "C" fn() = {
 };
 
 mod asmap;
+mod ban;
 mod cache;
 mod chain;
 mod codec;

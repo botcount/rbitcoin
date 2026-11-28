@@ -1478,7 +1478,9 @@ pub async fn inbound_connect_and_handshake(
             return Err(NetError::Timeout);
         }
     };
-    let sess = peers.register_handshaken_net(
+    // Publication refuses an endpoint a manual ban names, including a
+    // ban added while this handshake ran.
+    let Some(sess) = peers.register_handshaken_net(
         &sess,
         crate::peers::PeerEndpoint {
             addr: their_addr,
@@ -1488,7 +1490,10 @@ pub async fn inbound_connect_and_handshake(
         &their_version,
         crate::peers::PeerConnType::Inbound,
         wire,
-    );
+    ) else {
+        let _ = peers.disconnect_id(sess.id);
+        return Err(NetError::Protocol("banned"));
+    };
     Ok((their_version, reader, writer, tcp_shutdown, sess))
 }
 

@@ -1378,3 +1378,115 @@ async fn handshakes_refresh_only_outbound_rows() {
 
     cli.shutdown().await;
 }
+
+/// A ban that lands while an outbound dial is still connecting must
+/// not leave a live session: publication re-checks the ban list after
+/// the handshake and refuses the session. A gated SOCKS proxy holds the
+/// dial inside `connect_net`, before any session row exists, so nothing
+/// but the re-check can stop this session: `ban_add` has no live or
+/// provisional row to disconnect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ban_added_during_dial_blocks_session_publication() {
+    use rbitcoin_net::peer::{connect_and_handshake_timed, HandshakePolicy};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let far = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let far_addr = far.local_addr().unwrap();
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let at_gate = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (gate_seen, gate_release) = (Arc::clone(&at_gate), Arc::clone(&release));
+    let gate = tokio::spawn(async move {
+        let (mut c, _) = proxy.accept().await.unwrap();
+        let mut ver_n = [0u8; 2];
+        c.read_exact(&mut ver_n).await.unwrap();
+        let mut methods = vec![0u8; ver_n[1] as usize];
+        c.read_exact(&mut methods).await.unwrap();
+        if methods.contains(&0x02) {
+            c.write_all(&[5, 0x02]).await.unwrap();
+            let mut ver = [0u8; 1];
+            c.read_exact(&mut ver).await.unwrap();
+            let mut ulen = [0u8; 1];
+            c.read_exact(&mut ulen).await.unwrap();
+            let mut user = vec![0u8; ulen[0] as usize];
+            c.read_exact(&mut user).await.unwrap();
+            let mut plen = [0u8; 1];
+            c.read_exact(&mut plen).await.unwrap();
+            let mut pass = vec![0u8; plen[0] as usize];
+            c.read_exact(&mut pass).await.unwrap();
+            c.write_all(&[1, 0]).await.unwrap();
+        } else {
+            c.write_all(&[5, 0x00]).await.unwrap();
+        }
+        let mut hdr = [0u8; 4];
+        c.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(hdr[1], 1, "test gate expects an IPv4 CONNECT");
+        let mut a = [0u8; 4];
+        c.read_exact(&mut a).await.unwrap();
+        let mut p = [0u8; 2];
+        c.read_exact(&mut p).await.unwrap();
+        let dest = SocketAddr::from((Ipv4Addr::new(a[0], a[1], a[2], a[3]), u16::from_be_bytes(p)));
+        gate_seen.notify_one();
+        gate_release.notified().await;
+        let mut peer = tokio::net::TcpStream::connect(dest).await.unwrap();
+        c.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+        let _ = tokio::io::copy_bidirectional(&mut c, &mut peer).await;
+    });
+
+    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("ban-race");
+    let mut node = P2PNode::start_outbound_only(
+        q,
+        ChainParams::regtest(),
+        Milestone::NONE,
+        "/rbitcoin:0.1.0(ban-race)/".into(),
+        0,
+        rbitcoin_net::socks::Dialer::socks(proxy_addr, false),
+        rbitcoin_net::REDIAL_INTERVAL_TEST,
+    )
+    .await
+    .unwrap();
+    let peers = Arc::clone(&node.peers);
+    let dial = tokio::spawn(async move { node.follow_from(far_addr).await });
+    tokio::time::timeout(Duration::from_secs(5), at_gate.notified())
+        .await
+        .expect("the dial never reached the proxy gate");
+    assert!(
+        peers.snapshot().is_empty(),
+        "no session row exists while the dial is held"
+    );
+    let target = rbitcoin_net::parse_ban_target("127.0.0.1").unwrap();
+    peers.ban_add(target, peers.now_secs() + 3600).unwrap();
+    release.notify_one();
+    // The far end answers the handshake once the splice is up; its own
+    // result does not matter, the dial side may close on refusal.
+    let far_side = tokio::spawn(async move {
+        let (stream, _) = far.accept().await.unwrap();
+        let _ = connect_and_handshake_timed(
+            Duration::from_secs(5),
+            stream,
+            Magic::REGTEST,
+            far_addr,
+            far_addr,
+            0,
+            true,
+            "/rbitcoin:test/",
+            HandshakePolicy::plain(),
+        )
+        .await;
+    });
+    let err = dial
+        .await
+        .unwrap()
+        .expect_err("a session banned mid-dial is refused");
+    assert!(err.to_string().contains("banned"), "dial error: {err}");
+    assert!(
+        peers.snapshot().is_empty(),
+        "no session is published: {:?}",
+        peers.snapshot()
+    );
+    far_side.abort();
+    gate.abort();
+}
